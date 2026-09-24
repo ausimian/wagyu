@@ -1,7 +1,10 @@
 # Wagyu
 
-Wagyu is an Elixir application skeleton with a supervision tree. No public
-functionality exists yet.
+Wagyu is a user-mode WireGuard endpoint for SmolNet application sockets. The
+design and implementation order are tracked in
+https://github.com/ausimian/wagyu/issues/2. So far only configuration
+validation and the wire-format building blocks exist; the running interface
+does not.
 
 ## Development
 
