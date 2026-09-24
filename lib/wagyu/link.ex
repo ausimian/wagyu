@@ -159,6 +159,9 @@ defmodule Wagyu.Link do
   defp handle({:DOWN, monitor, :process, _object, _reason}, %{monitor: monitor} = state),
     do: {:stop, {:shutdown, :stack_down}, state}
 
+  defp handle({:DOWN, monitor, :process, _object, _reason}, %{interface: {_pid, _egress, monitor}} = state),
+    do: {:noreply, reconcile(state)}
+
   # Besides its parent, which GenServer handles, only the registry is linked
   # to the link: registering links to it. If the registry exits, it takes
   # every registration of this interface with it, so the link exits and the
@@ -168,21 +171,26 @@ defmodule Wagyu.Link do
   defp handle(_message, state), do: {:noreply, state}
 
   # Packets admitted to an interface that exits before taking them are lost
-  # with its mailbox. Its queue's count outlives it, so once it has exited
-  # the link counts whatever it never took as dropped.
-  defp track_interface(%{interface: interface} = state, interface), do: state
+  # with its mailbox. Its queue's count outlives it, so the link monitors
+  # the interface it delivers to and, when that exits, counts whatever it
+  # never took as dropped.
+  defp track_interface(state, nil), do: state
+  defp track_interface(%{interface: {pid, _egress, _monitor}} = state, {pid, _same}), do: state
 
-  defp track_interface(%{interface: {pid, egress}} = state, interface) do
-    if Process.alive?(pid) do
-      state
-    else
-      {lost, _bytes} = Admission.usage(egress)
-      count(state.counters, :egress_dropped, lost)
-      %{state | interface: interface}
-    end
+  defp track_interface(state, {pid, egress}) do
+    # A different interface registered only once the one before it had
+    # exited, even if its :DOWN has yet to arrive.
+    %{reconcile(state) | interface: {pid, egress, Process.monitor(pid)}}
   end
 
-  defp track_interface(state, interface), do: %{state | interface: interface}
+  defp reconcile(%{interface: {_pid, egress, monitor}} = state) do
+    Process.demonitor(monitor, [:flush])
+    {lost, _bytes} = Admission.usage(egress)
+    count(state.counters, :egress_dropped, lost)
+    %{state | interface: nil}
+  end
+
+  defp reconcile(state), do: state
 
   # Adds packets to the pending batch, sending the batch whenever the next
   # packet would take it past the stack's limits.

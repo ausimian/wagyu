@@ -114,16 +114,16 @@ defmodule Wagyu.LinkTest do
       _state = :sys.get_state(link)
       assert {:ok, %{egress: 3, egress_dropped: 0}} = Link.counters(root)
 
-      monitor = Process.monitor(interface)
+      # The three it never took are counted as soon as it exits, and once
+      # only: a batch for its replacement adds nothing.
       Process.exit(interface, :kill)
-      assert_receive {:DOWN, ^monitor, :process, ^interface, :killed}
+      assert eventually(fn -> match?({:ok, %{egress: 3, egress_dropped: 3}}, Link.counters(root)) end)
 
-      # The next batch reaches a new interface, and the three the old one
-      # never took are counted.
       register_interface(root)
       egress(link, options, packets(4..4))
       assert_receive {:wg_egress, [_packet]}
-      assert eventually(fn -> match?({:ok, %{egress: 4, egress_dropped: 3}}, Link.counters(root)) end)
+      _state = :sys.get_state(link)
+      assert {:ok, %{egress: 4, egress_dropped: 3}} = Link.counters(root)
     end
 
     test "ignores egress for another link reference", %{root: root, link: link} do
