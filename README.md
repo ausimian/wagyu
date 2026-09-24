@@ -5,10 +5,12 @@ Wagyu is a user-mode WireGuard endpoint for
 Elixir. It carries IPv4 and IPv6 packets between a SmolNet network stack and
 WireGuard peers over one UDP socket, with no host TUN device.
 
-Wagyu is under development. So far it validates interface configuration
-(`Wagyu.Config.new/1`) and implements the WireGuard wire format: message
-framing, keyed BLAKE2s MAC1, TAI64N timestamps, inner IP validation and
-AllowedIPs routing. The running interface is not available yet.
+Wagyu is under development. An interface starts under supervision with its
+UDP socket and SmolNet stack (`Wagyu.start_link/1`), validates its
+configuration, and implements the WireGuard wire format: message framing,
+keyed BLAKE2s MAC1, TAI64N timestamps, inner IP validation and AllowedIPs
+routing. WireGuard handshakes are not implemented yet, so no traffic crosses
+the tunnel.
 
 ## Development
 

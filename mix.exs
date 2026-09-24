@@ -9,6 +9,7 @@ defmodule Wagyu.MixProject do
       app: :wagyu,
       version: System.get_env("VERSION_OVERRIDE", @version),
       elixir: "~> 1.18",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
@@ -36,9 +37,13 @@ defmodule Wagyu.MixProject do
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
       {:excoveralls, "~> 0.18", only: :test},
-      {:publisho, "~> 1.0", only: :dev, runtime: false}
+      {:publisho, "~> 1.0", only: :dev, runtime: false},
+      {:smolnet, "~> 0.4"}
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
 
   defp aliases do
     [
