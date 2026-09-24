@@ -228,6 +228,25 @@ defmodule Wagyu.InterfaceTest do
       assert running_peers(context.interface) == []
     end
 
+    # Killing the interface logs its exit.
+    @tag :capture_log
+    test "counts egress lost with an interface that dies part-way through routing it", context do
+      interface = child(context.interface, :interface)
+      %{egress: egress} = :sys.get_state(interface)
+
+      # With the peer supervisor suspended, the interface blocks starting the
+      # peer for the first packet, holding that packet mid-route.
+      :ok = :sys.suspend(child(context.interface, :peer_supervisor))
+      send_egress(open_udp(context.stack), 3)
+      assert eventually(fn -> match?({3, _bytes}, Admission.usage(egress)) end)
+
+      Process.exit(interface, :kill)
+
+      assert eventually(fn ->
+               match?({:ok, %{egress: 3, egress_dropped: 3}}, Wagyu.Link.counters(context.interface))
+             end)
+    end
+
     test "the link drops egress beyond what the interface has queued", context do
       interface = child(context.interface, :interface)
       %{egress: egress} = :sys.get_state(interface)

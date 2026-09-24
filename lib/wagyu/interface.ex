@@ -165,9 +165,17 @@ defmodule Wagyu.Interface do
     {:noreply, state}
   end
 
+  # Each packet stays admitted until it has been routed, so if the interface
+  # dies part-way through a batch the link counts the unrouted rest as
+  # dropped. At most the one packet being routed at that instant may be
+  # counted twice.
   def handle_info({:wg_egress, packets}, state) do
-    Admission.release_all(state.egress, packets)
-    {:noreply, Enum.reduce(packets, state, &route(&2, &1))}
+    {:noreply,
+     Enum.reduce(packets, state, fn packet, state ->
+       state = route(state, packet)
+       Admission.release(state.egress, 1, byte_size(packet))
+       state
+     end)}
   end
 
   def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
