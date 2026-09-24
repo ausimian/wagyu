@@ -18,6 +18,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       MIX_ENV: test
+      # Run the wireguard-go interop tests, and fail if Go is missing.
+      WAGYU_INTEROP: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +41,12 @@ jobs:
         with:
           otp-version: ${{ matrix.pair.otp }}
           elixir-version: ${{ matrix.pair.elixir }}
+
+      - name: Set up Go for the interop tests
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: test/interop/go.mod
+          cache-dependency-path: test/interop/go.sum
 
       - name: Restore dependencies and build cache
         uses: actions/cache@v6.1.0

@@ -24,3 +24,9 @@ mix precommit
 
 `mix precommit` compiles with warnings treated as errors, checks dependency
 usage and formatting, runs Credo, and executes the tests.
+
+The interoperability tests (tagged `interop`) run Wagyu against
+[wireguard-go](https://git.zx2c4.com/wireguard-go) on its userspace network
+stack, which needs no TUN device or root. They build a small Go helper in
+`test/interop`, so they run when `go` (1.25 or later) is on the `PATH` and
+are skipped otherwise. `mix test --exclude interop` skips them regardless.
