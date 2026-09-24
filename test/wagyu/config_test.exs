@@ -174,6 +174,16 @@ defmodule Wagyu.ConfigTest do
       assert Config.new(Keyword.put(options, :peers, [peer(%{public_key: own_key})])) ==
                invalid([:peers, 0, :public_key], :local_key)
     end
+
+    test "reject a peer key that no handshake can use" do
+      # Low-order points, of orders 4, 1, 2 and 8: X25519 with any of them
+      # yields all zeros.
+      order_8 = Base.decode16!("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800", case: :lower)
+
+      for key <- [<<0::256>>, <<1::little-256>>, <<2 ** 255 - 20::little-256>>, order_8] do
+        assert Config.new(options(peers: [peer(%{public_key: key})])) == invalid([:peers, 0, :public_key], :invalid)
+      end
+    end
   end
 
   describe "preshared keys" do

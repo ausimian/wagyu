@@ -5,9 +5,15 @@ defmodule Wagyu.TestHelpers do
   import ExUnit.Assertions
 
   alias Wagyu.Packet
-  alias Wagyu.Packet.Initiation
+  alias Wagyu.Packet.{Initiation, Response, Transport}
 
   @roles [:link, :interface, :handshake_supervisor, :peer_supervisor]
+
+  # WireGuard's Noise parameters, stated here independently of
+  # `Wagyu.Noise`, for the remote parties that tests play.
+  @protocol "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+  @prologue "WireGuard v1 zx2c4 Jason@zx2c4.com"
+  @zero_psk <<0::256>>
 
   def keypair, do: :crypto.generate_key(:ecdh, :x25519)
 
@@ -112,33 +118,126 @@ defmodule Wagyu.TestHelpers do
   @doc """
   A genuine initiation from the holder of `initiator` (a key pair) to the
   holder of `responder_key`, carrying `timestamp`, with a valid MAC1.
-
-  It is built with a Decibel initiator from WireGuard's parameters, stated
-  here independently of `Wagyu.Noise`.
   """
-  def noise_initiation(responder_key, initiator, timestamp, sender_index \\ :rand.uniform(0xFFFFFFFF)) do
-    session =
-      Decibel.new("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s", :ini, %{
-        s: initiator,
-        rs: responder_key,
-        psks: [<<0::256>>],
-        prologue: "WireGuard v1 zx2c4 Jason@zx2c4.com"
-      })
+  def noise_initiation(responder_key, initiator, timestamp, sender_index \\ random_index()) do
+    {frame, session} = initiate_to(responder_key, initiator, timestamp, sender_index)
+    :ok = Decibel.close(session)
+    frame
+  end
+
+  @doc """
+  Plays the initiator: returns a genuine initiation, as `noise_initiation/4`
+  does, and the Decibel session that wrote it, owned by the caller and
+  waiting for the response (see `complete/2`).
+  """
+  def initiate_to(responder_key, initiator, timestamp, sender_index \\ random_index()) do
+    session = Decibel.new(@protocol, :ini, %{s: initiator, rs: responder_key, psks: [@zero_psk], prologue: @prologue})
 
     <<ephemeral::binary-32, static::binary-48, encrypted_timestamp::binary-28>> =
       session |> Decibel.handshake_encrypt(timestamp) |> IO.iodata_to_binary()
 
-    :ok = Decibel.close(session)
+    frame =
+      %Initiation{
+        sender_index: sender_index,
+        ephemeral: ephemeral,
+        encrypted_static: static,
+        encrypted_timestamp: encrypted_timestamp
+      }
+      |> Packet.encode()
+      |> Packet.put_mac1(Packet.mac1_key(responder_key))
 
-    %Initiation{
-      sender_index: sender_index,
-      ephemeral: ephemeral,
-      encrypted_static: static,
-      encrypted_timestamp: encrypted_timestamp
-    }
-    |> Packet.encode()
-    |> Packet.put_mac1(Packet.mac1_key(responder_key))
+    {frame, session}
   end
+
+  @doc """
+  Reads a response frame into an initiator session from `initiate_to/4`,
+  which is then ready for transport. Returns `:ok`, or `:error` if the
+  response does not authenticate.
+  """
+  def complete(session, response) do
+    {:ok, %Response{ephemeral: ephemeral, encrypted_nothing: nothing}} = Packet.decode(response)
+    "" = session |> Decibel.handshake_decrypt([ephemeral, nothing]) |> IO.iodata_to_binary()
+    :ok
+  rescue
+    Decibel.DecryptionError -> :error
+  end
+
+  @doc """
+  Plays the responder to an initiation frame: checks its MAC1 for
+  `responder` (a key pair), reads it with a Decibel responder and writes a
+  response from `sender_index` with a valid MAC1. Returns the response
+  frame, the responder's transport session, owned by the caller, and what
+  the initiation carried.
+  """
+  def respond_to(initiation, {public_key, _private_key} = responder, sender_index \\ random_index()) do
+    assert Packet.valid_mac1?(initiation, Packet.mac1_key(public_key))
+    {:ok, %Initiation{} = message} = Packet.decode(initiation)
+    session = Decibel.new(@protocol, :rsp, %{s: responder, psks: [@zero_psk], prologue: @prologue})
+
+    timestamp =
+      session
+      |> Decibel.handshake_decrypt([message.ephemeral, message.encrypted_static, message.encrypted_timestamp])
+      |> IO.iodata_to_binary()
+
+    initiator_key = Decibel.remote_key(session)
+    <<ephemeral::binary-32, nothing::binary-16>> = session |> Decibel.handshake_encrypt("") |> IO.iodata_to_binary()
+
+    frame =
+      %Response{
+        sender_index: sender_index,
+        receiver_index: message.sender_index,
+        ephemeral: ephemeral,
+        encrypted_nothing: nothing
+      }
+      |> Packet.encode()
+      |> Packet.put_mac1(Packet.mac1_key(initiator_key))
+
+    {frame, session, %{timestamp: timestamp, initiator_key: initiator_key, sender_index: message.sender_index}}
+  end
+
+  @doc "A transport message to `receiver_index`, encrypted with a transport session the caller owns."
+  def transport_frame(session, receiver_index, plaintext \\ "") do
+    counter = Decibel.nonce(session, :out)
+    packet = session |> Decibel.encrypt(plaintext, "") |> IO.iodata_to_binary()
+    Packet.encode(%Transport{receiver_index: receiver_index, counter: counter, encrypted_packet: packet})
+  end
+
+  @doc "Decrypts a transport frame with a session the caller owns: `{:ok, plaintext}` or `:error`."
+  def open_transport(session, frame) do
+    {:ok, %Transport{counter: counter, encrypted_packet: packet}} = Packet.decode(frame)
+    :ok = Decibel.set_nonce(session, :in, counter)
+    {:ok, session |> Decibel.decrypt(packet, "") |> IO.iodata_to_binary()}
+  rescue
+    Decibel.DecryptionError -> :error
+  end
+
+  @doc "Whether a session the calling process owned has been closed."
+  def closed?(session) do
+    Decibel.handshake_complete?(session)
+    false
+  rescue
+    error in Decibel.SessionError -> error.reason in [:closed, :unknown]
+  end
+
+  @doc """
+  Runs `fun` on a GenServer's state inside that process, which owns its
+  Decibel sessions, and returns the result. The state is left unchanged.
+  """
+  def in_process(pid, fun) do
+    test = self()
+    ref = make_ref()
+
+    :sys.replace_state(pid, fn state ->
+      send(test, {ref, fun.(state)})
+      state
+    end)
+
+    receive do
+      {^ref, result} -> result
+    end
+  end
+
+  def random_index, do: :rand.uniform(0x100000000) - 1
 
   @doc "The `n`th of a series of strictly increasing TAI64N timestamps."
   def timestamp(n), do: <<0x400000000000000A + 1_700_000_000::64, n * 0x1000000::32>>

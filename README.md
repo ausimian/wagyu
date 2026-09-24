@@ -7,10 +7,10 @@ WireGuard peers over one UDP socket, with no host TUN device.
 
 Wagyu is under development. An interface starts under supervision with its
 UDP socket and SmolNet stack (`Wagyu.start_link/1`), validates its
-configuration, and implements the WireGuard wire format: message framing,
-keyed BLAKE2s MAC1, TAI64N timestamps, inner IP validation and AllowedIPs
-routing. WireGuard handshakes are not implemented yet, so no traffic crosses
-the tunnel.
+configuration, and completes WireGuard handshakes with its configured peers,
+initiating on outbound traffic and responding to initiations, including with
+wireguard-go. The encrypted data path is not implemented yet, so no traffic
+crosses the tunnel.
 
 ## Development
 
@@ -24,3 +24,9 @@ mix precommit
 
 `mix precommit` compiles with warnings treated as errors, checks dependency
 usage and formatting, runs Credo, and executes the tests.
+
+The interoperability tests (tagged `interop`) run Wagyu against
+[wireguard-go](https://git.zx2c4.com/wireguard-go) on its userspace network
+stack, which needs no TUN device or root. They build a small Go helper in
+`test/interop`, so they run when `go` (1.25 or later) is on the `PATH` and
+are skipped otherwise. `mix test --exclude interop` skips them regardless.
