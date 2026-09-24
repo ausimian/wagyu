@@ -9,7 +9,7 @@ defmodule Wagyu.Registry do
   # A registration's value carries what other processes need to talk to its
   # owner: the admission bounds of its mailbox and its shared counters.
 
-  @type role :: :root | :link | :interface | :handshake_supervisor | :peer_supervisor
+  @type role :: :link | :interface | :handshake_supervisor | :peer_supervisor
 
   @spec child_spec(term()) :: Supervisor.child_spec()
   def child_spec(_arg), do: Registry.child_spec(keys: :unique, name: __MODULE__)
@@ -31,7 +31,8 @@ defmodule Wagyu.Registry do
 
   The registry removes an entry only once it has processed its owner's exit,
   so a lookup soon after an exit can still find the entry; a dead owner is
-  reported as `:error`.
+  reported as `:error`. So is every lookup while the registry itself is
+  restarting.
   """
   @spec lookup(term(), role()) :: {:ok, pid(), term()} | :error
   def lookup(root, role) do
@@ -39,5 +40,8 @@ defmodule Wagyu.Registry do
       [{pid, value}] -> if Process.alive?(pid), do: {:ok, pid, value}, else: :error
       [] -> :error
     end
+  rescue
+    # The registry is not running.
+    ArgumentError -> :error
   end
 end

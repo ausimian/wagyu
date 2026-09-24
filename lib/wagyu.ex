@@ -269,11 +269,12 @@ defmodule Wagyu do
     end
   end
 
-  # Only a live interface supervisor is registered as a root, so a PID or
-  # name that belongs to anything else is not running.
+  # A PID or name that belongs to anything other than a live interface
+  # supervisor on this node is not running. The check does not use the
+  # registry, so it holds while the registry restarts.
   defp root(interface) do
-    with pid when is_pid(pid) <- GenServer.whereis(interface),
-         {:ok, ^pid, _value} <- Wagyu.Registry.lookup(pid, :root) do
+    with pid when is_pid(pid) and node(pid) == node() <- GenServer.whereis(interface),
+         {:supervisor, Wagyu.Interface.Supervisor, _args} <- :proc_lib.initial_call(pid) do
       {:ok, pid}
     else
       _not_running -> {:error, :not_running}

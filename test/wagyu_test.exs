@@ -217,7 +217,7 @@ defmodule WagyuTest do
         assert_receive {:DOWN, ^stack_monitor, :process, _object, _reason}
         assert Enum.filter(pids, &Process.alive?/1) == []
 
-        for role <- [:root, :link, :interface, :handshake_supervisor, :peer_supervisor],
+        for role <- [:link, :interface, :handshake_supervisor, :peer_supervisor],
             do: assert(Wagyu.Registry.lookup(interface, role) == :error)
       end
 

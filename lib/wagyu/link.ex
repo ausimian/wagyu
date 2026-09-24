@@ -31,7 +31,9 @@ defmodule Wagyu.Link do
   #
   # The link exits when its stack stops for any reason, including an
   # application calling `SmolNet.stop_stack/1`, and stops its stack when it
-  # exits, so the root supervisor always rebuilds the two together.
+  # exits, so the root supervisor always rebuilds the two together. It also
+  # exits when the registry does, so that a restarted registry is repopulated
+  # rather than leaving the interface unreachable.
 
   use GenServer
 
@@ -154,6 +156,12 @@ defmodule Wagyu.Link do
 
   defp handle({:DOWN, monitor, :process, _object, _reason}, %{monitor: monitor} = state),
     do: {:stop, {:shutdown, :stack_down}, state}
+
+  # Besides its parent, which GenServer handles, only the registry is linked
+  # to the link: registering links to it. If the registry exits, it takes
+  # every registration of this interface with it, so the link exits and the
+  # root rebuilds the interface, whose processes register again.
+  defp handle({:EXIT, _registry, reason}, state), do: {:stop, {:shutdown, {:registry_down, reason}}, state}
 
   defp handle(_message, state), do: {:noreply, state}
 

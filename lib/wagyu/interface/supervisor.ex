@@ -13,9 +13,13 @@ defmodule Wagyu.Interface.Supervisor do
   #   * a peer supervisor failure restarts only the peers.
   #
   # Children find one another through `Wagyu.Registry`, keyed by this
-  # supervisor's PID. The start argument is the validated configuration,
-  # whose `Inspect` implementation hides its keys, so supervisor reports
-  # never print them raw.
+  # supervisor's PID. The link is the first child, so if the registry
+  # restarts and loses their registrations, the link's exit rebuilds the
+  # whole interface and the children register again.
+  #
+  # The start argument is the validated configuration, whose `Inspect`
+  # implementation hides its keys, so supervisor reports never print them
+  # raw.
 
   use Supervisor
 
@@ -28,7 +32,6 @@ defmodule Wagyu.Interface.Supervisor do
   @impl true
   def init(%Config{} = config) do
     root = self()
-    :ok = Wagyu.Registry.register(root, :root)
 
     # Workers and peers need the local key pair and stack settings, not the
     # peer table, which only the interface consults. Leaving it out keeps
