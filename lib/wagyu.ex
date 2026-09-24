@@ -167,12 +167,13 @@ defmodule Wagyu do
       for a receiver index with no live peer
     * `:egress` - packets the stack sent
     * `:egress_dropped` - packets the stack sent that were dropped because
-      the interface's queue was full or it was restarting
+      the interface's queue was full, it was restarting, or it exited before
+      taking them
     * `:egress_unroutable` - packets with a malformed IP header or no
       matching AllowedIPs prefix
     * `:egress_routed` - packets queued for their peer
     * `:egress_peer_dropped` - packets dropped because the peer's queue was
-      full or it could not start
+      full, it could not start, or it exited before taking them
     * `:ingress` - packets the stack accepted
     * `:ingress_dropped` - packets bound for the stack that were dropped,
       because the link's queue was full or the stack refused them

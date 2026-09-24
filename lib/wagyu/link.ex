@@ -117,7 +117,8 @@ defmodule Wagyu.Link do
            counters: counters,
            pending: [],
            pending_count: 0,
-           pending_bytes: 0
+           pending_bytes: 0,
+           interface: nil
          }}
 
       {:error, reason} ->
@@ -150,8 +151,9 @@ defmodule Wagyu.Link do
 
   defp handle({:smol_stack, ref, :egress, packets}, %{ref: ref} = state) do
     count(state.counters, :egress, length(packets))
-    count(state.counters, :egress_dropped, Wagyu.Interface.deliver(state.root, packets))
-    {:noreply, state}
+    {refused, interface} = Wagyu.Interface.deliver(state.root, packets)
+    count(state.counters, :egress_dropped, refused)
+    {:noreply, track_interface(state, interface)}
   end
 
   defp handle({:DOWN, monitor, :process, _object, _reason}, %{monitor: monitor} = state),
@@ -164,6 +166,23 @@ defmodule Wagyu.Link do
   defp handle({:EXIT, _registry, reason}, state), do: {:stop, {:shutdown, {:registry_down, reason}}, state}
 
   defp handle(_message, state), do: {:noreply, state}
+
+  # Packets admitted to an interface that exits before taking them are lost
+  # with its mailbox. Its queue's count outlives it, so once it has exited
+  # the link counts whatever it never took as dropped.
+  defp track_interface(%{interface: interface} = state, interface), do: state
+
+  defp track_interface(%{interface: {pid, egress}} = state, interface) do
+    if Process.alive?(pid) do
+      state
+    else
+      {lost, _bytes} = Admission.usage(egress)
+      count(state.counters, :egress_dropped, lost)
+      %{state | interface: interface}
+    end
+  end
+
+  defp track_interface(state, interface), do: %{state | interface: interface}
 
   # Adds packets to the pending batch, sending the batch whenever the next
   # packet would take it past the stack's limits.

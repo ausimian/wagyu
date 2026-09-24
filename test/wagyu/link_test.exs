@@ -97,6 +97,35 @@ defmodule Wagyu.LinkTest do
       assert_receive {:wg_egress, [_packet]}
     end
 
+    test "counts egress lost with an interface that exits before taking it",
+         %{root: root, link: link, options: options} do
+      test = self()
+
+      # An interface that takes nothing from its mailbox.
+      interface =
+        spawn(fn ->
+          :ok = Wagyu.Registry.register(root, :interface, %{egress: Admission.new(256, 512 * 1024)})
+          send(test, :registered)
+          receive(do: (:never -> :ok))
+        end)
+
+      assert_receive :registered
+      egress(link, options, packets(1..3))
+      _state = :sys.get_state(link)
+      assert {:ok, %{egress: 3, egress_dropped: 0}} = Link.counters(root)
+
+      monitor = Process.monitor(interface)
+      Process.exit(interface, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^interface, :killed}
+
+      # The next batch reaches a new interface, and the three the old one
+      # never took are counted.
+      register_interface(root)
+      egress(link, options, packets(4..4))
+      assert_receive {:wg_egress, [_packet]}
+      assert eventually(fn -> match?({:ok, %{egress: 4, egress_dropped: 3}}, Link.counters(root)) end)
+    end
+
     test "ignores egress for another link reference", %{root: root, link: link} do
       register_interface(root)
       send(link, {:smol_stack, make_ref(), :egress, packets(1..1)})

@@ -207,6 +207,27 @@ defmodule Wagyu.InterfaceTest do
       assert eventually(fn -> Admission.usage(outbound) == {0, 0} end)
     end
 
+    # Killing the peer logs its exit.
+    @tag :capture_log
+    test "counts what a peer never took as dropped when it exits", context do
+      socket = open_udp(context.stack)
+      send_egress(socket, 1)
+      counters(context.interface, &(&1.egress_routed == 1))
+      %{pid: peer, outbound: outbound} = peer(context.interface, context.peer_key)
+      assert eventually(fn -> Admission.usage(outbound) == {0, 0} end)
+
+      :ok = :sys.suspend(peer)
+      send_egress(socket, 10)
+      assert eventually(fn -> match?({10, _bytes}, Admission.usage(outbound)) end)
+
+      Process.exit(peer, :kill)
+
+      assert %{egress_routed: 11, egress_peer_dropped: 10} =
+               counters(context.interface, &(&1.egress_peer_dropped == 10))
+
+      assert running_peers(context.interface) == []
+    end
+
     test "the link drops egress beyond what the interface has queued", context do
       interface = child(context.interface, :interface)
       %{egress: egress} = :sys.get_state(interface)

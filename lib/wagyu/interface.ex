@@ -78,18 +78,19 @@ defmodule Wagyu.Interface do
   @doc """
   Admits egress packets from the link and sends them to `root`'s interface,
   in order. Returns how many were refused because its queue was full or no
-  interface is running.
+  interface is running, and the interface and queue that took the rest, so
+  that the link can account for them if that interface exits first.
   """
-  @spec deliver(term(), [binary()]) :: non_neg_integer()
+  @spec deliver(term(), [binary()]) :: {non_neg_integer(), {pid(), Admission.t()} | nil}
   def deliver(root, packets) do
     case Wagyu.Registry.lookup(root, :interface) do
       {:ok, interface, %{egress: egress}} ->
         {admitted, refused} = Admission.admit_prefix(egress, packets)
         if admitted != [], do: send(interface, {:wg_egress, admitted})
-        refused
+        {refused, {interface, egress}}
 
       :error ->
-        length(packets)
+        {length(packets), nil}
     end
   end
 
@@ -172,7 +173,7 @@ defmodule Wagyu.Interface do
   def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
     case Map.pop(state.monitors, monitor) do
       {:worker, monitors} -> {:noreply, worker_done(%{state | monitors: monitors})}
-      {{:peer, key}, monitors} -> {:noreply, %{state | monitors: monitors, peers: Map.delete(state.peers, key)}}
+      {{:peer, key}, monitors} -> {:noreply, peer_down(%{state | monitors: monitors}, key)}
       {nil, _monitors} -> {:noreply, state}
     end
   end
@@ -299,6 +300,15 @@ defmodule Wagyu.Interface do
     end
   end
 
+  # Packets admitted to a peer that it never took were lost with it; its
+  # queue's count says how many.
+  defp peer_down(state, key) do
+    {peer, peers} = Map.pop!(state.peers, key)
+    {lost, _bytes} = Admission.usage(peer.outbound)
+    add(state, :egress_peer_dropped, lost)
+    %{state | peers: peers}
+  end
+
   # Socket
 
   defp open_socket(%{address: address, port: port}) do
@@ -323,7 +333,9 @@ defmodule Wagyu.Interface do
   end
 
   defp count(state, name, result \\ :ok) do
-    :counters.add(state.counters, Keyword.fetch!(@counters, name), 1)
+    add(state, name, 1)
     result
   end
+
+  defp add(state, name, increment), do: :counters.add(state.counters, Keyword.fetch!(@counters, name), increment)
 end
