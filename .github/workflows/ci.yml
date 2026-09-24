@@ -14,14 +14,15 @@ concurrency:
 
 jobs:
   quality:
-    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Elixir ${{ matrix.pair.elixir }} / OTP ${{ matrix.pair.otp }}
+    runs-on: ${{ matrix.os }}
     env:
       MIX_ENV: test
     strategy:
       fail-fast: false
       matrix:
-        include:
+        os: [ubuntu-latest, macos-latest]
+        pair:
           - {elixir: "1.20", otp: "29"}
           - {elixir: "1.20", otp: "28"}
           - {elixir: "1.20", otp: "27"}
@@ -36,8 +37,8 @@ jobs:
       - name: Set up Erlang and Elixir
         uses: erlef/setup-beam@v1.24.1
         with:
-          otp-version: ${{ matrix.otp }}
-          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.pair.otp }}
+          elixir-version: ${{ matrix.pair.elixir }}
 
       - name: Restore dependencies and build cache
         uses: actions/cache@v6.1.0
@@ -45,9 +46,9 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-${{ runner.arch }}-elixir-${{ matrix.elixir }}-otp-${{ matrix.otp }}-mix-${{ hashFiles('mix.lock', 'mix.exs') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-elixir-${{ matrix.pair.elixir }}-otp-${{ matrix.pair.otp }}-mix-${{ hashFiles('mix.lock', 'mix.exs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-elixir-${{ matrix.elixir }}-otp-${{ matrix.otp }}-mix-
+            ${{ runner.os }}-${{ runner.arch }}-elixir-${{ matrix.pair.elixir }}-otp-${{ matrix.pair.otp }}-mix-
 
       - name: Install dependencies
         run: mix deps.get
