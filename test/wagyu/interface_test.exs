@@ -58,10 +58,12 @@ defmodule Wagyu.InterfaceTest do
       assert %{invalid_mac1: 2, initiations: 0} = counters(context.interface, &(&1.datagrams == 2))
     end
 
-    test "hands an initiation with a valid MAC1 to a handshake worker", context do
+    test "hands an initiation with a valid MAC1 to a handshake worker, which drops a forged one", context do
       send_datagrams(context, [initiation(context.public_key)])
 
-      assert %{initiations: 1, initiations_dropped: 0} = counters(context.interface, &(&1.initiations == 1))
+      assert %{initiations: 1, initiations_dropped: 0, initiations_failed: 1} =
+               counters(context.interface, &(&1.initiations_failed == 1))
+
       supervisor = child(context.interface, :handshake_supervisor)
       assert eventually(fn -> DynamicSupervisor.count_children(supervisor).active == 0 end)
       assert running_peers(context.interface) == []
@@ -118,12 +120,14 @@ defmodule Wagyu.InterfaceTest do
                counters.invalid_datagrams + counters.initiations + counters.initiations_dropped +
                  counters.unknown_index
 
+      # Each initiation's Noise fields are arbitrary, so every one fails.
+      assert counters.initiations_failed == counters.initiations
+
       assert eventually(fn -> DynamicSupervisor.count_children(supervisor).active == 0 end)
     end
 
     test "refuses initiations beyond the waiting queue while every worker is busy", context do
-      # Workers exit at once until responder processing exists, so occupy
-      # every worker slot directly.
+      # Workers finish quickly, so occupy every worker slot directly.
       interface = child(context.interface, :interface)
       :sys.replace_state(interface, &put_in(&1.handshakes.active, 8))
 
