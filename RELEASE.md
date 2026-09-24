@@ -12,9 +12,22 @@
   reference `Wagyu.stack/1` returns for opening sockets. `Wagyu.info/1`
   reports counters, peer state and public keys, and `Wagyu.stop/1` stops the
   interface, its socket and its stack. All three accept the interface's PID
-  or its registered name. WireGuard handshakes are not implemented yet, so
-  no traffic crosses the tunnel: arriving datagrams are checked and dropped,
+  or its registered name. WireGuard handshakes are not complete yet, so no
+  traffic crosses the tunnel: arriving datagrams are checked and dropped,
   and packets sent on the stack are routed to their peer and dropped there.
+- An interface authenticates WireGuard handshake initiations and identifies
+  the configured peer that sent each one, but does not respond to them yet.
+  It refuses, silently, initiations from unknown keys, replayed or stale
+  timestamps (including after a peer's process restarts), and a second
+  initiation from one peer within 20 ms, as wireguard-go and Linux do.
+  `Wagyu.info/1` counts each outcome. Handshake cryptography runs in at
+  most 8 workers, off the socket's receive path, and at most 2 accepted
+  handshakes wait for each peer.
+- Responses, cookie replies and transport messages are delivered only to
+  the peer holding their receiver index. Indices are random and unique, and
+  one that is retired, or whose peer has exited, drops at the interface
+  and is not reused for 180 seconds.
+- Wagyu now depends on Decibel 1.1.1 or later.
 - If the stack fails, including when stopped with `SmolNet.stop_stack/1`,
   the interface restarts with a new stack and sockets opened on the old one
   must be reopened. Any other failure inside the interface keeps the stack

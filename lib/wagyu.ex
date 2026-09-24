@@ -11,9 +11,11 @@ defmodule Wagyu do
   >
   > An interface starts, opens its UDP socket and its SmolNet stack, and runs
   > under supervision, but it does not complete WireGuard handshakes yet, so
-  > no traffic crosses the tunnel. Datagrams that arrive are checked and
-  > dropped, and packets that sockets send are routed to their peer and
-  > dropped there. `info/1` counts both.
+  > no traffic crosses the tunnel. It authenticates handshake initiations
+  > from configured peers and hands each accepted one to its peer, but does
+  > not respond to them. Other datagrams are checked and dropped, and
+  > packets that sockets send are routed to their peer and dropped there.
+  > `info/1` counts all of them.
 
   ## Starting an interface
 
@@ -118,6 +120,16 @@ defmodule Wagyu do
   beyond what the interface has queued are dropped. At most 32 packets reach
   the stack in one ingress call, one call at a time.
 
+  Handshake cryptography runs only in the workers, never in the process
+  that reads the socket, so a flood of initiations cannot hold up other
+  datagrams. An initiation is accepted only from a configured peer, only
+  with a timestamp later than any accepted from that peer before, and at
+  most once every 20 ms per peer, as in wireguard-go and Linux. The
+  interface keeps these timestamps until it restarts, so a replay is
+  refused even after the peer's own process restarts. At most 2 accepted
+  handshakes wait for each peer's process, apart from its other queues;
+  beyond that, new ones are refused until it catches up.
+
   The one exception is the stack's own output. SmolNet sends each outbound
   batch to the interface without backpressure, so nothing bounds those
   messages before they arrive; the interface drains them promptly and drops
@@ -148,7 +160,8 @@ defmodule Wagyu do
       differs from the configured port when that is `0`
     * `:peers` - each configured peer's public key, endpoint and AllowedIPs,
       sorted by public key, and whether its process is `:running`. Peer
-      processes start when traffic first needs them.
+      processes start when outbound traffic or an accepted handshake
+      initiation first needs them.
     * `:counters` - packet counters. The link's (`:egress`, `:egress_dropped`,
       `:ingress`, `:ingress_dropped`) last as long as the stack; the others
       reset when the interface restarts.
@@ -163,8 +176,25 @@ defmodule Wagyu do
     * `:initiations` - handshake initiations handed to a worker
     * `:initiations_dropped` - initiations refused because the handshake
       queue was full
+    * `:initiations_failed` - initiations that failed authentication, or
+      whose worker failed
+    * `:initiations_unknown_peer` - authenticated initiations from a key
+      that is not a configured peer
+    * `:initiations_replayed` - initiations whose timestamp was not later
+      than the last one accepted from their peer
+    * `:initiations_rate_limited` - initiations less than 20 ms after the
+      last one accepted from their peer
+    * `:initiations_unavailable` - initiations whose peer process could not
+      be started or already had as many handshakes waiting as it may
+    * `:initiations_accepted` - initiations authorized and passed to their
+      peer's process
     * `:unknown_index` - responses, cookie replies and transport messages
-      for a receiver index with no live peer
+      for a receiver index with no live peer, including one retired in the
+      last 180 seconds
+    * `:inbound_routed` - responses, cookie replies and transport messages
+      queued for the peer holding their receiver index
+    * `:inbound_peer_dropped` - those dropped because the peer's queue was
+      full or it exited before taking them
     * `:egress` - packets the stack sent
     * `:egress_dropped` - packets the stack sent that were dropped because
       the interface's queue was full, it was restarting, or it exited before

@@ -5,6 +5,7 @@ defmodule Wagyu.TestHelpers do
   import ExUnit.Assertions
 
   alias Wagyu.Packet
+  alias Wagyu.Packet.Initiation
 
   @roles [:link, :interface, :handshake_supervisor, :peer_supervisor]
 
@@ -107,6 +108,54 @@ defmodule Wagyu.TestHelpers do
     frame = <<1, 0, 0, 0, :crypto.strong_rand_bytes(4)::binary, :crypto.strong_rand_bytes(140)::binary>>
     Packet.put_mac1(frame, Packet.mac1_key(public_key))
   end
+
+  @doc """
+  A genuine initiation from the holder of `initiator` (a key pair) to the
+  holder of `responder_key`, carrying `timestamp`, with a valid MAC1.
+
+  It is built with a Decibel initiator from WireGuard's parameters, stated
+  here independently of `Wagyu.Noise`.
+  """
+  def noise_initiation(responder_key, initiator, timestamp, sender_index \\ :rand.uniform(0xFFFFFFFF)) do
+    session =
+      Decibel.new("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s", :ini, %{
+        s: initiator,
+        rs: responder_key,
+        psks: [<<0::256>>],
+        prologue: "WireGuard v1 zx2c4 Jason@zx2c4.com"
+      })
+
+    <<ephemeral::binary-32, static::binary-48, encrypted_timestamp::binary-28>> =
+      session |> Decibel.handshake_encrypt(timestamp) |> IO.iodata_to_binary()
+
+    :ok = Decibel.close(session)
+
+    %Initiation{
+      sender_index: sender_index,
+      ephemeral: ephemeral,
+      encrypted_static: static,
+      encrypted_timestamp: encrypted_timestamp
+    }
+    |> Packet.encode()
+    |> Packet.put_mac1(Packet.mac1_key(responder_key))
+  end
+
+  @doc "The `n`th of a series of strictly increasing TAI64N timestamps."
+  def timestamp(n), do: <<0x400000000000000A + 1_700_000_000::64, n * 0x1000000::32>>
+
+  @doc """
+  Replaces an interface's clock with a fake one that starts at `start` and
+  moves only when `advance/2` moves it. Returns the clock.
+  """
+  def fake_clock(interface, start \\ 1_000_000) do
+    clock = :atomics.new(1, signed: true)
+    :atomics.put(clock, 1, start)
+    :sys.replace_state(interface, &%{&1 | clock: fn -> :atomics.get(clock, 1) end})
+    clock
+  end
+
+  @doc "Moves a fake clock forward by `milliseconds`."
+  def advance(clock, milliseconds), do: :atomics.add(clock, 1, milliseconds)
 
   @doc "A complete IPv4 UDP packet with valid header and UDP checksums."
   def ipv4_udp({s1, s2, s3, s4} = _source, {d1, d2, d3, d4} = _destination, source_port, destination_port, payload) do
