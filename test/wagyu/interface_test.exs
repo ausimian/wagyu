@@ -35,6 +35,15 @@ defmodule Wagyu.InterfaceTest do
 
   defp peer(interface, key), do: :sys.get_state(child(interface, :interface)).peers[key]
 
+  # Waits until the counters stop changing, and returns them.
+  defp settled(interface) do
+    eventually(fn ->
+      before = counters(interface)
+      Process.sleep(50)
+      if counters(interface) == before, do: before
+    end)
+  end
+
   describe "inbound datagrams" do
     test "drops datagrams that are not WireGuard messages", context do
       send_datagrams(context, ["", "hi", <<1, 0, 0, 0>>, <<9, 0, 0, 0, 0::256>>, <<4, 1, 0, 0, 0::256>>])
@@ -120,10 +129,20 @@ defmodule Wagyu.InterfaceTest do
 
       send_datagrams(context, for(_n <- 1..100, do: initiation(context.public_key)))
 
-      assert %{initiations: 0, initiations_dropped: 36} =
-               counters(context.interface, &(&1.initiations_dropped == 36))
-
+      # UDP may lose some of the burst, so check against what arrived.
+      counters = settled(context.interface)
+      assert counters.datagrams > 64
+      assert counters.initiations == 0
+      assert counters.initiations_dropped == counters.datagrams - 64
       assert :sys.get_state(interface).handshakes.queued == 64
+    end
+
+    test "reads whole datagrams of any size and buffers bursts", context do
+      %{socket: socket} = :sys.get_state(child(context.interface, :interface))
+      {:ok, options} = :inet.getopts(socket, [:buffer, :recbuf])
+
+      assert options[:buffer] >= 65_507
+      assert options[:recbuf] >= 65_536
     end
   end
 

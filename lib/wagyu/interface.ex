@@ -51,6 +51,14 @@ defmodule Wagyu.Interface do
   # socket may hold for a moment after that process was killed.
   @bind_attempts 10
   @bind_retry 10
+  # OTP 27 gives a UDP socket an 8 KiB receive buffer, which a burst of
+  # small datagrams overflows while the interface is busy; OTP 28 leaves the
+  # OS default. Set it explicitly so the interface behaves the same on both.
+  # The kernel may cap it lower. The driver's own buffer must hold the
+  # largest datagram whole: a transport message is up to the MTU plus 32
+  # bytes, and the MTU may be up to 65,475.
+  @recbuf 1_048_576
+  @buffer 65_535
 
   @counters [
     datagrams: 1,
@@ -295,7 +303,8 @@ defmodule Wagyu.Interface do
 
   defp open_socket(%{address: address, port: port}) do
     family = if tuple_size(address) == 4, do: [:inet], else: [:inet6, ipv6_v6only: true]
-    open_socket(port, [:binary, ip: address, active: @active] ++ family, @bind_attempts)
+    options = [:binary, ip: address, active: @active, recbuf: @recbuf, buffer: @buffer] ++ family
+    open_socket(port, options, @bind_attempts)
   end
 
   defp open_socket(port, options, attempts) do
