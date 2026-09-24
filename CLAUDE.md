@@ -3,9 +3,9 @@
 Wagyu is a user-mode WireGuard endpoint for SmolNet application sockets. The
 design and implementation order are tracked in
 https://github.com/ausimian/wagyu/issues/2. So far configuration validation,
-the wire-format building blocks and the supervised interface (UDP socket,
-SmolNet stack and link, bounded admission) exist; handshakes and the
-encrypted data path do not.
+the wire-format building blocks, the supervised interface (UDP socket,
+SmolNet stack and link, bounded admission) and peer-owned handshakes with
+key confirmation exist; the encrypted data path and timers do not.
 
 ## Development
 

@@ -51,13 +51,6 @@ defmodule Wagyu.HandshakeWorkerTest do
     error in Decibel.HandoffError -> {:error, error.reason}
   end
 
-  defp closed?(session) do
-    Decibel.handshake_complete?(session)
-    false
-  rescue
-    error in Decibel.SessionError -> error.reason == :closed
-  end
-
   defp kill(pid) do
     monitor = Process.monitor(pid)
     Process.exit(pid, :kill)

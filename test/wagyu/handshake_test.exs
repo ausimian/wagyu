@@ -1,7 +1,7 @@
 defmodule Wagyu.HandshakeTest do
   # Inbound initiations through a running interface: authorization, the
-  # handoff to peers, and the receiver-index lifecycle. The interface runs
-  # on a fake clock, so every time-based rule is exact.
+  # handoff to peers, their responses, and the receiver-index lifecycle. The
+  # interface runs on a fake clock, so every time-based rule is exact.
   use ExUnit.Case, async: true
 
   import Wagyu.TestHelpers
@@ -61,12 +61,14 @@ defmodule Wagyu.HandshakeTest do
 
   defp peer_children(context), do: DynamicSupervisor.which_children(context.children.peer_supervisor)
 
-  # Waits for the peer to hold a pending handshake with `timestamp`.
-  defp pending(context, timestamp) do
+  # Waits for the peer to have responded to the initiation carrying
+  # `timestamp`, and returns the key pair it holds for that handshake, which
+  # waits in `:next` for the initiator to confirm it.
+  defp responded(context, timestamp) do
     eventually(fn ->
       with pid when is_pid(pid) <- peer(context),
-           %{pending: %{timestamp: ^timestamp} = pending} <- :sys.get_state(pid) do
-        Map.put(pending, :peer, pid)
+           %{received: ^timestamp, next: %{} = next, endpoint: endpoint} <- :sys.get_state(pid) do
+        Map.merge(next, %{peer: pid, endpoint: endpoint})
       else
         _not_yet -> nil
       end
@@ -93,24 +95,29 @@ defmodule Wagyu.HandshakeTest do
     assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
   end
 
-  test "an authenticated initiation starts its peer, which takes the handshake and a live index", context do
+  test "an authenticated initiation starts its peer, which responds from a live index", context do
     send_datagrams(context, [genuine(context, 1, 77)])
 
-    pending = pending(context, timestamp(1))
-    assert %{sender_index: 77, source: source, local_index: index} = pending
-    assert source == context.source
-    assert lookup(context, index) == {:active, {context.peer_key, pending.peer}}
+    responded = responded(context, timestamp(1))
+    assert %{remote_index: 77, endpoint: endpoint, local_index: index} = responded
+    assert endpoint == context.source
+    assert lookup(context, index) == {:active, {context.peer_key, responded.peer}}
 
-    assert %{initiations: 1, initiations_accepted: 1, initiations_failed: 0} = settled(context)
+    assert %{initiations: 1, initiations_accepted: 1, initiations_failed: 0, responses_sent: 1} = settled(context)
     assert [_one] = peer_children(context)
 
-    # Messages for the index reach the peer; others drop at the interface.
+    # The response comes from the new index to the initiator's, with MAC1
+    # keyed for the initiator.
+    assert {:ok, {{127, 0, 0, 1}, _port, response}} = :gen_udp.recv(context.client, 0, 1_000)
+    assert {:ok, %Packet.Response{sender_index: ^index, receiver_index: 77}} = Packet.decode(response)
+    assert Packet.valid_mac1?(response, Packet.mac1_key(context.peer_key))
+
+    # Messages for the index reach the peer, which drops this unauthenticated
+    # one; others drop at the interface.
     send_datagrams(context, [transport(index), transport(index + 1)])
     assert %{inbound_routed: 1, unknown_index: 1} = counters(context.interface, &(&1.datagrams == 3))
-    assert eventually(fn -> :sys.get_state(pending.peer).inbound_dropped == 1 end)
-
-    # No response is written yet.
-    assert :gen_udp.recv(context.client, 0, 100) == {:error, :timeout}
+    assert eventually(fn -> :sys.get_state(responded.peer).inbound_dropped == 1 end)
+    assert %{transport_invalid: 1} = counters(context.interface)
   end
 
   test "concurrent initiations for one key start one peer and accept one timestamp", context do
@@ -129,7 +136,7 @@ defmodule Wagyu.HandshakeTest do
 
     %{initiations: %{} = initiations} = interface_state(context)
     %{timestamp: accepted} = Map.fetch!(initiations, context.peer_key)
-    assert pending(context, accepted)
+    assert responded(context, accepted)
 
     # The same initiation arriving many times is accepted at most once.
     advance(context.clock, 1_000)
@@ -143,7 +150,7 @@ defmodule Wagyu.HandshakeTest do
       )
 
     assert counters.initiations_accepted == 2
-    assert pending(context, timestamp(100))
+    assert responded(context, timestamp(100))
     assert [_one] = peer_children(context)
   end
 
@@ -162,7 +169,7 @@ defmodule Wagyu.HandshakeTest do
     assert %{initiations_accepted: 2, initiations_rate_limited: 1} =
              counters(context.interface, &(&1.initiations_accepted == 2))
 
-    assert pending(context, timestamp(3))
+    assert responded(context, timestamp(3))
   end
 
   # Killing the peer logs its exit.
@@ -170,7 +177,7 @@ defmodule Wagyu.HandshakeTest do
   test "replayed and stale timestamps are dropped, even after the peer restarts", context do
     frame = genuine(context, 2)
     send_datagrams(context, [frame])
-    %{peer: first} = pending(context, timestamp(2))
+    %{peer: first} = responded(context, timestamp(2))
 
     advance(context.clock, 1_000)
     send_datagrams(context, [frame, genuine(context, 1)])
@@ -187,7 +194,7 @@ defmodule Wagyu.HandshakeTest do
     assert peer(context) == nil
 
     send_datagrams(context, [genuine(context, 3)])
-    assert %{peer: second} = pending(context, timestamp(3))
+    assert %{peer: second} = responded(context, timestamp(3))
     refute second == first
   end
 
@@ -212,7 +219,7 @@ defmodule Wagyu.HandshakeTest do
 
   test "a peer that has not accepted its ticket is neither waited on nor killed", context do
     send_datagrams(context, [genuine(context, 1)])
-    %{peer: peer} = pending(context, timestamp(1))
+    %{peer: peer} = responded(context, timestamp(1))
     :ok = :sys.suspend(peer)
 
     # The claim and the handoff finish without the peer, which is left with
@@ -227,12 +234,12 @@ defmodule Wagyu.HandshakeTest do
 
     # The ticket is still good when the peer gets to it.
     :ok = :sys.resume(peer)
-    assert %{peer: ^peer} = pending(context, timestamp(2))
+    assert %{peer: ^peer} = responded(context, timestamp(2))
   end
 
   test "a peer with handoffs waiting refuses more, apart from its inbound queue", context do
     send_datagrams(context, [genuine(context, 1)])
-    %{local_index: index, peer: peer} = pending(context, timestamp(1))
+    %{local_index: index, peer: peer} = responded(context, timestamp(1))
     %{handoffs: handoffs, inbound: inbound} = Map.fetch!(interface_state(context).peers, context.peer_key)
     :ok = :sys.suspend(peer)
 
@@ -257,22 +264,22 @@ defmodule Wagyu.HandshakeTest do
 
     # Once the peer takes its handoffs, the same initiation is accepted.
     :ok = :sys.resume(peer)
-    assert %{peer: ^peer} = pending(context, timestamp(3))
+    assert %{peer: ^peer} = responded(context, timestamp(3))
     assert Admission.usage(handoffs) == {0, 0}
     send_datagrams(context, [frame])
-    assert %{peer: ^peer} = pending(context, timestamp(4))
+    assert %{peer: ^peer} = responded(context, timestamp(4))
   end
 
   # Killing the peer logs its exit.
   @tag :capture_log
   test "retired and dead-peer indices drop at the interface, and tombstones expire after 180 seconds", context do
     send_datagrams(context, [genuine(context, 1)])
-    %{local_index: first, peer: peer} = pending(context, timestamp(1))
+    %{local_index: first, peer: peer} = responded(context, timestamp(1))
 
-    # A newer handshake replaces the pending one and retires its index.
+    # A newer handshake replaces the unconfirmed one and retires its index.
     advance(context.clock, 20)
     send_datagrams(context, [genuine(context, 2)])
-    %{local_index: second} = pending(context, timestamp(2))
+    %{local_index: second} = responded(context, timestamp(2))
     refute second == first
     assert lookup(context, first) == :retired
 
@@ -307,7 +314,7 @@ defmodule Wagyu.HandshakeTest do
   @tag :capture_log
   test "messages for a live index are bounded by the peer's inbound queue", context do
     send_datagrams(context, [genuine(context, 1)])
-    %{local_index: index, peer: peer} = pending(context, timestamp(1))
+    %{local_index: index, peer: peer} = responded(context, timestamp(1))
     :ok = :sys.suspend(peer)
 
     send_datagrams(context, List.duplicate(transport(index), 200))

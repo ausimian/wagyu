@@ -42,7 +42,9 @@ defmodule Wagyu.Config do
     * `:peers` - at most 1024 peer maps, each with:
 
       * `:public_key` (required) - the peer's 32-byte X25519 public key,
-        distinct from every other peer's and from the interface's own.
+        distinct from every other peer's and from the interface's own. A
+        low-order point, such as 32 zero bytes, is not a key any handshake
+        can use, so it is `:invalid`.
       * `:endpoint` - `%{address: address, port: port}` with `port` in
         `1..65535`, a specified address, and the listen address's family.
         Omit it (or pass `nil`) when the peer always initiates, so that this
@@ -71,7 +73,7 @@ defmodule Wagyu.Config do
     * `:missing` - a required option is absent
     * `:unknown` - an unrecognized option
     * `:reserved` - a stack option that Wagyu sets itself
-    * `:invalid` - the wrong type or shape
+    * `:invalid` - the wrong type or shape, or an unusable peer public key
     * `:invalid_length` - a key that is not exactly 32 bytes
     * `:out_of_range` - a port or MTU outside its range
     * `:too_many` - more addresses, routes or peers than allowed
@@ -177,7 +179,7 @@ defmodule Wagyu.Config do
          {:ok, listen} <- listen(Keyword.get(options, :listen, @default_listen)),
          {:ok, listen_family} <- family(listen.address),
          {:ok, stack} <- stack(Keyword.get(options, :stack, [])),
-         {:ok, peers} <- peers(Keyword.get(options, :peers, []), listen_family, public_key),
+         {:ok, peers} <- peers(Keyword.get(options, :peers, []), listen_family, {public_key, private_key}),
          {:ok, allowed_ips} <- allowed_ips(peers) do
       {:ok,
        %__MODULE__{
@@ -308,17 +310,17 @@ defmodule Wagyu.Config do
 
   # Peers
 
-  defp peers(peers, listen_family, local_key) do
+  defp peers(peers, listen_family, local_keys) do
     with :ok <- list(peers, [:peers], @max_peers),
-         {:ok, peers} <- map_indexed(peers, [:peers], &peer(&1, &2, listen_family, local_key)),
+         {:ok, peers} <- map_indexed(peers, [:peers], &peer(&1, &2, listen_family, local_keys)),
          :ok <- unique(Enum.map(peers, & &1.public_key), &[:peers, &1, :public_key]) do
       {:ok, peers}
     end
   end
 
-  defp peer(value, path, listen_family, local_key) do
+  defp peer(value, path, listen_family, local_keys) do
     with :ok <- map(value, path, @peer_options, [:public_key]),
-         {:ok, public_key} <- peer_public_key(value.public_key, path ++ [:public_key], local_key),
+         {:ok, public_key} <- peer_public_key(value.public_key, path ++ [:public_key], local_keys),
          {:ok, endpoint} <- endpoint(Map.get(value, :endpoint), path ++ [:endpoint], listen_family),
          {:ok, allowed_ips} <- peer_allowed_ips(Map.get(value, :allowed_ips, []), path ++ [:allowed_ips]),
          {:ok, preshared_key} <- preshared_key(Map.fetch(value, :preshared_key), path ++ [:preshared_key]) do
@@ -326,11 +328,22 @@ defmodule Wagyu.Config do
     end
   end
 
-  defp peer_public_key(value, path, local_key) do
+  defp peer_public_key(value, path, {local_key, private_key}) do
     case key(value, path) do
       {:ok, ^local_key} -> invalid(path, :local_key)
-      result -> result
+      {:ok, key} -> if usable?(key, private_key), do: {:ok, key}, else: invalid(path, :invalid)
+      error -> error
     end
+  end
+
+  # X25519 with a low-order point, such as all zeros, yields all zeros for
+  # every private key, which Decibel rejects, so no handshake with such a
+  # peer could ever complete.
+  defp usable?(public_key, private_key) do
+    _shared = :crypto.compute_key(:ecdh, public_key, private_key, :x25519)
+    true
+  rescue
+    ErlangError -> false
   end
 
   defp endpoint(nil, _path, _listen_family), do: {:ok, nil}

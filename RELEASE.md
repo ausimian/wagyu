@@ -3,8 +3,10 @@
 - `Wagyu.Config.new/1` validates interface options: a 32-byte private key,
   the listen address, SmolNet stack options (MTU 1280 to 65,475, default 1420;
   at most 8 addresses and 4 routes), and up to 1024 peers with their public
-  keys, endpoints and AllowedIPs. Errors name the offending option, and the
-  configuration's `Inspect` implementation omits private and preshared keys.
+  keys, endpoints and AllowedIPs. A peer public key that no handshake can
+  use, such as 32 zero bytes or another low-order point, is rejected. Errors
+  name the offending option, and the configuration's `Inspect`
+  implementation omits private and preshared keys.
 - A nonzero preshared key fails validation with
   `{:error, :unsupported_preshared_key}` instead of being treated as zero.
 - `Wagyu.start_link/1`, or `{Wagyu, options}` in a supervision tree, starts
@@ -12,14 +14,40 @@
   reference `Wagyu.stack/1` returns for opening sockets. `Wagyu.info/1`
   reports counters, peer state and public keys, and `Wagyu.stop/1` stops the
   interface, its socket and its stack. All three accept the interface's PID
-  or its registered name. WireGuard handshakes are not complete yet, so no
-  traffic crosses the tunnel: arriving datagrams are checked and dropped,
-  and packets sent on the stack are routed to their peer and dropped there.
-- An interface authenticates WireGuard handshake initiations and identifies
-  the configured peer that sent each one, but does not respond to them yet.
-  It refuses, silently, initiations from unknown keys, replayed or stale
-  timestamps (including after a peer's process restarts), and a second
-  initiation from one peer within 20 ms, as wireguard-go and Linux do.
+  or its registered name. The encrypted data path is not complete yet, so
+  no traffic crosses the tunnel: packets sent on the stack are routed to
+  their peer and dropped there, and data arriving from a peer is dropped
+  once it authenticates.
+- An interface completes WireGuard handshakes with its configured peers in
+  both directions, interoperating with wireguard-go. A packet sent to a peer
+  with no session starts a handshake, from a random registered sender index
+  and with a wall-clock TAI64N timestamp that strictly increases for each
+  peer, including across restarts of its process and of the interface unless
+  the wall clock steps back. A peer with no configured endpoint responds to
+  initiations and then uses the endpoint they came from; until it has one,
+  it counts each handshake it could not start in `Wagyu.info/1`. A peer
+  starts a handshake at most once every 5 seconds, and not within 5 seconds
+  of responding to one.
+- Each peer keeps next, current and previous keys, as wireguard-go does. The
+  initiator of a handshake sends with the new keys at once and confirms
+  them with an empty keepalive; the responder keeps sending with its
+  current keys until the initiator's first transport message arrives under
+  the new ones. Transport messages still authenticate under the previous
+  keys, for packets delayed across a rekey. A rekey keeps the same peer
+  process, and keys that leave the three slots are closed and their indices
+  retired.
+- A handshake response that is not for the peer's handshake in progress, or
+  whose MAC1 or authentication fails, is dropped without changing the
+  peer's keys or endpoint.
+- `Wagyu.info/1` counts handshake initiations, responses and keepalives
+  sent, responses accepted and refused, confirmed keys, transport messages
+  that do not authenticate, handshakes a peer could not start for want of an
+  endpoint, and failed sends.
+- The interface authenticates WireGuard handshake initiations and identifies
+  the configured peer that sent each one. It refuses, silently, initiations
+  from unknown keys, replayed or stale timestamps (including after a peer's
+  process restarts), and a second initiation from one peer within 20 ms, as
+  wireguard-go and Linux do.
   `Wagyu.info/1` counts each outcome. Handshake cryptography runs in at
   most 8 workers, off the socket's receive path, and at most 2 accepted
   handshakes wait for each peer.

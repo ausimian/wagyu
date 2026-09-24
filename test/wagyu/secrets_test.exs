@@ -86,15 +86,16 @@ defmodule Wagyu.SecretsTest do
     catch_exit(GenServer.call(interface, :crash))
     children = eventually(fn -> if child(root, :interface) != interface, do: children(root) end)
 
-    # A peer raises the same way, while it holds an accepted handshake. Its
-    # Noise state, which includes the private key, lives in its process
-    # dictionary, and crash reports include the dictionary of a process
-    # that is not sensitive.
+    # A peer raises the same way, while it holds the transport session of
+    # a handshake it has responded to. Its Noise state, which includes the
+    # private key and the session keys, lives in its process dictionary, and
+    # crash reports include the dictionary of a process that is not
+    # sensitive.
     {:ok, %{public_key: public_key, listen: %{port: port}}} = Wagyu.info(root)
     {:ok, client} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}])
     :ok = :gen_udp.send(client, {127, 0, 0, 1}, port, noise_initiation(public_key, initiator, timestamp(1)))
     peer = only_child(children.peer_supervisor)
-    assert eventually(fn -> :sys.get_state(peer).pending end)
+    assert eventually(fn -> :sys.get_state(peer).next end)
     catch_exit(GenServer.call(peer, :crash))
 
     # A handshake worker fails in init, with its key pair in its arguments.

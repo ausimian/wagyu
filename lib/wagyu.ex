@@ -9,13 +9,14 @@ defmodule Wagyu do
 
   > #### Status {: .warning}
   >
-  > An interface starts, opens its UDP socket and its SmolNet stack, and runs
-  > under supervision, but it does not complete WireGuard handshakes yet, so
-  > no traffic crosses the tunnel. It authenticates handshake initiations
-  > from configured peers and hands each accepted one to its peer, but does
-  > not respond to them. Other datagrams are checked and dropped, and
-  > packets that sockets send are routed to their peer and dropped there.
-  > `info/1` counts all of them.
+  > An interface starts, opens its UDP socket and its SmolNet stack, runs
+  > under supervision, and completes WireGuard handshakes with its
+  > configured peers, both ways, but it carries no traffic yet. A packet
+  > that a socket sends to a peer with no session starts a handshake and is
+  > then dropped, as is every other packet sent; the handshake's initiator
+  > confirms the new keys with an empty keepalive. Data that a peer sends
+  > is authenticated and dropped. Handshakes that fail are not retried on a
+  > timer, and keys do not expire yet. `info/1` counts all of it.
 
   ## Starting an interface
 
@@ -120,15 +121,17 @@ defmodule Wagyu do
   beyond what the interface has queued are dropped. At most 32 packets reach
   the stack in one ingress call, one call at a time.
 
-  Handshake cryptography runs only in the workers, never in the process
-  that reads the socket, so a flood of initiations cannot hold up other
-  datagrams. An initiation is accepted only from a configured peer, only
-  with a timestamp later than any accepted from that peer before, and at
-  most once every 20 ms per peer, as in wireguard-go and Linux. The
-  interface keeps these timestamps until it restarts, so a replay is
-  refused even after the peer's own process restarts. At most 2 accepted
-  handshakes wait for each peer's process, apart from its other queues;
-  beyond that, new ones are refused until it catches up.
+  Handshake cryptography for initiations that arrive runs only in the
+  workers, never in the process that reads the socket, so a flood of
+  initiations cannot hold up other datagrams. An initiation is accepted
+  only from a configured peer, only with a timestamp later than any
+  accepted from that peer before, and at most once every 20 ms per peer, as
+  in wireguard-go and Linux. The interface keeps these timestamps until it
+  restarts, so a replay is refused even after the peer's own process
+  restarts. At most 2 accepted handshakes wait for each peer's process,
+  apart from its other queues; beyond that, new ones are refused until it
+  catches up. A peer starts a handshake at most once every 5 seconds, and
+  not within 5 seconds of responding to one, as wireguard-go does.
 
   The one exception is the stack's own output. SmolNet sends each outbound
   batch to the interface without backpressure, so nothing bounds those
@@ -158,10 +161,10 @@ defmodule Wagyu do
     * `:public_key` - the interface's public key
     * `:listen` - the UDP socket's local address and bound port, which
       differs from the configured port when that is `0`
-    * `:peers` - each configured peer's public key, endpoint and AllowedIPs,
-      sorted by public key, and whether its process is `:running`. Peer
-      processes start when outbound traffic or an accepted handshake
-      initiation first needs them.
+    * `:peers` - each configured peer's public key, configured endpoint and
+      AllowedIPs, sorted by public key, and whether its process is
+      `:running`. Peer processes start when outbound traffic or an accepted
+      handshake initiation first needs them.
     * `:counters` - packet counters. The link's (`:egress`, `:egress_dropped`,
       `:ingress`, `:ingress_dropped`) last as long as the stack; the others
       reset when the interface restarts.
@@ -195,6 +198,23 @@ defmodule Wagyu do
       queued for the peer holding their receiver index
     * `:inbound_peer_dropped` - those dropped because the peer's queue was
       full or it exited before taking them
+    * `:initiations_sent` - handshake initiations sent to peers
+    * `:initiations_no_endpoint` - handshakes that a peer needed but could
+      not start, because it has no endpoint: none configured, and none
+      learned from an initiation it accepted
+    * `:responses_sent` - handshake responses sent to accepted initiations
+    * `:responses_accepted` - responses that authenticated and completed a
+      handshake this interface initiated
+    * `:responses_invalid` - responses that reached their peer but were not
+      for its handshake in progress or did not authenticate
+    * `:keepalives_sent` - empty transport messages sent to confirm a
+      handshake this interface initiated
+    * `:keys_confirmed` - handshakes this interface responded to whose keys
+      the initiator confirmed with its first transport message, after which
+      the responder sends with them
+    * `:transport_invalid` - transport messages that reached their peer but
+      did not authenticate under any of its keys
+    * `:send_errors` - datagrams that a peer failed to send
     * `:egress` - packets the stack sent
     * `:egress_dropped` - packets the stack sent that were dropped because
       the interface's queue was full, it was restarting, or it exited before

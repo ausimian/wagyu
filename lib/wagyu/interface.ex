@@ -29,6 +29,19 @@ defmodule Wagyu.Interface do
   # to the live peer that holds it, and an unknown or retired index drops
   # here. When a peer exits, every index it held becomes a tombstone.
   #
+  # A peer that initiates a handshake gets its sender index and timestamp
+  # here together (`allocate_initiation/2`). The interface keeps the last
+  # timestamp it gave each peer, so a peer's initiations are strictly
+  # increasing across restarts of its process, and each is later than the
+  # moment the interface started. A peer never sends an initiation before
+  # the wall-clock time it names, so every timestamp sent before this
+  # interface started is at or before that moment, and later ones follow
+  # those of an interface that ran before it too. Only a wall clock that
+  # steps back can break that: timestamps then run ahead of it.
+  #
+  # Peers count their handshake events in the interface's counters, which
+  # they share, so `info/1` reports them without calling a peer.
+  #
   # Egress packets from the link are routed by destination through
   # AllowedIPs. Peers are configuration records until traffic or an
   # authorized initiation needs one; the interface then starts its process,
@@ -103,7 +116,29 @@ defmodule Wagyu.Interface do
     inbound_peer_dropped: 14,
     egress_routed: 15,
     egress_unroutable: 16,
-    egress_peer_dropped: 17
+    egress_peer_dropped: 17,
+    initiations_sent: 18,
+    initiations_no_endpoint: 19,
+    responses_sent: 20,
+    responses_accepted: 21,
+    responses_invalid: 22,
+    keys_confirmed: 23,
+    keepalives_sent: 24,
+    transport_invalid: 25,
+    send_errors: 26
+  ]
+
+  # The counters peers update.
+  @peer_counters [
+    :initiations_sent,
+    :initiations_no_endpoint,
+    :responses_sent,
+    :responses_accepted,
+    :responses_invalid,
+    :keys_confirmed,
+    :keepalives_sent,
+    :transport_invalid,
+    :send_errors
   ]
 
   @claim_errors [
@@ -191,6 +226,36 @@ defmodule Wagyu.Interface do
   end
 
   @doc """
+  Allocates a local sender index, as `allocate_index/2` does, and the
+  timestamp for the calling peer's next initiation.
+
+  The timestamp is the wall clock's when that is later than the last one
+  this interface gave the peer and than the moment the interface started.
+  Otherwise it is the next one after the later of those
+  (`Wagyu.TAI64N.next/2`), which may be slightly ahead of the wall clock.
+  Returns `:error` if the caller is not the running peer for `public_key`
+  or no interface is running.
+  """
+  @spec allocate_initiation(term(), <<_::256>>) :: {:ok, IndexTable.index(), TAI64N.t()} | :error
+  def allocate_initiation(root, public_key) do
+    case Wagyu.Registry.lookup(root, :interface) do
+      {:ok, interface, _value} -> GenServer.call(interface, {:allocate_initiation, public_key}, :infinity)
+      :error -> :error
+    end
+  catch
+    :exit, _reason -> :error
+  end
+
+  @doc """
+  Counts a peer's event in its interface's `counters`, which the interface
+  gives each peer it starts. `name` is one of the peer counters in
+  `t:Wagyu.info/0`.
+  """
+  @spec count_peer_event(:counters.counters_ref(), atom()) :: :ok
+  def count_peer_event(counters, name) when name in @peer_counters,
+    do: :counters.add(counters, Keyword.fetch!(@counters, name), 1)
+
+  @doc """
   Retires a local receiver index that the calling peer holds. The index
   becomes a drop-only tombstone and is not allocated again for 180 seconds.
   Anything else is ignored.
@@ -228,6 +293,8 @@ defmodule Wagyu.Interface do
            peers: %{},
            monitors: %{},
            initiations: %{},
+           sent: %{},
+           started: TAI64N.now(),
            indices: IndexTable.new(),
            expiry_timer: nil,
            clock: fn -> System.monotonic_time(:millisecond) end
@@ -277,12 +344,19 @@ defmodule Wagyu.Interface do
   end
 
   def handle_call({:allocate_index, key}, {caller, _tag}, state) do
-    case state.peers do
-      %{^key => %{pid: ^caller}} ->
-        {index, indices} = IndexTable.allocate(state.indices, {key, caller})
-        {:reply, {:ok, index}, %{state | indices: indices}}
+    case allocate(state, key, caller) do
+      {:ok, index, state} -> {:reply, {:ok, index}, state}
+      :error -> {:reply, :error, state}
+    end
+  end
 
-      _not_this_peer ->
+  def handle_call({:allocate_initiation, key}, {caller, _tag}, state) do
+    case allocate(state, key, caller) do
+      {:ok, index, state} ->
+        timestamp = TAI64N.next(Map.get(state.sent, key, state.started))
+        {:reply, {:ok, index, timestamp}, %{state | sent: Map.put(state.sent, key, timestamp)}}
+
+      :error ->
         {:reply, :error, state}
     end
   end
@@ -431,6 +505,19 @@ defmodule Wagyu.Interface do
     end
   end
 
+  # Indices
+
+  defp allocate(state, key, caller) do
+    case state.peers do
+      %{^key => %{pid: ^caller}} ->
+        {index, indices} = IndexTable.allocate(state.indices, {key, caller})
+        {:ok, index, %{state | indices: indices}}
+
+      _not_this_peer ->
+        :error
+    end
+  end
+
   # Claims
 
   defp authorize(state, key, timestamp, now) do
@@ -509,6 +596,7 @@ defmodule Wagyu.Interface do
       root: state.root,
       peer: config,
       socket: state.socket,
+      counters: state.counters,
       inbound: inbound,
       outbound: outbound,
       handoffs: handoffs
