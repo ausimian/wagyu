@@ -32,9 +32,24 @@ defmodule Wagyu.Config do
         full-size packet plus WireGuard's 32 bytes of framing and tag still
         fits the largest IPv4 UDP payload (65,507 bytes). Defaults to 1420, as
         in wg-quick.
+      * `:sockets` - the most sockets the stack holds at once, from 1 to
+        512. Defaults to 64, as in SmolNet. Each TCP or UDP socket takes a
+        slot, as does each member of a TCP listener's accept pool (up to 4)
+        and each interface address that a UDP socket bound to a wildcard
+        address listens on. A TCP socket that closes first keeps its slot
+        until TIME-WAIT ends, about 10 seconds after the close, so an
+        application that opens and closes connections sustains about
+        `sockets / 10` new ones a second. An open beyond the limit returns
+        `{:error, :system_limit}`. A slot holds its socket's buffers until
+        it is freed: 128 KiB for a TCP socket at SmolNet's default buffer
+        sizes and 32 KiB for a UDP socket, so 512 TCP sockets can hold about
+        64 MiB. Whatever the limit, SmolNet caps a stack's socket buffers at
+        128 MiB in total, and an open past that also returns `{:error,
+        :system_limit}`.
 
       Wagyu sets SmolNet's `:egress`, `:egress_credit`, `:limits` and
-      `:link_down` options itself, so passing them is an error. Addresses and routes follow
+      `:link_down` options itself, so passing them is an error; `:sockets`
+      reaches SmolNet within the `:limits` Wagyu sets. Addresses and routes follow
       SmolNet's own checks, so a configuration that passes here is one
       SmolNet accepts: no multicast or IPv4-mapped IPv6 addresses, no IPv4
       broadcast interface address or gateway, and no unspecified gateway.
@@ -84,7 +99,8 @@ defmodule Wagyu.Config do
     * `:reserved` - a stack option that Wagyu sets itself
     * `:invalid` - the wrong type or shape, or an unusable peer public key
     * `:invalid_length` - a key that is not exactly 32 bytes
-    * `:out_of_range` - a port, MTU or persistent keepalive outside its range
+    * `:out_of_range` - a port, MTU, socket limit or persistent keepalive
+      outside its range
     * `:too_many` - more addresses, routes or peers than allowed
     * `:family_mismatch` - an endpoint or gateway in the wrong address family
     * `:duplicate` - a repeated option, public key, address, route or prefix
@@ -108,7 +124,7 @@ defmodule Wagyu.Config do
   alias Wagyu.IP
 
   @options [:name, :private_key, :listen, :stack, :peers]
-  @stack_options [:addresses, :routes, :mtu]
+  @stack_options [:addresses, :routes, :mtu, :sockets]
   @reserved_stack_options [:egress, :egress_credit, :limits, :link_down]
   @peer_options [:public_key, :endpoint, :allowed_ips, :preshared_key, :persistent_keepalive]
   @endpoint_options [:address, :port]
@@ -118,6 +134,8 @@ defmodule Wagyu.Config do
   # 65,535 less the IPv4 and UDP headers (28) and the transport header and
   # tag (32). Padding is capped at the MTU, so it adds nothing at the limit.
   @mtu_range 1280..65_475
+  @default_sockets 64
+  @sockets_range 1..512
   @max_addresses 8
   @max_routes 4
   @max_peers 1024
@@ -130,7 +148,7 @@ defmodule Wagyu.Config do
     :private_key,
     :public_key,
     listen: @default_listen,
-    stack: [addresses: [], routes: [], mtu: @default_mtu],
+    stack: [addresses: [], routes: [], mtu: @default_mtu, sockets: @default_sockets],
     peers: %{},
     allowed_ips: %AllowedIPs{}
   ]
@@ -144,7 +162,8 @@ defmodule Wagyu.Config do
           stack: [
             addresses: [{:inet.ip_address(), non_neg_integer()}],
             routes: [{:inet.ip_address(), non_neg_integer(), :inet.ip_address()}],
-            mtu: pos_integer()
+            mtu: pos_integer(),
+            sockets: pos_integer()
           ],
           peers: %{optional(<<_::256>>) => Peer.t()},
           allowed_ips: AllowedIPs.t()
@@ -174,7 +193,7 @@ defmodule Wagyu.Config do
 
       iex> {:ok, config} = Wagyu.Config.new(private_key: :binary.copy(<<1>>, 32))
       iex> config.stack
-      [addresses: [], routes: [], mtu: 1420]
+      [addresses: [], routes: [], mtu: 1420, sockets: 64]
 
       iex> Wagyu.Config.new(private_key: <<1, 2, 3>>)
       {:error, {:invalid_option, [:private_key], :invalid_length}}
@@ -249,8 +268,9 @@ defmodule Wagyu.Config do
     with :ok <- keyword(options, [:stack], @stack_options, @reserved_stack_options),
          {:ok, addresses} <- stack_addresses(Keyword.get(options, :addresses, [])),
          {:ok, routes} <- stack_routes(Keyword.get(options, :routes, [])),
-         {:ok, mtu} <- mtu(Keyword.get(options, :mtu, @default_mtu)) do
-      {:ok, [addresses: addresses, routes: routes, mtu: mtu]}
+         {:ok, mtu} <- mtu(Keyword.get(options, :mtu, @default_mtu)),
+         {:ok, sockets} <- sockets(Keyword.get(options, :sockets, @default_sockets)) do
+      {:ok, [addresses: addresses, routes: routes, mtu: mtu, sockets: sockets]}
     end
   end
 
@@ -316,6 +336,10 @@ defmodule Wagyu.Config do
   defp mtu(mtu) when is_integer(mtu) and mtu in @mtu_range, do: {:ok, mtu}
   defp mtu(mtu) when is_integer(mtu), do: invalid([:stack, :mtu], :out_of_range)
   defp mtu(_mtu), do: invalid([:stack, :mtu], :invalid)
+
+  defp sockets(sockets) when is_integer(sockets) and sockets in @sockets_range, do: {:ok, sockets}
+  defp sockets(sockets) when is_integer(sockets), do: invalid([:stack, :sockets], :out_of_range)
+  defp sockets(_sockets), do: invalid([:stack, :sockets], :invalid)
 
   # Peers
 

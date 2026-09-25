@@ -60,6 +60,18 @@ defmodule WagyuTest do
                Wagyu.start_link(options(listen: %{address: {127, 0, 0, 1}, port: port}))
     end
 
+    test "starts its stack with the configured socket limit" do
+      stack_options = Keyword.put(options()[:stack], :sockets, 65)
+      {:ok, interface} = Wagyu.start_link(options(stack: stack_options))
+      {:ok, stack} = Wagyu.stack(interface)
+
+      assert {:ok, %{native: %{result: %{native_socket_capacity: 65}}}} = SmolNet.stack_info(stack)
+
+      for _n <- 1..65, do: assert({:ok, _socket} = SmolNet.open(:inet, :dgram, :udp, stack: stack))
+      assert {:error, :system_limit} = SmolNet.open(:inet, :dgram, :udp, stack: stack)
+      assert :ok = Wagyu.stop(interface)
+    end
+
     test "listens on IPv6" do
       [peer] = options()[:peers]
       peer = %{peer | endpoint: %{address: {0, 0, 0, 0, 0, 0, 0, 1}, port: 51_820}}
