@@ -53,12 +53,16 @@ defmodule Wagyu.Config do
         send from and that route to it. Host bits are cleared. Nested prefixes
         are allowed and the longest match wins, but an exact prefix may appear
         only once across all peers. Defaults to `[]`.
-      * `:preshared_key` - omit it for no preshared key, which the protocol
-        treats as 32 zero bytes. An explicit 32 zero bytes is accepted too.
-        Any nonzero key fails with `{:error, :unsupported_preshared_key}`
-        rather than being silently replaced by zeros. `nil` is rejected as
-        `:invalid` rather than treated as omitted, so an unset variable
-        cannot quietly disable a key.
+      * `:preshared_key` - a 32-byte symmetric key shared with the peer,
+        as `wg genpsk` makes, mixed into every handshake with it. Both
+        sides must configure the same key: a handshake with a peer whose
+        key differs, or that has none, never completes and yields no key
+        either side sends with. Omit it for no preshared key, which the
+        protocol treats as 32 zero bytes, so an explicit 32 zero bytes also
+        means none, as in WireGuard. A configured key is always used, never
+        replaced by zeros. `nil` is rejected as `:invalid` rather than
+        treated as omitted, so an unset variable cannot quietly disable a
+        key.
       * `:persistent_keepalive` - seconds, from 1 to 65,535, after which the
         interface sends the peer a keepalive if nothing else has passed
         between them, to keep a NAT or firewall mapping open. `0`, the
@@ -70,8 +74,7 @@ defmodule Wagyu.Config do
 
   ## Errors
 
-  `new/1` returns `{:error, :unsupported_preshared_key}` for a nonzero
-  preshared key and otherwise `{:error, {:invalid_option, path, reason}}`.
+  `new/1` returns `{:error, {:invalid_option, path, reason}}`.
   `path` locates the option, with list positions as zero-based indices, for
   example `[:peers, 1, :allowed_ips, 0]`. Errors never contain option values,
   so they are safe to log. `reason` is one of:
@@ -162,7 +165,7 @@ defmodule Wagyu.Config do
           | :duplicate
           | :local_key
 
-  @type error :: :unsupported_preshared_key | {:invalid_option, path(), reason()}
+  @type error :: {:invalid_option, path(), reason()}
 
   @doc """
   Validates interface options.
@@ -385,13 +388,10 @@ defmodule Wagyu.Config do
       else: invalid(path, :invalid)
   end
 
-  # An omitted preshared key is the protocol's all-zero key. A nonzero key is
-  # an explicit error until preshared keys are supported: it must never fall
-  # back to zero. `nil` is rejected too, because an unset variable that was
-  # meant to hold a key would otherwise silently disable it.
+  # An omitted preshared key is the protocol's all-zero key. `nil` is
+  # rejected, because an unset variable that was meant to hold a key would
+  # otherwise silently disable it.
   defp preshared_key(:error, _path), do: {:ok, @zero_key}
-  defp preshared_key({:ok, @zero_key}, _path), do: {:ok, @zero_key}
-  defp preshared_key({:ok, <<_::binary-32>>}, _path), do: {:error, :unsupported_preshared_key}
   defp preshared_key({:ok, value}, path), do: key(value, path)
 
   defp persistent_keepalive(seconds, _path) when is_integer(seconds) and seconds in 0..65_535, do: {:ok, seconds}

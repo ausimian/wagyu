@@ -117,7 +117,7 @@ defmodule Wagyu.WgPeer do
     end
   end
 
-  defp uapi_line({key, <<_::binary-32>> = value}) when key in [:private_key, :public_key],
+  defp uapi_line({key, <<_::binary-32>> = value}) when key in [:private_key, :public_key, :preshared_key],
     do: "#{key}=#{Base.encode16(value, case: :lower)}"
 
   defp uapi_line({key, value}), do: "#{key}=#{value}"

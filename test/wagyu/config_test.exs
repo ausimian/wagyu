@@ -187,25 +187,30 @@ defmodule Wagyu.ConfigTest do
   end
 
   describe "preshared keys" do
-    test "accept an omitted or all-zero key as the zero key" do
-      assert {:ok, config} = Config.new(options(peers: [peer(%{preshared_key: <<0::256>>})]))
-      assert [%Peer{preshared_key: <<0::256>>}] = Map.values(config.peers)
-    end
-
-    test "reject every nonzero key instead of replacing it with zeros" do
-      for bit <- 0..255 do
-        key = <<0::size(bit), 1::1, 0::size(255 - bit)>>
-        assert Config.new(options(peers: [peer(%{preshared_key: key})])) == {:error, :unsupported_preshared_key}
-      end
-
-      for key <- [:binary.copy(<<0xFF>>, 32), :crypto.strong_rand_bytes(32)] do
-        assert Config.new(options(peers: [peer(%{preshared_key: key})])) == {:error, :unsupported_preshared_key}
+    test "accept an omitted or all-zero key as no key, the zero key" do
+      for peer <- [peer(), peer(%{preshared_key: <<0::256>>})] do
+        assert {:ok, config} = Config.new(options(peers: [peer]))
+        assert [%Peer{preshared_key: <<0::256>>}] = Map.values(config.peers)
       end
     end
 
-    test "reject a nonzero key on any peer" do
-      peers = [peer(%{allowed_ips: []}), peer(%{allowed_ips: []}), peer(%{preshared_key: :binary.copy(<<7>>, 32)})]
-      assert Config.new(options(peers: peers)) == {:error, :unsupported_preshared_key}
+    test "keep every nonzero key as configured, never replacing it with zeros" do
+      keys =
+        [:binary.copy(<<0xFF>>, 32), :crypto.strong_rand_bytes(32)] ++
+          for bit <- 0..255, do: <<0::size(bit), 1::1, 0::size(255 - bit)>>
+
+      for key <- keys do
+        assert {:ok, config} = Config.new(options(peers: [peer(%{preshared_key: key})]))
+        assert [%Peer{preshared_key: ^key}] = Map.values(config.peers)
+      end
+    end
+
+    test "keep each peer's own key, and none for peers without one" do
+      [first, second] = [:binary.copy(<<7>>, 32), :binary.copy(<<8>>, 32)]
+      peers = [peer(%{preshared_key: first}), peer(%{allowed_ips: []}), peer(%{allowed_ips: [], preshared_key: second})]
+      assert {:ok, config} = Config.new(options(peers: peers))
+
+      assert Enum.map(peers, &config.peers[&1.public_key].preshared_key) == [first, <<0::256>>, second]
     end
 
     test "reject nil and mis-sized keys" do

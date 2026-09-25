@@ -4,10 +4,9 @@ defmodule Wagyu.Config.Peer do
 
   `:allowed_ips` holds normalized prefixes (host bits cleared) in configured
   order. `:endpoint` is `nil` for a responder-only peer. `:preshared_key` is
-  the protocol's all-zero key, the only one this release supports; the
-  struct's `Inspect` implementation omits it all the same, with the limits
-  described in `Wagyu.Config`. `:persistent_keepalive` is in seconds, `0` for
-  none.
+  the configured key, or 32 zero bytes for none. The struct's `Inspect`
+  implementation omits it, with the limits described in `Wagyu.Config`.
+  `:persistent_keepalive` is in seconds, `0` for none.
   """
 
   @derive {Inspect, except: [:preshared_key]}

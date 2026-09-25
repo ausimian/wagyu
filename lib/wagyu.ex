@@ -50,7 +50,7 @@ defmodule Wagyu do
   caller. On success it returns `{:ok, pid}`, where `pid` is that
   per-interface supervisor, whether or not a `:name` is given. Invalid options
   fail startup with the error `Wagyu.Config.new/1` returns, such as
-  `{:error, :unsupported_preshared_key}`. `start_link/1` also accepts a
+  `{:error, {:invalid_option, [:private_key], :missing}}`. `start_link/1` also accepts a
   configuration that `Wagyu.Config.new/1` has already validated.
 
       {:ok, interface} =

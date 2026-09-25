@@ -17,15 +17,18 @@ defmodule Wagyu.Peer do
   # mailbox.
   #
   # Responding. After the interface authorizes an initiation for this peer,
-  # the handshake worker hands its responder session over with
-  # `{:wg_handoff, ticket, metadata}`, where `metadata` holds the initiator's
-  # sender index, the initiation's timestamp and its source. The peer
+  # the handshake worker hands its responder session, which has this peer's
+  # preshared key, over with `{:wg_handoff, ticket, metadata}`, where
+  # `metadata` holds the initiator's sender index, the initiation's
+  # timestamp and its source. The peer
   # accepts the ticket, registers a local index with the interface, and
   # writes the response straight away: its sender index is the new local
   # index and its receiver index the initiator's sender index. The source
   # becomes the endpoint. An initiation no newer than the last one the peer
   # took, which a slow worker can deliver late, is closed instead, and a
-  # ticket that cannot be accepted is dropped. Unlike wireguard-go, which
+  # ticket that cannot be accepted is dropped. A worker that claimed this
+  # peer but has no session to hand over sends `:wg_handoff_abandoned`
+  # instead, which releases its handoff. Unlike wireguard-go, which
   # has room for one handshake per peer, responding does not abandon an
   # initiation of the peer's own in flight, so when both sides initiate at
   # once both handshakes complete and neither waits for a retry.
@@ -252,6 +255,11 @@ defmodule Wagyu.Peer do
     {:noreply, state |> accept_handshake(ticket, metadata) |> arm()}
   end
 
+  def handle_info(:wg_handoff_abandoned, state) do
+    Admission.release(state.handoffs, 1, 0)
+    {:noreply, state}
+  end
+
   def handle_info({:wg_outbound, packet}, state) do
     Admission.release(state.outbound, 1, byte_size(packet))
     {:noreply, state |> send_packet(packet) |> arm()}
@@ -357,7 +365,7 @@ defmodule Wagyu.Peer do
   defp send_initiation(state) do
     case Interface.allocate_initiation(state.root, state.public_key) do
       {:ok, index, timestamp} ->
-        session = Noise.initiator(state.identity, state.public_key)
+        session = Noise.initiator(state.identity, state.public_key, state.peer.preshared_key)
         frame = Noise.write_initiation(session, index, timestamp, state.mac1_key)
         :ok = wait_for(timestamp)
         initiation = %{session: session, local_index: index, timestamp: timestamp, sent_at: state.clock.()}

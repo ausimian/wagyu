@@ -119,8 +119,8 @@ defmodule Wagyu.TestHelpers do
   A genuine initiation from the holder of `initiator` (a key pair) to the
   holder of `responder_key`, carrying `timestamp`, with a valid MAC1.
   """
-  def noise_initiation(responder_key, initiator, timestamp, sender_index \\ random_index()) do
-    {frame, session} = initiate_to(responder_key, initiator, timestamp, sender_index)
+  def noise_initiation(responder_key, initiator, timestamp, sender_index \\ random_index(), psk \\ @zero_psk) do
+    {frame, session} = initiate_to(responder_key, initiator, timestamp, sender_index, psk)
     :ok = Decibel.close(session)
     frame
   end
@@ -128,10 +128,11 @@ defmodule Wagyu.TestHelpers do
   @doc """
   Plays the initiator: returns a genuine initiation, as `noise_initiation/4`
   does, and the Decibel session that wrote it, owned by the caller and
-  waiting for the response (see `complete/2`).
+  waiting for the response (see `complete/2`). `psk` is the preshared key,
+  32 zero bytes for none.
   """
-  def initiate_to(responder_key, initiator, timestamp, sender_index \\ random_index()) do
-    session = Decibel.new(@protocol, :ini, %{s: initiator, rs: responder_key, psks: [@zero_psk], prologue: @prologue})
+  def initiate_to(responder_key, initiator, timestamp, sender_index \\ random_index(), psk \\ @zero_psk) do
+    session = Decibel.new(@protocol, :ini, %{s: initiator, rs: responder_key, psks: [psk], prologue: @prologue})
 
     <<ephemeral::binary-32, static::binary-48, encrypted_timestamp::binary-28>> =
       session |> Decibel.handshake_encrypt(timestamp) |> IO.iodata_to_binary()
@@ -167,12 +168,13 @@ defmodule Wagyu.TestHelpers do
   `responder` (a key pair), reads it with a Decibel responder and writes a
   response from `sender_index` with a valid MAC1. Returns the response
   frame, the responder's transport session, owned by the caller, and what
-  the initiation carried.
+  the initiation carried. `psk` is the preshared key, 32 zero bytes for
+  none.
   """
-  def respond_to(initiation, {public_key, _private_key} = responder, sender_index \\ random_index()) do
+  def respond_to(initiation, {public_key, _private_key} = responder, sender_index \\ random_index(), psk \\ @zero_psk) do
     assert Packet.valid_mac1?(initiation, Packet.mac1_key(public_key))
     {:ok, %Initiation{} = message} = Packet.decode(initiation)
-    session = Decibel.new(@protocol, :rsp, %{s: responder, psks: [@zero_psk], prologue: @prologue})
+    session = Decibel.new(@protocol, :rsp, %{s: responder, psks: [psk], prologue: @prologue})
 
     timestamp =
       session

@@ -6,8 +6,10 @@ defmodule Wagyu.HandshakeWorkerTest do
   alias Wagyu.Config
   alias Wagyu.HandshakeWorker
   alias Wagyu.Noise
+  alias Wagyu.Packet
 
   @source {{127, 0, 0, 1}, 51_820}
+  @zero_psk <<0::256>>
 
   setup do
     {:ok, identity} = Config.new(private_key: elem(keypair(), 1))
@@ -24,6 +26,23 @@ defmodule Wagyu.HandshakeWorkerTest do
     end
   end
 
+  # Responder sessions for `respond/5`'s second read, made for `identity`.
+  # Each one is reported to the test process.
+  defp responder(identity) do
+    test = self()
+
+    fn psk ->
+      session = Noise.responder(identity, psk)
+      send(test, {:responder, psk, session})
+      session
+    end
+  end
+
+  defp peer_config(psk), do: %Config.Peer{public_key: elem(keypair(), 0), preshared_key: psk}
+
+  defp respond(context, session, frame, claim),
+    do: HandshakeWorker.respond(session, frame, @source, claim, responder(context.identity))
+
   # A stand-in peer. It reports every message it receives, accepts a ticket
   # in its own process when told to, and exits with the test.
   defp target do
@@ -39,6 +58,7 @@ defmodule Wagyu.HandshakeWorkerTest do
     receive do
       {:DOWN, ^monitor, :process, _test, _reason} -> exit(:normal)
       {:accept, ticket} -> send(test, {:target_accepted, accept(ticket)})
+      {:respond, ticket, mac1_key} -> send(test, {:target_responded, write_response(ticket, mac1_key)})
       message -> send(test, {:target_received, message})
     end
 
@@ -49,6 +69,12 @@ defmodule Wagyu.HandshakeWorkerTest do
     {:ok, Decibel.handshake_complete?(Decibel.accept_handoff(ticket))}
   rescue
     error in Decibel.HandoffError -> {:error, error.reason}
+  end
+
+  # Accepts a ticket and writes the response to sender index 77 from it.
+  defp write_response(ticket, mac1_key) do
+    {:ok, frame} = ticket |> Decibel.accept_handoff() |> Noise.write_response(1, 77, mac1_key)
+    frame
   end
 
   defp kill(pid) do
@@ -63,7 +89,7 @@ defmodule Wagyu.HandshakeWorkerTest do
     session = Noise.responder(context.identity)
     peer = target()
 
-    assert HandshakeWorker.respond(session, frame, @source, claim({:ok, peer})) == {:ok, peer}
+    assert respond(context, session, frame, claim({:ok, peer, peer_config(@zero_psk)})) == {:ok, peer}
 
     expected_timestamp = timestamp(1)
     assert_received {:claim, ^initiator_key, ^expected_timestamp}
@@ -103,11 +129,14 @@ defmodule Wagyu.HandshakeWorkerTest do
 
     for frame <- frames do
       session = Noise.responder(context.identity)
-      assert HandshakeWorker.respond(session, frame, @source, claim({:ok, peer})) == {:error, :authentication_failed}
+      claim = claim({:ok, peer, peer_config(:binary.copy(<<7>>, 32))})
+      assert respond(context, session, frame, claim) == {:error, :authentication_failed}
       assert closed?(session)
     end
 
+    # Nor does it read again with the peer's preshared key.
     refute_received {:claim, _key, _timestamp}
+    refute_received {:responder, _psk, _session}
     refute_receive {:target_received, _message}, 50
   end
 
@@ -116,7 +145,7 @@ defmodule Wagyu.HandshakeWorkerTest do
       frame = noise_initiation(context.identity.public_key, context.initiator, timestamp(1))
       session = Noise.responder(context.identity)
 
-      assert HandshakeWorker.respond(session, frame, @source, claim({:error, reason})) == {:error, reason}
+      assert respond(context, session, frame, claim({:error, reason})) == {:error, reason}
       assert_received {:claim, _key, _timestamp}
       assert closed?(session)
     end
@@ -131,8 +160,17 @@ defmodule Wagyu.HandshakeWorkerTest do
     frame = noise_initiation(context.identity.public_key, context.initiator, timestamp(1))
     session = Noise.responder(context.identity)
 
-    assert HandshakeWorker.respond(session, frame, @source, claim({:ok, peer})) == {:error, :handoff_failed}
+    assert respond(context, session, frame, claim({:ok, peer, peer_config(@zero_psk)})) == {:error, :handoff_failed}
     assert closed?(session)
+
+    # With a preshared key, the session of the second read is closed too.
+    session = Noise.responder(context.identity)
+
+    assert respond(context, session, frame, claim({:ok, peer, peer_config(:binary.copy(<<7>>, 32))})) ==
+             {:error, :handoff_failed}
+
+    assert_received {:responder, _psk, rekeyed}
+    assert closed?(session) and closed?(rekeyed)
   end
 
   test "a ticket its peer never accepts is discarded when that peer exits", context do
@@ -140,7 +178,7 @@ defmodule Wagyu.HandshakeWorkerTest do
     session = Noise.responder(context.identity)
     peer = target()
 
-    assert {:ok, ^peer} = HandshakeWorker.respond(session, frame, @source, claim({:ok, peer}))
+    assert {:ok, ^peer} = respond(context, session, frame, claim({:ok, peer, peer_config(@zero_psk)}))
     assert_receive {:target_received, {:wg_handoff, ticket, _metadata}}
 
     # Nothing is waiting on the peer: the worker has nothing left, and the
@@ -151,6 +189,82 @@ defmodule Wagyu.HandshakeWorkerTest do
 
     kill(peer)
     assert eventually(fn -> accept(ticket) == {:error, :unavailable} end)
+  end
+
+  describe "a peer with a preshared key" do
+    setup context do
+      Map.merge(context, %{psk: :binary.copy(<<7>>, 32), mac1_key: Packet.mac1_key(elem(context.initiator, 0))})
+    end
+
+    # Hands an initiation made with `psk` to a peer whose key is `peer_psk`,
+    # and returns the response the peer writes and the initiator's session,
+    # waiting for it.
+    defp exchange(context, psk, peer_psk) do
+      {frame, initiator} = initiate_to(context.identity.public_key, context.initiator, timestamp(1), 77, psk)
+      session = Noise.responder(context.identity)
+      peer = target()
+
+      assert respond(context, session, frame, claim({:ok, peer, peer_config(peer_psk)})) == {:ok, peer}
+      assert_receive {:target_received, {:wg_handoff, ticket, %{sender_index: 77}}}
+      send(peer, {:respond, ticket, context.mac1_key})
+      assert_receive {:target_responded, response}
+
+      # The session of the first read, without the key, was closed rather
+      # than handed off.
+      assert_received {:responder, ^peer_psk, _rekeyed}
+      assert closed?(session)
+      {response, initiator}
+    end
+
+    test "gets a session read again with its key, which completes with its initiator", context do
+      {response, initiator} = exchange(context, context.psk, context.psk)
+      assert complete(initiator, response) == :ok
+    end
+
+    test "an initiator with another key, or none, rejects the response", context do
+      for initiator_psk <- [:binary.copy(<<8>>, 32), @zero_psk] do
+        {response, initiator} = exchange(context, initiator_psk, context.psk)
+        assert complete(initiator, response) == :error
+      end
+    end
+
+    test "an initiator with a key rejects the response of a peer without one", context do
+      {frame, initiator} = initiate_to(context.identity.public_key, context.initiator, timestamp(1), 77, context.psk)
+      peer = target()
+
+      assert respond(context, Noise.responder(context.identity), frame, claim({:ok, peer, peer_config(@zero_psk)})) ==
+               {:ok, peer}
+
+      assert_receive {:target_received, {:wg_handoff, ticket, _metadata}}
+      send(peer, {:respond, ticket, context.mac1_key})
+      assert_receive {:target_responded, response}
+
+      # A peer without a key reads once.
+      refute_received {:responder, _psk, _session}
+      assert complete(initiator, response) == :error
+    end
+
+    test "a second read that fails hands off nothing and releases the claimed handoff", context do
+      {:ok, other} = Config.new(private_key: elem(keypair(), 1))
+      frame = noise_initiation(context.identity.public_key, context.initiator, timestamp(1), 77, context.psk)
+      session = Noise.responder(context.identity)
+      peer = target()
+
+      # A responder for another interface cannot read the initiation.
+      assert HandshakeWorker.respond(
+               session,
+               frame,
+               @source,
+               claim({:ok, peer, peer_config(context.psk)}),
+               responder(other)
+             ) ==
+               {:error, :preshared_key_failed}
+
+      assert_received {:responder, _psk, rekeyed}
+      assert closed?(session) and closed?(rekeyed)
+      assert_receive {:target_received, :wg_handoff_abandoned}
+      refute_receive {:target_received, _message}, 50
+    end
   end
 
   describe "a worker process" do
@@ -175,10 +289,27 @@ defmodule Wagyu.HandshakeWorkerTest do
 
       expected_timestamp = timestamp(3)
       assert_receive {:"$gen_call", from, {:claim_peer, ^initiator_key, ^expected_timestamp}}
-      GenServer.reply(from, {:ok, peer})
+      GenServer.reply(from, {:ok, peer, peer_config(@zero_psk)})
 
       assert_receive {:target_received, {:wg_handoff, _ticket, %{timestamp: ^expected_timestamp}}}
       assert_receive {:EXIT, ^worker, :normal}
+    end
+
+    test "reads again with its peer's preshared key before handing off", context do
+      {initiator_key, _private_key} = context.initiator
+      psk = :binary.copy(<<7>>, 32)
+      peer = target()
+      {frame, initiator} = initiate_to(context.identity.public_key, context.initiator, timestamp(3), 77, psk)
+      worker = start_worker(context, frame)
+
+      assert_receive {:"$gen_call", from, {:claim_peer, ^initiator_key, _timestamp}}
+      GenServer.reply(from, {:ok, peer, peer_config(psk)})
+
+      assert_receive {:target_received, {:wg_handoff, ticket, _metadata}}
+      assert_receive {:EXIT, ^worker, :normal}
+      send(peer, {:respond, ticket, Packet.mac1_key(initiator_key)})
+      assert_receive {:target_responded, response}
+      assert complete(initiator, response) == :ok
     end
 
     test "exits normally when its claim is rejected", context do

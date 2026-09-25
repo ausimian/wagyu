@@ -45,10 +45,10 @@ defmodule WagyuTest do
       assert Wagyu.start_link([]) == {:error, {:invalid_option, [:private_key], :missing}}
 
       [peer] = options()[:peers]
-      psk = :binary.copy(<<7>>, 32)
+      psk = :binary.copy(<<7>>, 31)
 
       assert Wagyu.start_link(options(peers: [Map.put(peer, :preshared_key, psk)])) ==
-               {:error, :unsupported_preshared_key}
+               {:error, {:invalid_option, [:peers, 0, :preshared_key], :invalid_length}}
     end
 
     test "fails to start when its UDP port is taken" do
@@ -165,10 +165,13 @@ defmodule WagyuTest do
       error = assert_raise ArgumentError, fn -> Wagyu.child_spec(private_key: "not a key") end
       assert error.message == "invalid Wagyu options: {:invalid_option, [:private_key], :invalid_length}"
 
-      assert_raise ArgumentError, ~r/:unsupported_preshared_key/, fn ->
-        [peer] = options()[:peers]
-        Wagyu.child_spec(options(peers: [Map.put(peer, :preshared_key, :binary.copy(<<7>>, 32))]))
-      end
+      [peer] = options()[:peers]
+      psk = :binary.copy(<<7>>, 31)
+
+      error =
+        assert_raise ArgumentError, fn -> Wagyu.child_spec(options(peers: [Map.put(peer, :preshared_key, psk)])) end
+
+      assert error.message == "invalid Wagyu options: {:invalid_option, [:peers, 0, :preshared_key], :invalid_length}"
     end
   end
 
