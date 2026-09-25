@@ -387,6 +387,26 @@ defmodule Wagyu.DataPathTest do
   end
 
   describe "key limits" do
+    test "a key's age runs from the initiation, so a response 180 seconds late yields no usable key", context do
+      {udp, _port} = smolnet_udp(context, :inet)
+      :ok = SmolNet.sendto(udp, "waiting", %{family: :inet, addr: @a_host, port: 9})
+      initiation = receive_datagram(context, context.a)
+      peer = eventually(fn -> peer(context, context.a) end)
+      %{initiation: %{sent_at: sent_at}} = :sys.get_state(peer)
+      advance(fake_clock(peer, sent_at), 180_000)
+
+      # The response still completes the handshake, but its key is already
+      # as old as the responder's will be, so the staged packet waits for a
+      # new handshake instead of going out under it.
+      {response, _session, _sent} = respond_to(initiation, context.a.keypair, 7)
+      to_wagyu(context, response, context.a.socket)
+      assert <<1, _rest::binary>> = receive_datagram(context, context.a)
+      refute_datagram(context.a.socket)
+      assert %{current: %{remote_index: 7}} = state = :sys.get_state(peer)
+      assert [_waiting] = :queue.to_list(state.staged)
+      assert %{responses_accepted: 1, transport_sent: 0, initiations_sent: 2} = counters(context.interface)
+    end
+
     test "a key sends and receives nothing once it is 180 seconds old", context do
       key = handshake(context, context.a)
       {udp, port} = smolnet_udp(context, :inet)

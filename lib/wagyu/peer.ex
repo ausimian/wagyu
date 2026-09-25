@@ -231,7 +231,7 @@ defmodule Wagyu.Peer do
   defp respond(state, session, index, %{sender_index: remote_index, timestamp: timestamp, source: source}) do
     case Noise.write_response(session, index, remote_index, state.mac1_key) do
       {:ok, frame} ->
-        state = install_next(state, key_pair(state, session, index, remote_index))
+        state = install_next(state, key_pair(session, index, remote_index, state.clock.()))
         transmit(%{state | endpoint: source, received: timestamp}, frame, :responses_sent)
 
       :error ->
@@ -250,8 +250,8 @@ defmodule Wagyu.Peer do
          {:ok, index, timestamp} <- Interface.allocate_initiation(state.root, state.public_key) do
       session = Noise.initiator(state.identity, state.public_key)
       frame = Noise.write_initiation(session, index, timestamp, state.mac1_key)
-      initiation = %{session: session, local_index: index, timestamp: timestamp}
       :ok = wait_for(timestamp)
+      initiation = %{session: session, local_index: index, timestamp: timestamp, sent_at: state.clock.()}
       transmit(%{discard_initiation(state) | initiation: initiation}, frame, :initiations_sent)
     else
       :error -> state
@@ -293,9 +293,13 @@ defmodule Wagyu.Peer do
   end
 
   defp response(state, index, response, source) do
-    with %{local_index: ^index, session: session} <- state.initiation,
+    with %{local_index: ^index, session: session, sent_at: sent_at} <- state.initiation,
          :ok <- Noise.read_response(session, response) do
-      key_pair = key_pair(state, session, index, response.sender_index)
+      # The initiator's key is as old as its initiation, so it is never
+      # younger than the responder's, which dates from the response: a
+      # response that arrives too late yields a key already expired, and
+      # the next packet starts a new handshake.
+      key_pair = key_pair(session, index, response.sender_index, sent_at)
 
       %{state | initiation: nil, endpoint: source}
       |> install_current(key_pair)
@@ -356,12 +360,12 @@ defmodule Wagyu.Peer do
 
   # Key slots
 
-  defp key_pair(state, session, local_index, remote_index) do
+  defp key_pair(session, local_index, remote_index, created_at) do
     %{
       session: session,
       local_index: local_index,
       remote_index: remote_index,
-      created_at: state.clock.(),
+      created_at: created_at,
       replay: ReplayWindow.new(@replay_window)
     }
   end

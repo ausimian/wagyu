@@ -37,7 +37,9 @@
   that roams keeps its tunnel.
 - A key is used for at most 180 seconds after its handshake, in either
   direction, and never beyond 2^64 - 2^13 - 1 messages; the next packet then
-  waits for a new handshake. Automatic rekeying before that point is not
+  waits for a new handshake. An initiator counts those seconds from its
+  initiation, so a response that arrives too late cannot leave it sending
+  under a key the responder has already retired. Automatic rekeying before that point is not
   implemented yet.
 - Outbound packets are padded to a multiple of 16 bytes, but never beyond the
   MTU.
