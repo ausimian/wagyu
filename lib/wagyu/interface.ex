@@ -122,8 +122,10 @@ defmodule Wagyu.Interface do
   @buffer 65_535
   # The socket backend sends from the calling process through the socket
   # NIF, about a quarter faster per datagram than the inet driver. Peers
-  # send their own datagrams on this socket, so they get that too.
-  @inet_backend :socket
+  # send their own datagrams on this socket, so they get that too. Before
+  # OTP 27.2 (kernel 10.2) the backend sets `ipv6_v6only` only after binding,
+  # which fails, so an IPv6 socket there keeps the inet driver.
+  @v6only_before_bind [10, 2]
   # How long after a peer with a persistent keepalive fails the interface
   # starts it again, so a peer that fails at once cannot spin.
   @peer_restart 1_000
@@ -837,9 +839,16 @@ defmodule Wagyu.Interface do
   defp open_socket(%{address: address, port: port}) do
     family = if tuple_size(address) == 4, do: [:inet], else: [:inet6, ipv6_v6only: true]
     # The backend option must come first.
-    options = [{:inet_backend, @inet_backend}, :binary, ip: address, active: @active, recbuf: @recbuf, buffer: @buffer]
-    options = options ++ family
+    options = [{:inet_backend, inet_backend(address)}, :binary, ip: address, active: @active]
+    options = options ++ [recbuf: @recbuf, buffer: @buffer] ++ family
     open_socket(port, options, @bind_attempts)
+  end
+
+  defp inet_backend(address) when tuple_size(address) == 4, do: :socket
+
+  defp inet_backend(_address) do
+    kernel = :kernel |> Application.spec(:vsn) |> to_string() |> String.split(".") |> Enum.map(&String.to_integer/1)
+    if kernel >= @v6only_before_bind, do: :socket, else: :inet
   end
 
   defp open_socket(port, options, attempts) do
