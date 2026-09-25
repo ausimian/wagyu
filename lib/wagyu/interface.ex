@@ -63,9 +63,14 @@ defmodule Wagyu.Interface do
   # Every send to a peer is admitted against that peer's bound first.
   # Messages that cannot be admitted or acted on are dropped and counted.
   # Egress also counts against the link's credit (`Wagyu.EgressCredit`)
-  # until a peer sends or stages it or it is dropped, and whoever retires
-  # it tells the link, so that the stack sends no more than this interface
-  # and its peers have room for.
+  # while the interface or a peer's queue holds it, so that the stack sends
+  # no more than they have room for. The interface records the credit each
+  # peer holds, what it has admitted to the peer's queue and not yet
+  # retired. When the peer has taken a batch (`outbound_taken/2`), the
+  # interface retires whatever the queue no longer holds, and when the peer
+  # goes, all of it. The queue's own count is the only one the peer
+  # changes, so this is exact however the peer exits. Whenever the interface
+  # retires credit it tells the link.
   #
   # A peer that has been idle long enough to discard its keys asks to be
   # forgotten (`release_peer/3`) and exits once it is. The interface agrees
@@ -329,6 +334,21 @@ defmodule Wagyu.Interface do
     do: :counters.add(counters, Keyword.fetch!(@counters, name), increment)
 
   @doc """
+  Tells `root`'s interface that the calling peer, the running peer for
+  `public_key`, has taken outbound packets off its queue, so that their
+  egress credit is free again.
+  """
+  @spec outbound_taken(term(), <<_::256>>) :: :ok
+  def outbound_taken(root, public_key) do
+    case Wagyu.Registry.lookup(root, :interface) do
+      {:ok, interface, _value} -> send(interface, {:wg_outbound_taken, public_key, self()})
+      :error -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Forgets the calling peer, the running peer for `public_key`, which then
   exits: traffic for it starts a new process, with `endpoint` as its
   endpoint unless that is nil, and its indices are retired.
@@ -508,6 +528,13 @@ defmodule Wagyu.Interface do
     # The rest were dropped, and the link may grant their credit again.
     if forwarded < length(packets), do: retired(state)
     {:noreply, state}
+  end
+
+  def handle_info({:wg_outbound_taken, key, pid}, state) do
+    case state.peers do
+      %{^key => %{pid: ^pid}} -> {:noreply, settle_peer(state, key)}
+      _not_this_peer -> {:noreply, state}
+    end
   end
 
   def handle_info({:DOWN, monitor, :process, pid, reason}, state) do
@@ -770,7 +797,9 @@ defmodule Wagyu.Interface do
         {:ok, peer, state} ->
           {admitted, _refused} = Admission.admit_prefix(peer.outbound, packets)
           if admitted != [], do: send(peer.pid, {:wg_outbound, admitted})
-          {length(admitted), state}
+          {credited_packets, credited_bytes} = peer.credited
+          credited = {credited_packets + length(admitted), credited_bytes + Admission.bytes(admitted)}
+          {length(admitted), put_in(state.peers[key].credited, credited)}
 
         {:error, state} ->
           {0, state}
@@ -786,6 +815,31 @@ defmodule Wagyu.Interface do
   # Tells the link that egress credit is free again.
   defp retired(state) do
     with {:ok, link} <- Link.lookup(state.root), do: Link.retired(link)
+  end
+
+  # Retires the credit of what the peer's queue no longer holds. Only the
+  # peer releases from the queue, so its count can only fall between
+  # reads, and what is retired has left it.
+  defp settle_peer(state, key) do
+    peer = Map.fetch!(state.peers, key)
+    {held_packets, held_bytes} = Admission.usage(peer.outbound)
+    {credited_packets, credited_bytes} = peer.credited
+    taken = {credited_packets - held_packets, credited_bytes - held_bytes}
+
+    if taken == {0, 0} do
+      state
+    else
+      EgressCredit.retire(state.credit, elem(taken, 0), elem(taken, 1))
+      retired(state)
+      put_in(state.peers[key].credited, {held_packets, held_bytes})
+    end
+  end
+
+  # Retires all the credit a peer that is being forgotten still holds.
+  defp retire_peer(state, peer) do
+    {credited_packets, credited_bytes} = peer.credited
+    EgressCredit.retire(state.credit, credited_packets, credited_bytes)
+    if peer.credited != {0, 0}, do: retired(state)
   end
 
   # Returns the peer's process, starting it if it is not running. Egress and
@@ -807,7 +861,6 @@ defmodule Wagyu.Interface do
       endpoint: Map.get(state.endpoints, key),
       socket: state.socket,
       counters: state.counters,
-      credit: state.credit,
       inbound: inbound,
       outbound: outbound,
       staging: staging,
@@ -817,7 +870,15 @@ defmodule Wagyu.Interface do
     case PeerSupervisor.start_peer(state.root, args) do
       {:ok, pid} ->
         monitor = Process.monitor(pid)
-        peer = %{pid: pid, inbound: inbound, outbound: outbound, staging: staging, handoffs: handoffs}
+
+        peer = %{
+          pid: pid,
+          inbound: inbound,
+          outbound: outbound,
+          staging: staging,
+          handoffs: handoffs,
+          credited: {0, 0}
+        }
 
         {:ok, peer,
          %{state | peers: Map.put(state.peers, key, peer), monitors: Map.put(state.monitors, monitor, {:peer, key})}}
@@ -828,8 +889,8 @@ defmodule Wagyu.Interface do
   end
 
   # Packets admitted to a peer that it never took, or that it staged and
-  # never sent, were lost with it; its queues' counts say how many, and
-  # the credit of those it never took is free again. Its indices become
+  # never sent, were lost with it; its queues' counts say how many. All the
+  # credit it held is free again. Its indices become
   # tombstones, so messages for them drop here and none is reused while the
   # remote party may still send to it.
   #
@@ -838,14 +899,11 @@ defmodule Wagyu.Interface do
   defp peer_down(state, key, pid) do
     case state.peers do
       %{^key => %{pid: ^pid} = peer} ->
-        {lost_outbound, lost_outbound_bytes} = Admission.usage(peer.outbound)
+        {lost_outbound, _bytes} = Admission.usage(peer.outbound)
         {lost_staged, _bytes} = Admission.usage(peer.staging)
         {lost_inbound, _bytes} = Admission.usage(peer.inbound)
         add(state, :egress_peer_dropped, lost_outbound + lost_staged)
-        EgressCredit.retire(state.credit, lost_outbound, lost_outbound_bytes)
-        # Even with none lost, the peer may have retired credit and exited
-        # before telling the link.
-        retired(state)
+        retire_peer(state, peer)
         add(state, :inbound_peer_dropped, lost_inbound)
         indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
         {:ok, config} = Config.fetch_peer(state.config, key)
@@ -858,6 +916,7 @@ defmodule Wagyu.Interface do
   end
 
   defp release(state, key, pid, endpoint) do
+    retire_peer(state, Map.fetch!(state.peers, key))
     indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
     endpoints = if endpoint, do: Map.put(state.endpoints, key, endpoint), else: state.endpoints
     schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices, endpoints: endpoints})

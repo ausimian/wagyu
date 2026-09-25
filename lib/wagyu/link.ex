@@ -15,8 +15,8 @@ defmodule Wagyu.Link do
   # `@egress_credit_packets` packets and `@egress_credit_bytes` bytes, and
   # the link grants credit back only once packets have left the interface.
   # The interface counts the packets it holds, in its own mailbox or a
-  # peer's, in a `Wagyu.EgressCredit` it registers, and it and the peers
-  # send `:wg_egress_retired` once they have sent, staged or dropped some.
+  # peer's queue, in a `Wagyu.EgressCredit` it registers, and sends
+  # `:wg_egress_retired` once some have been sent, staged or dropped.
   # The link then grants whatever neither the stack, its batches on their
   # way here, nor the interface holds. So the link's mailbox holds at most
   # that credit of egress, no interface queue it feeds can overflow, and
@@ -266,7 +266,7 @@ defmodule Wagyu.Link do
     end
   end
 
-  defp taken(%{interface: {_pid, _egress, credit, _monitor}}), do: EgressCredit.settle(credit)
+  defp taken(%{interface: {_pid, _egress, credit, _monitor}}), do: EgressCredit.outstanding(credit)
   defp taken(_state), do: {0, 0}
 
   # Adds packets to the pending batch, sending the batch whenever the next
