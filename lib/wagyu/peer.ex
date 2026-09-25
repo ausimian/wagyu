@@ -125,8 +125,11 @@ defmodule Wagyu.Peer do
   # one message, which goes out under one key as of one moment: the clock is
   # read, and the timers updated and armed, once for the batch. Decrypted
   # packets wait in `state.plaintext` while more frames are queued, and go
-  # to the link together, up to 32 at a time, once the mailbox is empty or
-  # another kind of message arrives; the timers are armed then too. The
+  # to the link together once the mailbox is empty, another kind of message
+  # arrives, or the peer has taken 32 frames since the first of them
+  # waited, whether or not those frames carried packets, so a flood of
+  # frames that carry none cannot hold one back. The timers are armed then
+  # too. The
   # link is looked up once and monitored, rather than for every packet. A
   # waiting packet's frame stays admitted, so if the peer dies the
   # interface counts it as dropped.
@@ -222,12 +225,14 @@ defmodule Wagyu.Peer do
   @max_timestamp_wait 2 * 0x1000000
   # How long a cookie keys MAC2 after it arrives (COOKIE_REFRESH_TIME).
   @cookie_lifetime 120_000
-  # The most decrypted packets that wait to go to the link together: the
-  # link's own ingress batch.
-  @deliver_packets 32
-  # Decrypted packets waiting for the link, newest first, and the bytes of
-  # the frames they came in, which stay admitted until they go.
-  @no_plaintext %{packets: [], count: 0, frame_bytes: 0}
+  # The most frames a peer takes while decrypted packets wait for the link,
+  # and so the most packets that go to it together: the link's own ingress
+  # batch.
+  @deliver_frames 32
+  # Decrypted packets waiting for the link, newest first, the bytes of the
+  # frames they came in, which stay admitted until they go, and the frames
+  # taken since the first of them waited.
+  @no_plaintext %{packets: [], count: 0, frame_bytes: 0, frames: 0}
 
   @slots [:next, :current, :previous]
   # The order in which timers due at the same moment run: an attempt that
@@ -297,12 +302,16 @@ defmodule Wagyu.Peer do
         state
       end
 
-    cond do
-      state.plaintext.count == 0 -> {:noreply, arm(state)}
-      state.plaintext.count >= @deliver_packets -> {:noreply, settle(state)}
+    if state.plaintext.count == 0 do
+      {:noreply, arm(state)}
+    else
+      state = update_in(state.plaintext.frames, &(&1 + 1))
+
       # Waits for the mailbox to empty (a zero timeout) before delivering,
-      # so that frames queued back to back reach the link together.
-      true -> {:noreply, state, 0}
+      # so that frames queued back to back reach the link together, but
+      # counts every frame, so that frames carrying no packet cannot keep
+      # the mailbox busy and hold back one that waits.
+      if state.plaintext.frames >= @deliver_frames, do: {:noreply, settle(state)}, else: {:noreply, state, 0}
     end
   end
 

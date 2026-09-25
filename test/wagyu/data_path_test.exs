@@ -196,6 +196,43 @@ defmodule Wagyu.DataPathTest do
       assert %{transport_received: 10, ingress: 10} = counters(context.interface, &(&1.ingress == 10))
     end
 
+    test "frames that carry no packet cannot hold back one waiting for the link", context do
+      key = handshake(context, context.a)
+      {_udp, port} = smolnet_udp(context, :inet)
+      link = context.children.link
+      a_key = context.a.key
+      %{peers: %{^a_key => %{inbound: inbound}}} = :sys.get_state(context.children.interface)
+      :ok = :sys.suspend(key.peer)
+      :ok = :sys.suspend(link)
+
+      # A packet, 40 replays of it, which the peer refuses, and another.
+      first = transport_frame(key.session, key.index, inbound(@a_host, port, "first"))
+      for _n <- 0..40, do: to_wagyu(context, first, context.a.socket)
+      send_data(context, context.a, key, inbound(@a_host, port, "second"))
+      assert eventually(fn -> match?({42, _bytes}, Admission.usage(inbound)) end)
+
+      # The first goes once the peer has taken 32 frames, without waiting for
+      # its mailbox to empty.
+      :ok = :sys.resume(key.peer)
+
+      deliveries =
+        eventually(fn ->
+          {:messages, messages} = Process.info(link, :messages)
+          deliveries = for {:wg_plaintext, packets} <- messages, do: packets
+          length(deliveries) == 2 and deliveries
+        end)
+
+      assert deliveries == [
+               [ipv4_udp(@a_host, @local, 4_000, port, "first")],
+               [ipv4_udp(@a_host, @local, 4_000, port, "second")]
+             ]
+
+      :ok = :sys.resume(link)
+
+      assert %{transport_replayed: 40, transport_received: 2} =
+               counters(context.interface, &(&1.transport_received == 2))
+    end
+
     test "packets whose source's longest AllowedIPs match is another peer, or none, are dropped", context do
       key = handshake(context, context.a)
       {udp, port} = smolnet_udp(context, :inet)
