@@ -55,7 +55,7 @@ defmodule Wagyu.MixProject do
 
   defp package do
     [
-      description: "A supervised Elixir application.",
+      description: "A user-mode WireGuard endpoint for SmolNet application sockets.",
       files: ~w(.formatter.exs CHANGELOG.md LICENSE README.md lib mix.exs),
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url}
