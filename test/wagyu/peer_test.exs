@@ -851,6 +851,27 @@ defmodule Wagyu.PeerTest do
       assert peer(context) not in [nil, peer]
     end
 
+    @tag :no_endpoint
+    test "a peer that idles out keeps the endpoint it learned", context do
+      {session, index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+      clock = fake_peer_clock(peer)
+      to_wagyu(context, transport_frame(session, index))
+      %{timers: %{zero: zero}} = eventually(fn -> :sys.get_state(peer).current && :sys.get_state(peer) end)
+
+      monitor = Process.monitor(peer)
+      advance_to(clock, zero)
+      send(peer, {:wg_timer, make_ref()})
+      assert_receive {:DOWN, ^monitor, :process, ^peer, :normal}
+
+      # The next process has the endpoint the last one learned, not the
+      # configuration's none.
+      demand(context)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      assert :sys.get_state(peer(context)).endpoint == context.remote_endpoint
+      assert %{initiations_no_endpoint: 0} = counters(context.interface)
+    end
+
     test "a peer's process dictionary does not grow with its handshakes", context do
       {peer, clock, _session, _index} = initiated(context)
       entries = fn -> in_process(peer, fn _state -> length(Process.get()) end) end
@@ -900,7 +921,7 @@ defmodule Wagyu.PeerTest do
       {peer, _clock, _session, index} = initiated(context)
       %{peers: %{} = peers} = :sys.get_state(context.children.interface)
       %{outbound: outbound} = Map.fetch!(peers, context.remote_key)
-      release = fn -> in_process(peer, &Wagyu.Interface.release_peer(&1.root, &1.public_key)) end
+      release = fn -> in_process(peer, &Wagyu.Interface.release_peer(&1.root, &1.public_key, &1.endpoint)) end
 
       :ok = Admission.admit(outbound, 1, 10)
       assert release.() == :busy

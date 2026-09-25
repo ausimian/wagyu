@@ -53,11 +53,13 @@ defmodule Wagyu.Interface do
   # Messages that cannot be admitted or acted on are dropped and counted.
   #
   # A peer that has been idle long enough to discard its keys asks to be
-  # forgotten (`release_peer/2`) and exits once it is. The interface agrees
+  # forgotten (`release_peer/3`) and exits once it is. The interface agrees
   # only when nothing admitted for the peer is still waiting to reach it,
   # and it stops forwarding to the peer and retires its indices in the same
   # step, so no message is lost to the exit: whatever comes next starts a
-  # new process.
+  # new process. The interface keeps the endpoint the peer had, which may
+  # have been learned from its traffic, and starts the next process with
+  # it.
   #
   # Synchronous calls go one way: workers and peers may call the interface,
   # and the interface calls only the supervisors that start them, never a
@@ -288,16 +290,17 @@ defmodule Wagyu.Interface do
 
   @doc """
   Forgets the calling peer, the running peer for `public_key`, which then
-  exits: traffic for it starts a new process, and its indices are retired.
+  exits: traffic for it starts a new process, with `endpoint` as its
+  endpoint unless that is nil, and its indices are retired.
   Returns `:busy`, and forgets nothing, while messages admitted for the
   peer are still waiting for it to take them. Returns `:ok` too if the
   caller is not that peer, or no interface is running, since nothing will
   be sent to it either way.
   """
-  @spec release_peer(term(), <<_::256>>) :: :ok | :busy
-  def release_peer(root, public_key) do
+  @spec release_peer(term(), <<_::256>>, {:inet.ip_address(), :inet.port_number()} | nil) :: :ok | :busy
+  def release_peer(root, public_key, endpoint) do
     case Wagyu.Registry.lookup(root, :interface) do
-      {:ok, interface, _value} -> GenServer.call(interface, {:release_peer, public_key}, :infinity)
+      {:ok, interface, _value} -> GenServer.call(interface, {:release_peer, public_key, endpoint}, :infinity)
       :error -> :ok
     end
   catch
@@ -340,6 +343,7 @@ defmodule Wagyu.Interface do
            counters: :counters.new(length(@counters), []),
            handshakes: HandshakeQueue.new(),
            peers: %{},
+           endpoints: %{},
            monitors: %{},
            initiations: %{},
            sent: %{},
@@ -410,12 +414,11 @@ defmodule Wagyu.Interface do
     end
   end
 
-  def handle_call({:release_peer, key}, {caller, _tag}, state) do
+  def handle_call({:release_peer, key, endpoint}, {caller, _tag}, state) do
     case state.peers do
       %{^key => %{pid: ^caller} = peer} ->
         if idle?(peer) do
-          indices = IndexTable.retire_owner(state.indices, {key, caller}, state.clock.())
-          {:reply, :ok, schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices})}
+          {:reply, :ok, release(state, key, caller, endpoint)}
         else
           {:reply, :busy, state}
         end
@@ -683,6 +686,7 @@ defmodule Wagyu.Interface do
       root: state.root,
       peer: config,
       allowed_ips: AllowedIPs.source_filter(state.config.allowed_ips, key),
+      endpoint: Map.get(state.endpoints, key),
       socket: state.socket,
       counters: state.counters,
       inbound: inbound,
@@ -727,6 +731,12 @@ defmodule Wagyu.Interface do
       _released ->
         state
     end
+  end
+
+  defp release(state, key, pid, endpoint) do
+    indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
+    endpoints = if endpoint, do: Map.put(state.endpoints, key, endpoint), else: state.endpoints
+    schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices, endpoints: endpoints})
   end
 
   defp idle?(peer) do

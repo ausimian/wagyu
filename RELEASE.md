@@ -57,7 +57,8 @@
   whenever that long passes with no traffic in either direction, to keep
   NAT mappings open. A peer with one starts with the interface.
 - 540 seconds after a peer's last handshake, all its keys are discarded, and
-  an idle peer's process exits, to start again when it is next needed.
+  an idle peer's process exits, to start again when it is next needed with
+  the endpoint it last had, including one learned from its traffic.
 - Outbound packets are padded to a multiple of 16 bytes, but never beyond the
   MTU.
 - An interface completes WireGuard handshakes with its configured peers in

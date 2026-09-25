@@ -136,8 +136,9 @@ defmodule Wagyu.Peer do
   #     timer running, the peer discards every key, and, unless it is
   #     attempting a handshake, its initiation and staged packets too. A
   #     peer with no persistent keepalive that is not attempting a handshake
-  #     then asks the interface to forget it (`Wagyu.Interface.release_peer/2`)
-  #     and exits; the interface starts a new one when it is next needed.
+  #     then asks the interface to forget it (`Wagyu.Interface.release_peer/3`)
+  #     and exits; the interface starts a new one when it is next needed,
+  #     with the endpoint this one had.
   #
   # Each timer is a deadline on `state.clock` in `state.timers`, and one
   # process timer is armed for the earliest deadline. When a `{:wg_timer,
@@ -223,7 +224,7 @@ defmodule Wagyu.Peer do
       handoffs: handoffs,
       staging: staging,
       mac1_key: Packet.mac1_key(peer.public_key),
-      endpoint: endpoint(peer.endpoint),
+      endpoint: Map.get(args, :endpoint) || endpoint(peer.endpoint),
       initiation: nil,
       received: nil,
       handshake_sent_at: nil,
@@ -731,7 +732,7 @@ defmodule Wagyu.Peer do
   # The interface refuses while it has messages admitted for this process,
   # which then arrive and are handled first; the peer asks again later.
   defp exit_if_idle(state) do
-    case Interface.release_peer(state.root, state.public_key) do
+    case Interface.release_peer(state.root, state.public_key, state.endpoint) do
       :ok -> {:stop, state}
       :busy -> set_timer(state, :zero, state.clock.() + @rekey_timeout)
     end

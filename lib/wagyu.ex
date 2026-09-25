@@ -38,7 +38,7 @@ defmodule Wagyu do
     * 540 seconds after a peer's last handshake, or after its last attempt
       ran out, it discards all its keys and, unless it has a persistent
       keepalive, its process exits. The next packet for it, or initiation
-      from it, starts it again.
+      from it, starts it again, with the endpoint it last had.
 
   Timers use the monotonic clock, so changing the system time neither
   extends a key's life nor delays a timer.
