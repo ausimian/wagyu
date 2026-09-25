@@ -51,6 +51,28 @@ reply and MAC2, that a golden test compares byte for byte.
   round trip, against a loose floor. `WAGYU_THROUGHPUT=1` prints the rate it
   measured.
 
+## Benchmarks
+
+`bench/throughput.exs` measures bulk TCP through the tunnel with
+[Benchee](https://github.com/bencheeorg/benchee). It runs two interfaces on
+127.0.0.1, peered with each other, and sends from sockets on one stack to a
+listener on the other over 1, 4 and 8 streams. SmolNet's loopback link,
+which carries the same TCP with no tunnel, is the baseline.
+
+```sh
+mix run bench/throughput.exs
+```
+
+`WAGYU_BENCH_MB` sets the MiB sent per run (default 16), `WAGYU_BENCH_TIME`
+the seconds measured per scenario (default 10), and `WAGYU_BENCH_MTU` the
+stacks' MTU (default 1280). After Benchee's report the script prints each
+scenario's median rate in MiB/s and the packets the interface dropped.
+
+Both ends share one VM, so the rates are a loopback figure for two
+interfaces, not the capacity of one. Each scenario opens its connections
+once and reuses them for every run: a SmolNet stack has 64 socket slots,
+and a closed TCP socket holds one through TIME_WAIT.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on pushes to `main` and on pull requests. It
