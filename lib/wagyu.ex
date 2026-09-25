@@ -11,9 +11,9 @@ defmodule Wagyu do
   >
   > An interface completes WireGuard handshakes with its configured peers,
   > both ways, and carries the TCP and UDP traffic of sockets opened on its
-  > stack. It retries, rekeys and sends keepalives on WireGuard's timers.
-  > Cookies, preshared keys and changing the configuration while running
-  > are not supported yet.
+  > stack. It retries, rekeys and sends keepalives on WireGuard's timers,
+  > and defends its handshakes with cookies under load. Changing the
+  > configuration while running is not supported yet.
 
   ## Timers
 
@@ -158,6 +158,20 @@ defmodule Wagyu do
   apart from its other queues; beyond that, new ones are refused until it
   catches up.
 
+  Under load, while 8 or more initiations wait for a worker or a worker
+  cannot be started, and for a second after, as in wireguard-go and Linux,
+  the interface does no handshake cryptography for an initiation or
+  response unless its MAC2 was made with the cookie for the address it
+  came from. One without gets a cookie reply, encrypted with
+  XChaCha20-Poly1305, and its sender must retry with the cookie; one with
+  it goes on at most 20 times a second, in bursts of 5, from each IPv4
+  address or IPv6 /64. A cookie is bound to the source address and port,
+  and expires when the interface replaces its cookie secret, 120 seconds
+  after making it. A handshake message whose MAC1 is not for this
+  interface is never answered. The other way round, a cookie reply from a
+  peer under load keys MAC2 on the handshake messages sent to that peer
+  for 120 seconds.
+
   The one exception is the stack's own output. SmolNet sends each outbound
   batch to the interface without backpressure, so nothing bounds those
   messages before they arrive; the interface drains them promptly and drops
@@ -216,6 +230,11 @@ defmodule Wagyu do
       be started or already had as many handshakes waiting as it may
     * `:initiations_accepted` - initiations authorized and passed to their
       peer's process
+    * `:cookie_replies_sent` - cookie replies sent, under load, to
+      initiations and responses with a valid MAC1 but no valid MAC2
+    * `:handshakes_rate_limited` - initiations and responses with a valid
+      MAC2, under load, refused because their source address had used its
+      budget of 20 a second, in bursts of 5
     * `:unknown_index` - responses, cookie replies and transport messages
       for a receiver index with no live peer, including one retired in the
       last 180 seconds
@@ -232,6 +251,11 @@ defmodule Wagyu do
       handshake this interface initiated
     * `:responses_invalid` - responses that reached their peer but were not
       for its handshake in progress or did not authenticate
+    * `:cookie_replies_accepted` - cookie replies from peers that decrypted
+      with the MAC1 of the last handshake message sent to them, whose
+      cookie then keys MAC2
+    * `:cookie_replies_invalid` - cookie replies that reached their peer but
+      did not decrypt, or came after one for the same message was taken
     * `:keepalives_sent` - empty transport messages sent to confirm a
       handshake this interface initiated, to answer data after 10 seconds
       of silence, or as persistent keepalives

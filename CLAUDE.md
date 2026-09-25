@@ -5,8 +5,9 @@ design and implementation order are tracked in
 https://github.com/ausimian/wagyu/issues/2. So far configuration validation,
 the wire-format building blocks, the supervised interface (UDP socket,
 SmolNet stack and link, bounded admission), peer-owned handshakes with key
-confirmation, the encrypted data path and WireGuard's retry, rekey,
-keepalive and key-expiry timers exist.
+confirmation, the encrypted data path, WireGuard's retry, rekey,
+keepalive and key-expiry timers, and cookie replies with MAC2 under load
+exist.
 
 ## Development
 

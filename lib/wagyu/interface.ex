@@ -7,8 +7,8 @@ defmodule Wagyu.Interface do
   # AllowedIPs routes, the table from configured public keys to running
   # peer processes, the local receiver-index table, and the greatest
   # initiation timestamp accepted from each peer. It does only fixed-size
-  # work per datagram: decode, MAC1 screening, admission and an index
-  # lookup. It never runs Noise.
+  # work per datagram: decode, MAC1 and MAC2 screening, a cookie reply,
+  # admission and an index lookup. It never runs Noise.
   #
   # The socket is in bounded active mode: it delivers `@active` datagrams and
   # then waits for the interface to re-arm it, so datagrams never pile up in
@@ -23,6 +23,17 @@ defmodule Wagyu.Interface do
   # the handshakes that would replace it. Accepted timestamps
   # outlive the peer process, so a replay cannot follow a peer's restart,
   # and last as long as this interface.
+  #
+  # A handshake message, an initiation or a response, whose MAC1 does not
+  # match this interface's key gets nothing at all. The interface is under
+  # load while at least an eighth of the initiation queue is waiting, or
+  # once a worker cannot be started, and for a second after, as in
+  # wireguard-go and Linux. Under load a handshake message must also carry a
+  # MAC2 made with the cookie for the address it came from
+  # (`Wagyu.Cookie`). One without gets a cookie reply, which costs no Noise
+  # work, and goes no further; one with it goes on only within its source's
+  # budget (`Wagyu.RateLimiter`). The cookie secret and the budgets are
+  # bounded, and neither the reply nor the budget starts a peer.
   #
   # Other messages are addressed by receiver index (`Wagyu.IndexTable`).
   # Peers allocate and retire their indices here; an index is forwarded only
@@ -73,6 +84,7 @@ defmodule Wagyu.Interface do
   alias Wagyu.Admission
   alias Wagyu.AllowedIPs
   alias Wagyu.Config
+  alias Wagyu.Cookie
   alias Wagyu.HandshakeQueue
   alias Wagyu.HandshakeSupervisor
   alias Wagyu.IndexTable
@@ -80,6 +92,7 @@ defmodule Wagyu.Interface do
   alias Wagyu.Packet
   alias Wagyu.Packet.{CookieReply, Initiation, Response, Transport}
   alias Wagyu.PeerSupervisor
+  alias Wagyu.RateLimiter
   alias Wagyu.TAI64N
 
   # Datagrams the socket delivers before it must be re-armed.
@@ -113,6 +126,9 @@ defmodule Wagyu.Interface do
   # The least time between two accepted initiations from one peer, in
   # milliseconds (wireguard-go's and Linux's 50 per second).
   @initiation_interval 20
+  # How long the interface stays under load once it is no longer loaded
+  # (wireguard-go's UnderLoadAfterTime).
+  @under_load_after 1_000
 
   @counters [
     datagrams: 1,
@@ -149,7 +165,11 @@ defmodule Wagyu.Interface do
     transport_expired: 32,
     transport_malformed: 33,
     transport_source_denied: 34,
-    handshakes_abandoned: 35
+    handshakes_abandoned: 35,
+    cookie_replies_sent: 36,
+    handshakes_rate_limited: 37,
+    cookie_replies_accepted: 38,
+    cookie_replies_invalid: 39
   ]
 
   # The counters peers update.
@@ -171,7 +191,9 @@ defmodule Wagyu.Interface do
     :transport_expired,
     :transport_malformed,
     :transport_source_denied,
-    :handshakes_abandoned
+    :handshakes_abandoned,
+    :cookie_replies_accepted,
+    :cookie_replies_invalid
   ]
 
   @claim_errors [
@@ -346,6 +368,9 @@ defmodule Wagyu.Interface do
            egress: egress,
            counters: :counters.new(length(@counters), []),
            handshakes: HandshakeQueue.new(),
+           cookies: Cookie.checker(config.public_key),
+           limiter: RateLimiter.new(),
+           under_load_until: nil,
            peers: %{},
            endpoints: %{},
            monitors: %{},
@@ -522,7 +547,7 @@ defmodule Wagyu.Interface do
   end
 
   @impl true
-  def format_status(status), do: Wagyu.Redact.format_status(status, [:config], &redact_reply/1)
+  def format_status(status), do: Wagyu.Redact.format_status(status, [:config, :cookies], &redact_reply/1)
 
   # A claim's reply carries the peer's preshared key.
   defp redact_reply({:ok, peer, %Config.Peer{}}), do: {:ok, peer, :redacted}
@@ -532,13 +557,11 @@ defmodule Wagyu.Interface do
 
   defp receive_datagram(state, datagram, source) do
     case Packet.decode(datagram) do
-      {:ok, %Initiation{}} ->
-        initiation(state, datagram, source)
+      {:ok, %Initiation{sender_index: sender}} ->
+        handshake(state, datagram, source, sender, &initiation/3)
 
-      {:ok, %Response{receiver_index: index}} ->
-        if Packet.valid_mac1?(datagram, state.mac1_key),
-          do: indexed(state, index, datagram, source),
-          else: count(state, :invalid_mac1, state)
+      {:ok, %Response{sender_index: sender, receiver_index: index}} ->
+        handshake(state, datagram, source, sender, &indexed(&1, index, &2, &3))
 
       {:ok, %CookieReply{receiver_index: index}} ->
         indexed(state, index, datagram, source)
@@ -551,15 +574,47 @@ defmodule Wagyu.Interface do
     end
   end
 
-  defp initiation(state, datagram, source) do
-    if Packet.valid_mac1?(datagram, state.mac1_key) do
-      case HandshakeQueue.admit(state.handshakes, %{frame: datagram, source: source}) do
-        {:start, candidate, handshakes} -> start_worker(%{state | handshakes: handshakes}, candidate)
-        {:queued, handshakes} -> %{state | handshakes: handshakes}
-        :full -> count(state, :initiations_dropped, state)
-      end
+  # MAC1 first, then, under load, MAC2 and the source's budget, before
+  # `accept` takes the message on.
+  defp handshake(state, frame, source, sender_index, accept) do
+    if Packet.valid_mac1?(frame, state.mac1_key) do
+      now = state.clock.()
+      state = if HandshakeQueue.loaded?(state.handshakes), do: under_load(state, now), else: state
+
+      if under_load?(state, now),
+        do: screen(state, frame, source, sender_index, accept, now),
+        else: accept.(state, frame, source)
     else
       count(state, :invalid_mac1, state)
+    end
+  end
+
+  defp screen(state, frame, {address, port} = source, sender_index, accept, now) do
+    if Cookie.valid_mac2?(state.cookies, frame, source, now) do
+      case RateLimiter.allow(state.limiter, address, now) do
+        {:ok, limiter} -> accept.(%{state | limiter: limiter}, frame, source)
+        {:limited, limiter} -> count(state, :handshakes_rate_limited, %{state | limiter: limiter})
+      end
+    else
+      {reply, cookies} = Cookie.reply(state.cookies, frame, sender_index, source, now)
+      state = %{state | cookies: cookies}
+
+      case :gen_udp.send(state.socket, address, port, reply) do
+        :ok -> count(state, :cookie_replies_sent, state)
+        {:error, _reason} -> count(state, :send_errors, state)
+      end
+    end
+  end
+
+  defp under_load(state, now), do: %{state | under_load_until: now + @under_load_after}
+
+  defp under_load?(%{under_load_until: until}, now), do: is_integer(until) and now < until
+
+  defp initiation(state, datagram, source) do
+    case HandshakeQueue.admit(state.handshakes, %{frame: datagram, source: source}) do
+      {:start, candidate, handshakes} -> start_worker(%{state | handshakes: handshakes}, candidate)
+      {:queued, handshakes} -> %{state | handshakes: handshakes}
+      :full -> count(state, :initiations_dropped, state)
     end
   end
 
@@ -589,13 +644,18 @@ defmodule Wagyu.Interface do
         count(state, :initiations)
         %{state | monitors: Map.put(state.monitors, Process.monitor(worker), :worker)}
 
+      # With no worker to run it, the handshake capacity is exhausted.
       {:error, _reason} ->
         count(state, :initiations_dropped)
-        worker_done(state)
+        state |> under_load(state.clock.()) |> worker_done()
     end
   end
 
+  # The load lasts a second from when it ends, which may be here, as a
+  # worker's slot is released, with no datagram arriving to notice it.
   defp worker_done(state) do
+    state = if HandshakeQueue.loaded?(state.handshakes), do: under_load(state, state.clock.()), else: state
+
     case HandshakeQueue.release(state.handshakes) do
       {:start, candidate, handshakes} -> start_worker(%{state | handshakes: handshakes}, candidate)
       {:idle, handshakes} -> %{state | handshakes: handshakes}

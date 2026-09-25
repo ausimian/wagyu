@@ -41,6 +41,14 @@ defmodule Wagyu.HandshakeQueue do
   def admit(%__MODULE__{}, _candidate), do: :full
 
   @doc """
+  Whether at least an eighth of the waiting room is taken (8 of 64 by
+  default), the load at which wireguard-go and Linux start to require
+  cookies. Candidates wait only while every worker is busy.
+  """
+  @spec loaded?(t()) :: boolean()
+  def loaded?(%__MODULE__{queued: queued, max_queued: max}), do: queued > 0 and queued * 8 >= max
+
+  @doc """
   Releases a worker slot. The oldest waiting candidate takes it, as
   `{:start, candidate, queue}`; with none waiting the slot is freed.
   """

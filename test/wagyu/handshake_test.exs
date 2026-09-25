@@ -95,6 +95,48 @@ defmodule Wagyu.HandshakeTest do
     assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
   end
 
+  # Receives datagrams on `socket` until one is a cookie reply to
+  # `receiver_index`, and returns it.
+  defp cookie_reply_to(socket, receiver_index) do
+    assert {:ok, {{127, 0, 0, 1}, _port, datagram}} = :gen_udp.recv(socket, 0, 1_000)
+
+    case datagram do
+      <<3, 0, 0, 0, ^receiver_index::little-32, _rest::binary>> -> datagram
+      _other -> cookie_reply_to(socket, receiver_index)
+    end
+  end
+
+  # Puts the interface under load for the next second of its clock, as a
+  # loaded initiation queue would.
+  defp under_load(context),
+    do: :sys.replace_state(context.children.interface, &%{&1 | under_load_until: &1.clock.() + 1_000})
+
+  # Occupies every worker slot with a stand-in process, as a flood of
+  # initiations would, and puts `queued` forged initiations in the waiting
+  # room. A stand-in frees its slot when it is sent `:stop`.
+  defp saturate(context, queued) do
+    stand_ins = for _n <- 1..8, do: spawn(fn -> receive do: (:stop -> :ok) end)
+    waiting = for _n <- 1..queued//1, do: %{frame: initiation(context.public_key), source: context.source}
+
+    # The function runs in the interface, so the interface monitors them.
+    :sys.replace_state(context.children.interface, fn state ->
+      monitors = Map.new(stand_ins, &{Process.monitor(&1), :worker})
+      handshakes = %{state.handshakes | active: 8, queued: queued, queue: :queue.from_list(waiting)}
+      %{state | monitors: Map.merge(state.monitors, monitors), handshakes: handshakes}
+    end)
+
+    stand_ins
+  end
+
+  # Waits until the counters stop changing, and returns them.
+  defp quiet(context) do
+    eventually(fn ->
+      before = counters(context.interface)
+      Process.sleep(50)
+      if counters(context.interface) == before, do: before
+    end)
+  end
+
   test "an authenticated initiation starts its peer, which responds from a live index", context do
     send_datagrams(context, [genuine(context, 1, 77)])
 
@@ -356,9 +398,12 @@ defmodule Wagyu.HandshakeTest do
     assert maxima.workers <= 8
     assert maxima.mailbox <= 48
 
-    # Every datagram that arrived is accounted for, and the clock is
-    # stopped, so only one genuine initiation is accepted.
-    assert counters.datagrams == counters.initiations + counters.initiations_dropped
+    # Every datagram that arrived is accounted for. Once 8 wait, the
+    # interface is under load, and with its clock stopped it stays so: every
+    # initiation after that gets a cookie reply instead. Only one genuine
+    # initiation is accepted.
+    assert counters.cookie_replies_sent > 0
+    assert counters.datagrams == counters.initiations + counters.initiations_dropped + counters.cookie_replies_sent
 
     assert counters.initiations ==
              counters.initiations_failed + counters.initiations_unknown_peer + counters.initiations_replayed +
@@ -367,6 +412,172 @@ defmodule Wagyu.HandshakeTest do
     assert counters.initiations_accepted == 1
     assert [_one] = peer_children(context)
     assert DynamicSupervisor.count_children(supervisor).active == 0
+  end
+
+  describe "under load" do
+    test "a loaded queue requires MAC2, answering an initiation without it with a cookie reply", context do
+      stand_ins = saturate(context, 8)
+      {other_key, _private_key} = keypair()
+      frame = genuine(context, 1, 77)
+
+      # A MAC1 for another key still gets nothing at all.
+      send_datagrams(context, [initiation(other_key), frame])
+      reply = cookie_reply_to(context.client, 77)
+
+      assert %{invalid_mac1: 1, cookie_replies_sent: 1, initiations: 0} =
+               counters(context.interface, &(&1.cookie_replies_sent == 1))
+
+      assert :gen_udp.recv(context.client, 0, 100) == {:error, :timeout}
+      assert interface_state(context).handshakes.queued == 8
+
+      # The cookie decrypts with the interface's public key and the
+      # initiation's MAC1. Under it the same initiation waits for a worker,
+      # and is accepted once one is free.
+      cookie = cookie(reply, context.public_key, frame)
+      send_datagrams(context, [with_mac2(frame, context.public_key, cookie)])
+      assert eventually(fn -> interface_state(context).handshakes.queued == 9 end)
+
+      for stand_in <- stand_ins, do: send(stand_in, :stop)
+      assert %{remote_index: 77} = responded(context, timestamp(1))
+
+      assert %{initiations: 9, initiations_failed: 8, initiations_accepted: 1, cookie_replies_sent: 1} =
+               settled(context)
+    end
+
+    test "the load lasts for a second after the queue drains", context do
+      stand_ins = saturate(context, 8)
+      send_datagrams(context, [genuine(context, 1, 1)])
+      cookie_reply_to(context.client, 1)
+
+      # The queue drains, with the interface's clock stopped.
+      for stand_in <- stand_ins, do: send(stand_in, :stop)
+      settled(context)
+
+      advance(context.clock, 999)
+      send_datagrams(context, [genuine(context, 2, 2)])
+      cookie_reply_to(context.client, 2)
+
+      advance(context.clock, 1)
+      send_datagrams(context, [genuine(context, 3, 3)])
+      assert %{remote_index: 3} = responded(context, timestamp(3))
+      assert %{cookie_replies_sent: 2, initiations_accepted: 1} = settled(context)
+    end
+
+    test "the load lasts for a second after the queue drains, however long it was loaded", context do
+      # No datagram arrives for two seconds while the queue is loaded.
+      stand_ins = saturate(context, 8)
+      advance(context.clock, 2_000)
+      for stand_in <- stand_ins, do: send(stand_in, :stop)
+      settled(context)
+
+      send_datagrams(context, [genuine(context, 1, 1)])
+      cookie_reply_to(context.client, 1)
+
+      advance(context.clock, 1_000)
+      send_datagrams(context, [genuine(context, 2, 2)])
+      assert %{remote_index: 2} = responded(context, timestamp(2))
+      assert %{cookie_replies_sent: 1, initiations_accepted: 1} = settled(context)
+    end
+
+    test "a cookie is bound to the source address and lasts until its secret is 120 seconds old", context do
+      under_load(context)
+      frame = genuine(context, 1, 1)
+      send_datagrams(context, [frame])
+      cookie = context.client |> cookie_reply_to(1) |> cookie(context.public_key, frame)
+
+      # From another port, the same MAC2 earns only a cookie of its own.
+      {:ok, other} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+      :ok = :gen_udp.send(other, {127, 0, 0, 1}, context.port, with_mac2(frame, context.public_key, cookie))
+      refute other |> cookie_reply_to(1) |> cookie(context.public_key, frame) == cookie
+      assert %{cookie_replies_sent: 2, initiations: 0} = counters(context.interface, &(&1.cookie_replies_sent == 2))
+
+      send_datagrams(context, [with_mac2(frame, context.public_key, cookie)])
+      assert responded(context, timestamp(1))
+
+      # Its cookies pass while the secret is younger than 120 seconds...
+      advance(context.clock, 119_980)
+      under_load(context)
+      send_datagrams(context, [with_mac2(genuine(context, 2, 2), context.public_key, cookie)])
+      assert responded(context, timestamp(2))
+
+      # ...and then it is replaced, and the old cookie earns a new one.
+      advance(context.clock, 20)
+      under_load(context)
+      frame = genuine(context, 3, 3)
+      send_datagrams(context, [with_mac2(frame, context.public_key, cookie)])
+      fresh = context.client |> cookie_reply_to(3) |> cookie(context.public_key, frame)
+      refute fresh == cookie
+
+      send_datagrams(context, [with_mac2(frame, context.public_key, fresh)])
+      assert responded(context, timestamp(3))
+      assert %{cookie_replies_sent: 3, initiations_accepted: 3} = settled(context)
+    end
+
+    test "initiations with a valid MAC2 are limited to bursts of 5 from each source address", context do
+      under_load(context)
+      frame = genuine(context, 1, 1)
+      send_datagrams(context, [frame])
+      cookie = context.client |> cookie_reply_to(1) |> cookie(context.public_key, frame)
+
+      send_datagrams(context, for(n <- 1..8, do: with_mac2(genuine(context, n, n), context.public_key, cookie)))
+      assert %{initiations: 5, handshakes_rate_limited: 3} = settled(context)
+
+      # Every 50 ms earns one more.
+      advance(context.clock, 50)
+      send_datagrams(context, for(n <- 9..10, do: with_mac2(genuine(context, n, n), context.public_key, cookie)))
+      assert %{initiations: 6, handshakes_rate_limited: 4, cookie_replies_sent: 1} = settled(context)
+    end
+
+    test "a response needs a MAC2 too, and one without gets a cookie reply to its sender", context do
+      under_load(context)
+      covered = <<2, 0, 0, 0, 5::little-32, 6::little-32, :crypto.strong_rand_bytes(48)::binary>>
+      response = Packet.put_mac1(covered <> <<0::256>>, Packet.mac1_key(context.public_key))
+
+      send_datagrams(context, [response])
+      cookie = context.client |> cookie_reply_to(5) |> cookie(context.public_key, response)
+      assert %{cookie_replies_sent: 1, unknown_index: 0} = counters(context.interface, &(&1.cookie_replies_sent == 1))
+
+      # With MAC2 it goes on to its receiver index, which no peer holds.
+      send_datagrams(context, [with_mac2(response, context.public_key, cookie)])
+      assert %{unknown_index: 1, cookie_replies_sent: 1} = counters(context.interface, &(&1.unknown_index == 1))
+    end
+
+    test "transport under existing keys keeps flowing while a flood saturates the workers", context do
+      # The test initiates a session, which the peer responds to, and
+      # confirms it.
+      {frame, session} = initiate_to(context.public_key, context.initiator, timestamp(1), 1)
+      send_datagrams(context, [frame])
+      assert {:ok, {{127, 0, 0, 1}, _port, response}} = :gen_udp.recv(context.client, 0, 1_000)
+      assert <<2, 0, 0, 0, index::little-32, 1::little-32, _rest::binary>> = response
+      assert complete(session, response) == :ok
+      send_datagrams(context, [transport_frame(session, index)])
+      assert %{keys_confirmed: 1} = counters(context.interface, &(&1.keys_confirmed == 1))
+
+      # Genuine and forged initiations, with a keepalive every 30 datagrams.
+      stand_ins = saturate(context, 8)
+      stranger = keypair()
+
+      flood =
+        for n <- 1..300 do
+          cond do
+            rem(n, 30) == 0 -> transport_frame(session, index)
+            rem(n, 2) == 0 -> noise_initiation(context.public_key, stranger, timestamp(n))
+            true -> initiation(context.public_key)
+          end
+        end
+
+      send_datagrams(context, flood)
+      assert %{keepalives_received: 11} = counters(context.interface, &(&1.keepalives_received == 11))
+
+      # No initiation in the flood reached a worker; each got a cookie reply.
+      counters = quiet(context)
+      assert counters.initiations == 1
+      assert counters.cookie_replies_sent == counters.datagrams - 12
+      assert counters.transport_invalid == 0
+      assert DynamicSupervisor.count_children(context.children.handshake_supervisor).active == 0
+
+      for stand_in <- stand_ins, do: send(stand_in, :stop)
+    end
   end
 
   defp sample(interface, supervisor, maxima) do

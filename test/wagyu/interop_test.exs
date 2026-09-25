@@ -145,6 +145,30 @@ defmodule Wagyu.InteropTest do
     assert go_handshake(device)
   end
 
+  test "wireguard-go retries with the cookie from Wagyu's reply while Wagyu is under load", context do
+    wagyu = start_wagyu(context, nil)
+
+    # Under load for the next minute, as a loaded initiation queue leaves it.
+    :sys.replace_state(wagyu.children.interface, &%{&1 | under_load_until: &1.clock.() + 60_000})
+    {device, _go_port} = start_go(context, endpoint: "127.0.0.1:#{wagyu.port}")
+    :ok = WgPeer.send_udp(device, @wagyu_address, 9, "hello")
+
+    # The first initiation has no MAC2 and gets a cookie reply. wireguard-go
+    # decrypts it and retries after REKEY_TIMEOUT with MAC2 under the
+    # cookie, which Wagyu accepts.
+    counters =
+      eventually(
+        fn ->
+          {:ok, %{counters: counters}} = Wagyu.info(wagyu.interface)
+          if counters.keys_confirmed == 1, do: counters
+        end,
+        1_000
+      )
+
+    assert %{cookie_replies_sent: 1, initiations: 1, responses_sent: 1, handshakes_rate_limited: 0} = counters
+    assert go_handshake(device)
+  end
+
   test "Wagyu rekeys with wireguard-go at 120 seconds without interrupting traffic", context do
     {device, go_port} = start_go(context, [])
     :ok = WgPeer.echo(device, :udp, 7)

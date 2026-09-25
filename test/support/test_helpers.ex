@@ -197,6 +197,20 @@ defmodule Wagyu.TestHelpers do
     {frame, session, %{timestamp: timestamp, initiator_key: initiator_key, sender_index: message.sender_index}}
   end
 
+  @doc """
+  Returns the cookie in `reply`, a cookie reply to `frame`, a handshake
+  message sent to the holder of `public_key`.
+  """
+  def cookie(reply, public_key, frame) do
+    {:ok, %Packet.CookieReply{} = message} = Packet.decode(reply)
+    {:ok, mac1} = Packet.mac1(frame)
+    {:ok, cookie} = Wagyu.Cookie.open(message, Wagyu.Cookie.key(public_key), mac1)
+    cookie
+  end
+
+  @doc "`frame`, a handshake message to the holder of `public_key`, with MAC2 under `cookie`."
+  def with_mac2(frame, public_key, cookie), do: Packet.put_macs(frame, Packet.mac1_key(public_key), cookie)
+
   @doc "A transport message to `receiver_index`, encrypted with a transport session the caller owns."
   def transport_frame(session, receiver_index, plaintext \\ "") do
     counter = Decibel.nonce(session, :out)

@@ -10,7 +10,8 @@ WireGuard peers over one UDP socket, with no host TUN device.
 > WireGuard handshakes with its configured peers in both directions, and
 > carries TCP and UDP traffic for sockets on its stack, interoperating with
 > wireguard-go. Handshakes are retried and keys replaced on WireGuard's
-> timers, with optional persistent keepalives. Progress is tracked in
+> timers, with optional persistent keepalives, and defended with cookies
+> under load. Progress is tracked in
 > [#2](https://github.com/ausimian/wagyu/issues/2).
 
 ## Why

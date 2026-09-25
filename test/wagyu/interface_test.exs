@@ -118,7 +118,7 @@ defmodule Wagyu.InterfaceTest do
 
       assert counters.datagrams ==
                counters.invalid_datagrams + counters.initiations + counters.initiations_dropped +
-                 counters.unknown_index
+                 counters.unknown_index + counters.cookie_replies_sent
 
       # Each initiation's Noise fields are arbitrary, so every one fails.
       assert counters.initiations_failed == counters.initiations
@@ -126,18 +126,44 @@ defmodule Wagyu.InterfaceTest do
       assert eventually(fn -> DynamicSupervisor.count_children(supervisor).active == 0 end)
     end
 
-    test "refuses initiations beyond the waiting queue while every worker is busy", context do
+    test "while every worker is busy, 8 initiations wait and the rest get cookie replies", context do
       # Workers finish quickly, so occupy every worker slot directly.
       interface = child(context.interface, :interface)
       :sys.replace_state(interface, &put_in(&1.handshakes.active, 8))
 
       send_datagrams(context, for(_n <- 1..100, do: initiation(context.public_key)))
 
-      # UDP may lose some of the burst, so check against what arrived.
+      # Once 8 wait, the interface is under load, and an initiation without
+      # a MAC2 gets a cookie reply instead of a place in the queue. UDP may
+      # lose some of the burst, so check against what arrived.
       counters = settled(context.interface)
-      assert counters.datagrams > 64
+      assert counters.datagrams > 8
       assert counters.initiations == 0
-      assert counters.initiations_dropped == counters.datagrams - 64
+      assert counters.initiations_dropped == 0
+      assert counters.cookie_replies_sent == counters.datagrams - 8
+      assert :sys.get_state(interface).handshakes.queued == 8
+    end
+
+    test "refuses initiations beyond the waiting queue, even with a valid MAC2", context do
+      interface = child(context.interface, :interface)
+      waiting = for _n <- 1..63, do: %{frame: initiation(context.public_key), source: {{127, 0, 0, 1}, 9}}
+
+      :sys.replace_state(interface, fn state ->
+        %{state | handshakes: %{state.handshakes | active: 8, queued: 63, queue: :queue.from_list(waiting)}}
+      end)
+
+      frame = initiation(context.public_key)
+      send_datagrams(context, [frame])
+      assert {:ok, {{127, 0, 0, 1}, _port, reply}} = :gen_udp.recv(context.client, 0, 1_000)
+      cookie = cookie(reply, context.public_key, frame)
+
+      # With the cookie, one more initiation waits and the next is refused.
+      send_datagrams(
+        context,
+        for(_n <- 1..2, do: with_mac2(initiation(context.public_key), context.public_key, cookie))
+      )
+
+      assert %{initiations_dropped: 1, cookie_replies_sent: 1} = settled(context.interface)
       assert :sys.get_state(interface).handshakes.queued == 64
     end
 
