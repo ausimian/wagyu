@@ -57,7 +57,13 @@ defmodule Wagyu.ConfigTest do
       assert config.private_key == options[:private_key]
       assert {config.public_key, config.private_key} == :crypto.generate_key(:ecdh, :x25519, options[:private_key])
       assert config.listen == %{address: {0, 0, 0, 0}, port: 51_820}
-      assert config.stack == [addresses: [{{10, 13, 0, 2}, 32}], routes: [{{0, 0, 0, 0}, 0, {10, 13, 0, 1}}], mtu: 1280]
+
+      assert config.stack == [
+               addresses: [{{10, 13, 0, 2}, 32}],
+               routes: [{{0, 0, 0, 0}, 0, {10, 13, 0, 1}}],
+               mtu: 1280,
+               sockets: 64
+             ]
 
       assert config.peers == %{
                peer_key => %Peer{
@@ -77,7 +83,7 @@ defmodule Wagyu.ConfigTest do
       assert {:ok, config} = Config.new(private_key: private_key)
       assert config.name == nil
       assert config.listen == %{address: {0, 0, 0, 0}, port: 0}
-      assert config.stack == [addresses: [], routes: [], mtu: 1420]
+      assert config.stack == [addresses: [], routes: [], mtu: 1420, sockets: 64]
       assert config.peers == %{}
       assert AllowedIPs.to_list(config.allowed_ips) == []
     end
@@ -376,6 +382,21 @@ defmodule Wagyu.ConfigTest do
       end
 
       assert Config.new(options(stack: [mtu: 1420.0])) == invalid([:stack, :mtu], :invalid)
+    end
+
+    test "limits the sockets to 1..512" do
+      for sockets <- [1, 64, 256, 512] do
+        assert {:ok, config} = Config.new(options(stack: [sockets: sockets]))
+        assert config.stack[:sockets] == sockets
+      end
+
+      for sockets <- [-1, 0, 513] do
+        assert Config.new(options(stack: [sockets: sockets])) == invalid([:stack, :sockets], :out_of_range)
+      end
+
+      for sockets <- [64.0, nil, :infinity] do
+        assert Config.new(options(stack: [sockets: sockets])) == invalid([:stack, :sockets], :invalid)
+      end
     end
 
     test "allows at most 8 addresses" do

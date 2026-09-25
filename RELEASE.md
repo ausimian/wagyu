@@ -127,6 +127,11 @@
   one that is retired, or whose peer has exited, drops at the interface
   and is not reused for 180 seconds.
 - Wagyu now depends on Decibel 1.1.1 or later and SmolNet 0.5.0 or later.
+- An interface's stack can hold more than 64 sockets: `stack: [sockets: n]`,
+  from 1 to 512, sets the limit, which defaults to 64. A TCP socket that
+  closes first keeps its slot for about 10 seconds, so a stack sustains
+  about `n / 10` new connections a second, and each slot holds its socket's
+  buffers, 128 KiB for a TCP socket at SmolNet's default sizes.
 - If the stack fails, including when stopped with `SmolNet.stop_stack/1`,
   the interface restarts with a new stack and sockets opened on the old one
   must be reopened. Any other failure inside the interface keeps the stack

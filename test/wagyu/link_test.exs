@@ -10,7 +10,12 @@ defmodule Wagyu.LinkTest do
   alias Wagyu.FakeSmolNet
   alias Wagyu.Link
 
-  @stack_options [addresses: [{{10, 13, 0, 2}, 32}], routes: [{{0, 0, 0, 0}, 0, {10, 13, 0, 1}}], mtu: 1280]
+  @stack_options [
+    addresses: [{{10, 13, 0, 2}, 32}],
+    routes: [{{0, 0, 0, 0}, 0, {10, 13, 0, 1}}],
+    mtu: 1280,
+    sockets: 256
+  ]
 
   setup do
     Process.register(self(), FakeSmolNet)
@@ -53,10 +58,19 @@ defmodule Wagyu.LinkTest do
     test "starts its stack with Wagyu's egress, limits and link-down policy", %{link: link, options: options} do
       assert {^link, ref} = options[:egress]
       assert is_reference(ref)
-      assert options[:limits] == %{input_packets: 32, bytes_copied: 65_536}
+      assert options[:limits] == %{input_packets: 32, bytes_copied: 65_536, sockets: 256}
       assert options[:link_down] == :stop
       assert options[:egress_credit] == {128, 256 * 1024}
-      assert Keyword.take(options, [:addresses, :routes, :mtu]) == @stack_options
+      assert Keyword.take(options, [:addresses, :routes, :mtu]) == Keyword.delete(@stack_options, :sockets)
+      refute Keyword.has_key?(options, :sockets)
+    end
+
+    test "leaves the socket limit to SmolNet when none is given" do
+      options = [root: make_ref(), stack: [mtu: 1280], smolnet: FakeSmolNet]
+      link = start_supervised!(Supervisor.child_spec({Link, options}, id: :default_sockets, restart: :temporary))
+
+      assert_receive {:start_stack, ^link, options}
+      assert options[:limits] == %{input_packets: 32, bytes_copied: 65_536}
     end
 
     test "exits with a start error when the stack will not start" do

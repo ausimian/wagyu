@@ -134,13 +134,16 @@ defmodule Wagyu.Link do
     root = Keyword.fetch!(options, :root)
     smolnet = Keyword.get(options, :smolnet, SmolNet)
     ref = make_ref()
+    # The configured socket limit is one of SmolNet's limits, which the link
+    # sets together with its own.
+    {limits, stack} = Keyword.split(Keyword.fetch!(options, :stack), [:sockets])
 
     stack_options =
-      Keyword.fetch!(options, :stack) ++
+      stack ++
         [
           egress: {self(), ref},
           egress_credit: {@egress_credit_packets, @egress_credit_bytes},
-          limits: %{input_packets: @ingress_packets, bytes_copied: @ingress_bytes},
+          limits: Map.merge(Map.new(limits), %{input_packets: @ingress_packets, bytes_copied: @ingress_bytes}),
           link_down: :stop
         ]
 
