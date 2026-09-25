@@ -100,7 +100,7 @@ defmodule Wagyu.PeerTest do
     do: timestamps |> Enum.chunk_every(2, 1, :discard) |> Enum.all?(fn [a, b] -> TAI64N.after?(b, a) end)
 
   describe "initiating" do
-    test "outbound demand starts a handshake, and the initiator confirms the key with a keepalive", context do
+    test "outbound demand starts a handshake, and the staged packet confirms the key", context do
       demand(context)
       initiation = receive_datagram(context)
       {peer, _clock} = started_peer(context)
@@ -118,22 +118,26 @@ defmodule Wagyu.PeerTest do
       assert at <= System.os_time(:nanosecond)
       assert System.os_time(:nanosecond) - at < 2_000_000_000
 
-      # The response completes the handshake, and a keepalive to the
-      # responder's index confirms the key.
+      # The response completes the handshake, and the packet that started
+      # it, sent to the responder's index, confirms the key.
       to_wagyu(context, response)
-      keepalive = receive_datagram(context)
-      assert <<4, 0, 0, 0, 99::little-32, 0::little-64, _tag::binary-16>> = keepalive
-      assert open_transport(session, keepalive) == {:ok, ""}
+      confirmation = receive_datagram(context)
+      assert <<4, 0, 0, 0, 99::little-32, 0::little-64, _rest::binary>> = confirmation
+      assert {:ok, plaintext} = open_transport(session, confirmation)
+      assert {:ok, %{destination: {192, 0, 2, 9}, length: length}} = Wagyu.IP.parse(plaintext)
+      assert plaintext == binary_part(plaintext, 0, length) <> <<0::size((byte_size(plaintext) - length) * 8)>>
 
       assert %{initiation: nil, next: nil, previous: nil, current: %{local_index: ^index, remote_index: 99}} =
                :sys.get_state(peer)
 
-      assert %{initiations_sent: 1, responses_accepted: 1, keepalives_sent: 1, responses_invalid: 0} =
+      assert %{initiations_sent: 1, responses_accepted: 1, keepalives_sent: 0, transport_sent: 1} =
                counters(context.interface)
 
-      # With a current key, outbound packets start no more handshakes.
+      # With a current key, outbound packets go straight out under it and
+      # start no more handshakes.
       demand(context)
-      assert eventually(fn -> :sys.get_state(peer).outbound_dropped == 2 end)
+      assert <<4, 0, 0, 0, 99::little-32, 1::little-64, _rest::binary>> = next = receive_datagram(context)
+      assert {:ok, _plaintext} = open_transport(session, next)
       refute_datagram(context)
     end
 
@@ -186,7 +190,7 @@ defmodule Wagyu.PeerTest do
 
       # The genuine response still completes the handshake.
       to_wagyu(context, response)
-      assert open_transport(session, receive_datagram(context)) == {:ok, ""}
+      assert {:ok, _confirmation} = open_transport(session, receive_datagram(context))
       assert %{current: %{local_index: ^index}, endpoint: endpoint} = :sys.get_state(peer)
       assert endpoint == context.remote_endpoint
     end
@@ -215,7 +219,7 @@ defmodule Wagyu.PeerTest do
 
       {response, session, _sent} = respond_to(second, context.remote, 22)
       to_wagyu(context, response)
-      assert open_transport(session, receive_datagram(context)) == {:ok, ""}
+      assert {:ok, _confirmation} = open_transport(session, receive_datagram(context))
       %{current: current} = :sys.get_state(peer)
       assert %{local_index: local_index, remote_index: 22} = current
       assert local_index == sender_index(second)
@@ -238,7 +242,7 @@ defmodule Wagyu.PeerTest do
       handshake = fn remote_index ->
         {response, session, _sent} = respond_to(receive_datagram(context), context.remote, remote_index)
         to_wagyu(context, response)
-        assert open_transport(session, receive_datagram(context)) == {:ok, ""}
+        assert {:ok, _confirmation} = open_transport(session, receive_datagram(context))
         session
       end
 
@@ -269,7 +273,9 @@ defmodule Wagyu.PeerTest do
 
       assert peer(context) == peer
       assert [_one] = DynamicSupervisor.which_children(context.children.peer_supervisor)
-      assert %{initiations_sent: 3, responses_accepted: 3, keepalives_sent: 3} = counters(context.interface)
+
+      assert %{initiations_sent: 3, responses_accepted: 3, keepalives_sent: 2, transport_sent: 1} =
+               counters(context.interface)
     end
 
     # Killing the peer logs its exit.
@@ -331,7 +337,7 @@ defmodule Wagyu.PeerTest do
       # and it waits REKEY_TIMEOUT after its response before initiating
       # itself, to the learned endpoint.
       demand(context)
-      assert eventually(fn -> :sys.get_state(peer).outbound_dropped == 2 end)
+      assert eventually(fn -> :queue.len(:sys.get_state(peer).staged) == 2 end)
       refute_datagram(context)
 
       advance(clock, 5_000)

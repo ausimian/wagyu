@@ -123,9 +123,11 @@ defmodule Wagyu.SecretsTest do
 
     # Noise state, such as the peer's chaining and cipher keys, never
     # appears. Session handles, which hold none, are inspected as
-    # #Decibel.Session<...>; state is a plain %Decibel... struct.
+    # #Decibel.Session<...>; state is a plain %Decibel... struct. A replay
+    # window is plain too, but holds only counters.
     assert logs =~ "#Decibel.Session<"
-    refute logs =~ "%Decibel."
+    assert logs =~ "%Decibel.ReplayWindow{"
+    refute logs =~ ~r/%Decibel\.(?!ReplayWindow\{)/
 
     for secret <- [private_key, preshared_key],
         form <- [
