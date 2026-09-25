@@ -213,7 +213,11 @@ defmodule Wagyu.Interface do
 
   @doc """
   Claims the peer for an initiation that a handshake worker has
-  authenticated, returning the peer's process.
+  authenticated, returning the peer's process and its configuration, which
+  holds its preshared key. The configuration, rather than the bare key, is
+  what the reply carries, so the `sys` debug log, which records replies
+  as they are, formats the key only through `Wagyu.Config.Peer`'s
+  `Inspect`, which omits it.
 
   The claim is atomic: `root`'s interface authorizes `remote_key` against the
   configuration and `timestamp` against the greatest one it has accepted for
@@ -230,7 +234,7 @@ defmodule Wagyu.Interface do
   peers, so it cannot be waiting on the caller.
   """
   @spec claim_peer(term(), <<_::256>>, TAI64N.t()) ::
-          {:ok, pid()} | {:error, :unknown_peer | :replayed | :rate_limited | :unavailable}
+          {:ok, pid(), Config.Peer.t()} | {:error, :unknown_peer | :replayed | :rate_limited | :unavailable}
   def claim_peer(root, remote_key, <<_::binary-12>> = timestamp) do
     case Wagyu.Registry.lookup(root, :interface) do
       {:ok, interface, _value} -> GenServer.call(interface, {:claim_peer, remote_key, timestamp}, :infinity)
@@ -384,12 +388,12 @@ defmodule Wagyu.Interface do
   def handle_call({:claim_peer, key, timestamp}, _from, state) do
     now = state.clock.()
 
-    with :ok <- authorize(state, key, timestamp, now),
+    with {:ok, config} <- authorize(state, key, timestamp, now),
          {:ok, peer, state} <- ensure_peer(state, key),
          :ok <- admit_handoff(peer, state) do
       count(state, :initiations_accepted)
       initiations = Map.put(state.initiations, key, %{timestamp: timestamp, accepted_at: now})
-      {:reply, {:ok, peer.pid}, %{state | initiations: initiations}}
+      {:reply, {:ok, peer.pid, config}, %{state | initiations: initiations}}
     else
       {:error, reason} when is_atom(reason) -> reject_claim(state, reason)
       {:error, state} -> reject_claim(state, :unavailable)
@@ -518,7 +522,11 @@ defmodule Wagyu.Interface do
   end
 
   @impl true
-  def format_status(status), do: Wagyu.Redact.format_status(status, [:config])
+  def format_status(status), do: Wagyu.Redact.format_status(status, [:config], &redact_reply/1)
+
+  # A claim's reply carries the peer's preshared key.
+  defp redact_reply({:ok, peer, %Config.Peer{}}), do: {:ok, peer, :redacted}
+  defp redact_reply(reply), do: reply
 
   # Inbound datagrams
 
@@ -614,15 +622,15 @@ defmodule Wagyu.Interface do
       {{:error, :unknown_peer} = error, _initiations} ->
         error
 
-      {{:ok, _peer}, %{^key => last}} ->
+      {{:ok, peer}, %{^key => last}} ->
         cond do
           not TAI64N.after?(timestamp, last.timestamp) -> {:error, :replayed}
           now - last.accepted_at < @initiation_interval -> {:error, :rate_limited}
-          true -> :ok
+          true -> {:ok, peer}
         end
 
-      {{:ok, _peer}, _first} ->
-        :ok
+      {{:ok, peer}, _first} ->
+        {:ok, peer}
     end
   end
 

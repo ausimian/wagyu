@@ -35,8 +35,10 @@ defmodule Wagyu.NoiseTest do
     assert initiator.public_key == vector(:initiator_public)
     assert responder.public_key == vector(:responder_public)
 
-    ini = Noise.initiator(initiator, responder.public_key, with_ephemeral(vector(:initiator_ephemeral_private)))
-    rsp = Noise.responder(responder, with_ephemeral(vector(:responder_ephemeral_private)))
+    ini =
+      Noise.initiator(initiator, responder.public_key, <<0::256>>, with_ephemeral(vector(:initiator_ephemeral_private)))
+
+    rsp = Noise.responder(responder, <<0::256>>, with_ephemeral(vector(:responder_ephemeral_private)))
 
     initiation =
       Noise.write_initiation(ini, @initiator_index, vector(:timestamp), Packet.mac1_key(responder.public_key))
@@ -65,7 +67,7 @@ defmodule Wagyu.NoiseTest do
     setup do
       initiator = identity(elem(keypair(), 1))
       responder = identity(elem(keypair(), 1))
-      ini = Noise.initiator(initiator, responder.public_key)
+      ini = Noise.initiator(initiator, responder.public_key, <<0::256>>)
       rsp = Noise.responder(responder)
       initiation = Noise.write_initiation(ini, 1, timestamp(1), Packet.mac1_key(responder.public_key))
       {:ok, _key, _timestamp} = Noise.read_initiation(rsp, decode(initiation))

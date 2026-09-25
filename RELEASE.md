@@ -7,8 +7,12 @@
   use, such as 32 zero bytes or another low-order point, is rejected. Errors
   name the offending option, and the configuration's `Inspect`
   implementation omits private and preshared keys.
-- A nonzero preshared key fails validation with
-  `{:error, :unsupported_preshared_key}` instead of being treated as zero.
+- Each peer may have its own 32-byte `:preshared_key`, which is mixed into
+  every handshake with it, interoperating with wireguard-go. Omitting it, or
+  passing 32 zero bytes, means no preshared key. A configured key is never
+  replaced by zeros: when the two sides' keys differ, or only one side has
+  one, the handshake does not complete and neither side gets a key to send
+  with.
 - `Wagyu.start_link/1`, or `{Wagyu, options}` in a supervision tree, starts
   an interface: a UDP socket on the listen address and a SmolNet stack whose
   reference `Wagyu.stack/1` returns for opening sockets. `Wagyu.info/1`

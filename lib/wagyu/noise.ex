@@ -5,10 +5,12 @@ defmodule Wagyu.Noise do
   #
   # WireGuard is Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s with its identifier as
   # the prologue. The first message's payload is the initiator's 12-byte
-  # TAI64N timestamp and the second's is empty. An omitted preshared key is
-  # 32 zero bytes, the only key this release supports. The psk2 modifier
-  # mixes it in only at the end of the second message, so a responder can
-  # read an initiation, and learn who sent it, before choosing a peer's key.
+  # TAI64N timestamp and the second's is empty. A peer without a preshared
+  # key uses 32 zero bytes. The psk2 modifier mixes the key in only at the
+  # end of the second message, so reading an initiation depends on whether
+  # a key is present but not on its value. A responder therefore reads an
+  # initiation with the zero key to learn who sent it, and reads it again
+  # with that peer's key when it has one (see `Wagyu.HandshakeWorker`).
   #
   # Noise's Split gives the initiator the first key to send with, as in
   # WireGuard, which is Decibel's default. Transport messages have empty
@@ -41,20 +43,32 @@ defmodule Wagyu.Noise do
   @typedoc "Makes a session, as `Decibel.new/3` does."
   @type new :: (String.t(), Decibel.role(), Decibel.key_material() -> Decibel.session())
 
-  @doc "Starts a responder session with the interface's key pair."
-  @spec responder(Config.t(), new()) :: Decibel.session()
-  def responder(%Config{public_key: public_key, private_key: private_key}, new \\ &Decibel.new/3) do
-    new.(@protocol, :rsp, %{s: {public_key, private_key}, psks: [@zero_psk], prologue: @prologue})
+  @doc """
+  Starts a responder session with the interface's key pair and
+  `preshared_key`, which defaults to none (32 zero bytes). The initiator is
+  not known until its initiation is read, so a first read uses the default.
+  """
+  @spec responder(Config.t(), <<_::256>>, new()) :: Decibel.session()
+  def responder(
+        %Config{public_key: public_key, private_key: private_key},
+        <<_::binary-32>> = preshared_key \\ @zero_psk,
+        new \\ &Decibel.new/3
+      ) do
+    new.(@protocol, :rsp, %{s: {public_key, private_key}, psks: [preshared_key], prologue: @prologue})
   end
 
-  @doc "Starts an initiator session with the interface's key pair, to the holder of `remote_key`."
-  @spec initiator(Config.t(), <<_::256>>, new()) :: Decibel.session()
+  @doc """
+  Starts an initiator session with the interface's key pair, to the holder
+  of `remote_key`, with the peer's `preshared_key` (32 zero bytes for none).
+  """
+  @spec initiator(Config.t(), <<_::256>>, <<_::256>>, new()) :: Decibel.session()
   def initiator(
         %Config{public_key: public_key, private_key: private_key},
         <<_::binary-32>> = remote_key,
+        <<_::binary-32>> = preshared_key,
         new \\ &Decibel.new/3
       ) do
-    new.(@protocol, :ini, %{s: {public_key, private_key}, rs: remote_key, psks: [@zero_psk], prologue: @prologue})
+    new.(@protocol, :ini, %{s: {public_key, private_key}, rs: remote_key, psks: [preshared_key], prologue: @prologue})
   end
 
   @doc """

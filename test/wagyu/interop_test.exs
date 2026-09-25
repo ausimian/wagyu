@@ -260,6 +260,113 @@ defmodule Wagyu.InteropTest do
     end
   end
 
+  describe "preshared keys" do
+    # Two wireguard-go devices, each with its own preshared key, and one
+    # Wagyu interface with both as peers. Each device's netstack address is
+    # routed to it alone.
+    setup context do
+      remotes =
+        for {address, fill} <- [{{10, 13, 0, 1}, 7}, {{10, 13, 0, 3}, 8}] do
+          {key, private_key} = keypair()
+          %{address: address, key: key, private_key: private_key, psk: :binary.copy(<<fill>>, 32)}
+        end
+
+      Map.put(context, :remotes, remotes)
+    end
+
+    defp start_wagyu_with(context, endpoints) do
+      peers =
+        for {remote, endpoint} <- Enum.zip(context.remotes, endpoints) do
+          %{public_key: remote.key, endpoint: endpoint, preshared_key: remote.psk, allowed_ips: [{remote.address, 32}]}
+        end
+
+      interface = start_supervised!({Wagyu, options(private_key: context.wagyu_private, peers: peers)})
+      {:ok, %{listen: %{port: port}}} = Wagyu.info(interface)
+      %{interface: interface, port: port, children: children(interface)}
+    end
+
+    defp start_go_with(context, remote, psk, peer) do
+      uapi =
+        [private_key: remote.private_key, listen_port: 0, public_key: context.wagyu_key, preshared_key: psk] ++
+          peer ++ [allowed_ip: "10.13.0.2/32"]
+
+      WgPeer.start!(context.wgpeer, remote.address, uapi)
+    end
+
+    test "Wagyu responds to, and initiates with, peers with distinct keys", context do
+      wagyu = start_wagyu_with(context, [nil, nil])
+
+      devices =
+        for remote <- context.remotes do
+          {device, _port} = start_go_with(context, remote, remote.psk, endpoint: "127.0.0.1:#{wagyu.port}")
+          :ok = WgPeer.echo(device, :udp, 7)
+          {remote, device}
+        end
+
+      socket = udp(wagyu, 9_000)
+
+      # Both devices initiate at once, and Wagyu reads each initiation again
+      # with that device's key.
+      for {_remote, device} <- devices, do: :ok = WgPeer.send_udp(device, @wagyu_address, 9_000, "hello")
+
+      for _device <- devices do
+        assert {:ok, %{data: "hello", source: %{addr: address}}} = SmolNet.recvfrom(socket, 0, 10_000)
+        assert address in Enum.map(context.remotes, & &1.address)
+      end
+
+      # Each reply goes under its own device's key.
+      for {remote, _device} <- devices do
+        :ok = SmolNet.sendto(socket, "reply", %{family: :inet, addr: remote.address, port: 7})
+        assert {:ok, %{data: "reply", source: %{addr: address}}} = SmolNet.recvfrom(socket, 0, 10_000)
+        assert address == remote.address
+      end
+
+      assert %{responses_sent: 2, keys_confirmed: 2, transport_invalid: 0} = counters(wagyu.interface)
+    end
+
+    test "Wagyu initiates to peers with distinct keys", context do
+      devices =
+        for remote <- context.remotes do
+          {device, port} = start_go_with(context, remote, remote.psk, [])
+          :ok = WgPeer.echo(device, :udp, 7)
+          {device, port}
+        end
+
+      wagyu =
+        start_wagyu_with(context, Enum.map(devices, fn {_device, port} -> %{address: {127, 0, 0, 1}, port: port} end))
+
+      socket = udp(wagyu)
+
+      for remote <- context.remotes do
+        :ok = SmolNet.sendto(socket, "ping", %{family: :inet, addr: remote.address, port: 7})
+        assert {:ok, %{data: "ping", source: %{addr: address}}} = SmolNet.recvfrom(socket, 0, 10_000)
+        assert address == remote.address
+      end
+
+      assert %{initiations_sent: 2, responses_accepted: 2, responses_invalid: 0} = counters(wagyu.interface)
+    end
+
+    test "a device with another key completes no handshake either way", context do
+      [remote, other] = context.remotes
+
+      # Wagyu responds, and wireguard-go rejects the response.
+      wagyu = start_wagyu_with(context, [nil, nil])
+      {device, go_port} = start_go_with(context, remote, other.psk, endpoint: "127.0.0.1:#{wagyu.port}")
+      :ok = WgPeer.send_udp(device, @wagyu_address, 9, "hello")
+      assert %{responses_sent: 1} = counters(wagyu.interface, &(&1.responses_sent == 1))
+
+      # wireguard-go responds to Wagyu, and Wagyu refuses the response.
+      :ok = stop_supervised!(Wagyu)
+      wagyu = start_wagyu_with(context, [%{address: {127, 0, 0, 1}, port: go_port}, nil])
+      :ok = SmolNet.sendto(udp(wagyu), "hello", %{family: :inet, addr: remote.address, port: 9})
+      assert %{responses_invalid: 1, responses_accepted: 0} = counters(wagyu.interface, &(&1.responses_invalid == 1))
+
+      Process.sleep(200)
+      assert %{keys_confirmed: 0, transport_sent: 0} = counters(wagyu.interface)
+      assert %{peers: [%{"last_handshake_time_sec" => "0"}]} = WgPeer.get(device)
+    end
+  end
+
   test "wgpeer vectors still prints the golden transcript", %{wgpeer: wgpeer} do
     assert WgPeer.vectors!(wgpeer) == Wagyu.GoldenVectors.hex()
   end

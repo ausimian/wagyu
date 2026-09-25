@@ -71,6 +71,9 @@ under its own supervisor:
   )
 ```
 
+A peer may also have a `:preshared_key`, the 32-byte key `wg genpsk` makes,
+which both sides must configure alike. `Wagyu.Config` describes every option.
+
 To run it in your own supervision tree instead, list `{Wagyu, options}` as a
 child.
 
