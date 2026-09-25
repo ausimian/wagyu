@@ -44,11 +44,22 @@ defmodule Wagyu.Interface do
   #
   # Egress packets from the link are routed by destination through
   # AllowedIPs. Peers are configuration records until traffic or an
-  # authorized initiation needs one; the interface then starts its process,
-  # monitors it, and forgets it when it exits. The interface is the only
-  # process that starts peers, so there is at most one per key. Every send to
-  # a peer is admitted against that peer's bound first. Messages that cannot
-  # be admitted or acted on are dropped and counted.
+  # authorized initiation needs one, or, for a peer with a persistent
+  # keepalive, until the peer supervisor starts; the interface then starts
+  # its process, monitors it, and forgets it when it exits. A peer with a
+  # persistent keepalive that exits is started again a second later. The interface is
+  # the only process that starts peers, so there is at most one per key.
+  # Every send to a peer is admitted against that peer's bound first.
+  # Messages that cannot be admitted or acted on are dropped and counted.
+  #
+  # A peer that has been idle long enough to discard its keys asks to be
+  # forgotten (`release_peer/3`) and exits once it is. The interface agrees
+  # only when nothing admitted for the peer is still waiting to reach it,
+  # and it stops forwarding to the peer and retires its indices in the same
+  # step, so no message is lost to the exit: whatever comes next starts a
+  # new process. The interface keeps the endpoint the peer had, which may
+  # have been learned from its traffic, and starts the next process with
+  # it.
   #
   # Synchronous calls go one way: workers and peers may call the interface,
   # and the interface calls only the supervisors that start them, never a
@@ -96,6 +107,9 @@ defmodule Wagyu.Interface do
   # bytes, and the MTU may be up to 65,475.
   @recbuf 1_048_576
   @buffer 65_535
+  # How long after a peer with a persistent keepalive fails the interface
+  # starts it again, so a peer that fails at once cannot spin.
+  @peer_restart 1_000
   # The least time between two accepted initiations from one peer, in
   # milliseconds (wireguard-go's and Linux's 50 per second).
   @initiation_interval 20
@@ -134,7 +148,8 @@ defmodule Wagyu.Interface do
     transport_replayed: 31,
     transport_expired: 32,
     transport_malformed: 33,
-    transport_source_denied: 34
+    transport_source_denied: 34,
+    handshakes_abandoned: 35
   ]
 
   # The counters peers update.
@@ -155,7 +170,8 @@ defmodule Wagyu.Interface do
     :transport_replayed,
     :transport_expired,
     :transport_malformed,
-    :transport_source_denied
+    :transport_source_denied,
+    :handshakes_abandoned
   ]
 
   @claim_errors [
@@ -268,9 +284,28 @@ defmodule Wagyu.Interface do
   gives each peer it starts. `name` is one of the peer counters in
   `t:Wagyu.info/0`.
   """
-  @spec count_peer_event(:counters.counters_ref(), atom()) :: :ok
-  def count_peer_event(counters, name) when name in @peer_counters,
-    do: :counters.add(counters, Keyword.fetch!(@counters, name), 1)
+  @spec count_peer_event(:counters.counters_ref(), atom(), non_neg_integer()) :: :ok
+  def count_peer_event(counters, name, increment \\ 1) when name in @peer_counters,
+    do: :counters.add(counters, Keyword.fetch!(@counters, name), increment)
+
+  @doc """
+  Forgets the calling peer, the running peer for `public_key`, which then
+  exits: traffic for it starts a new process, with `endpoint` as its
+  endpoint unless that is nil, and its indices are retired.
+  Returns `:busy`, and forgets nothing, while messages admitted for the
+  peer are still waiting for it to take them. Returns `:ok` too if the
+  caller is not that peer, or no interface is running, since nothing will
+  be sent to it either way.
+  """
+  @spec release_peer(term(), <<_::256>>, {:inet.ip_address(), :inet.port_number()} | nil) :: :ok | :busy
+  def release_peer(root, public_key, endpoint) do
+    case Wagyu.Registry.lookup(root, :interface) do
+      {:ok, interface, _value} -> GenServer.call(interface, {:release_peer, public_key, endpoint}, :infinity)
+      :error -> :ok
+    end
+  catch
+    :exit, _reason -> :ok
+  end
 
   @doc """
   Retires a local receiver index that the calling peer holds. The index
@@ -308,6 +343,7 @@ defmodule Wagyu.Interface do
            counters: :counters.new(length(@counters), []),
            handshakes: HandshakeQueue.new(),
            peers: %{},
+           endpoints: %{},
            monitors: %{},
            initiations: %{},
            sent: %{},
@@ -378,6 +414,20 @@ defmodule Wagyu.Interface do
     end
   end
 
+  def handle_call({:release_peer, key, endpoint}, {caller, _tag}, state) do
+    case state.peers do
+      %{^key => %{pid: ^caller} = peer} ->
+        if idle?(peer) do
+          {:reply, :ok, release(state, key, caller, endpoint)}
+        else
+          {:reply, :busy, state}
+        end
+
+      _not_this_peer ->
+        {:reply, :ok, state}
+    end
+  end
+
   def handle_call({:retire_index, index}, {caller, _tag}, state) do
     case IndexTable.lookup(state.indices, index) do
       {:active, {_key, ^caller}} ->
@@ -426,6 +476,28 @@ defmodule Wagyu.Interface do
 
       {nil, _monitors} ->
         {:noreply, state}
+    end
+  end
+
+  # The peer supervisor has started, or restarted: peers with a persistent
+  # keepalive start with it.
+  def handle_info(:peer_supervisor_started, state) do
+    {:noreply,
+     state.config.peers
+     |> Map.values()
+     |> Enum.filter(&(&1.persistent_keepalive > 0))
+     |> Enum.reduce(state, fn peer, state ->
+       case ensure_peer(state, peer.public_key) do
+         {:ok, _peer, state} -> state
+         {:error, state} -> state
+       end
+     end)}
+  end
+
+  def handle_info({:restart_peer, key}, state) do
+    case ensure_peer(state, key) do
+      {:ok, _peer, state} -> {:noreply, state}
+      {:error, state} -> {:noreply, state}
     end
   end
 
@@ -614,6 +686,7 @@ defmodule Wagyu.Interface do
       root: state.root,
       peer: config,
       allowed_ips: AllowedIPs.source_filter(state.config.allowed_ips, key),
+      endpoint: Map.get(state.endpoints, key),
       socket: state.socket,
       counters: state.counters,
       inbound: inbound,
@@ -639,15 +712,35 @@ defmodule Wagyu.Interface do
   # never sent, were lost with it; its queues' counts say how many. Its indices become tombstones, so messages
   # for them drop here and none is reused while the remote party may still
   # send to it.
+  #
+  # A peer that was released has been forgotten already, and another
+  # process may hold its key by now.
   defp peer_down(state, key, pid) do
-    {peer, peers} = Map.pop!(state.peers, key)
-    {lost_outbound, _bytes} = Admission.usage(peer.outbound)
-    {lost_staged, _bytes} = Admission.usage(peer.staging)
-    {lost_inbound, _bytes} = Admission.usage(peer.inbound)
-    add(state, :egress_peer_dropped, lost_outbound + lost_staged)
-    add(state, :inbound_peer_dropped, lost_inbound)
+    case state.peers do
+      %{^key => %{pid: ^pid} = peer} ->
+        {lost_outbound, _bytes} = Admission.usage(peer.outbound)
+        {lost_staged, _bytes} = Admission.usage(peer.staging)
+        {lost_inbound, _bytes} = Admission.usage(peer.inbound)
+        add(state, :egress_peer_dropped, lost_outbound + lost_staged)
+        add(state, :inbound_peer_dropped, lost_inbound)
+        indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
+        {:ok, config} = Config.fetch_peer(state.config, key)
+        if config.persistent_keepalive > 0, do: Process.send_after(self(), {:restart_peer, key}, @peer_restart)
+        schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices})
+
+      _released ->
+        state
+    end
+  end
+
+  defp release(state, key, pid, endpoint) do
     indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
-    schedule_expiry(%{state | peers: peers, indices: indices})
+    endpoints = if endpoint, do: Map.put(state.endpoints, key, endpoint), else: state.endpoints
+    schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices, endpoints: endpoints})
+  end
+
+  defp idle?(peer) do
+    Enum.all?([peer.inbound, peer.outbound, peer.staging, peer.handoffs], &match?({0, _bytes}, Admission.usage(&1)))
   end
 
   # One timer at a time, for the oldest tombstone.

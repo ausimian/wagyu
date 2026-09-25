@@ -145,6 +145,38 @@ defmodule Wagyu.InteropTest do
     assert go_handshake(device)
   end
 
+  test "Wagyu rekeys with wireguard-go at 120 seconds without interrupting traffic", context do
+    {device, go_port} = start_go(context, [])
+    :ok = WgPeer.echo(device, :udp, 7)
+    wagyu = start_wagyu(context, %{address: {127, 0, 0, 1}, port: go_port})
+    socket = udp(wagyu)
+    ping = fn -> :ok = SmolNet.sendto(socket, "ping", %{family: :inet, addr: @go_address, port: 7}) end
+
+    ping.()
+    assert {:ok, %{data: "ping"}} = SmolNet.recvfrom(socket, 0, 10_000)
+    peer = wagyu_peer(wagyu)
+    %{current: %{local_index: first}} = :sys.get_state(peer)
+
+    # REKEY_AFTER_TIME passes on Wagyu's clock. The next datagram goes out
+    # under the old key and starts a handshake, and the echo comes back.
+    # wireguard-go takes at most one initiation from a peer every 20 ms of
+    # its own time, which a fake clock does not move.
+    clock = fake_clock(peer, System.monotonic_time(:millisecond))
+    advance(clock, 120_000)
+    Process.sleep(50)
+    ping.()
+    assert {:ok, %{data: "ping"}} = SmolNet.recvfrom(socket, 0, 10_000)
+    assert %{responses_accepted: 2} = counters(wagyu.interface, &(&1.responses_accepted == 2))
+
+    # Both sides carry on under the new key.
+    ping.()
+    assert {:ok, %{data: "ping"}} = SmolNet.recvfrom(socket, 0, 10_000)
+    assert %{current: %{local_index: second}, previous: %{local_index: ^first}} = :sys.get_state(peer)
+    refute second == first
+    assert %{transport_invalid: 0, transport_expired: 0, responses_invalid: 0} = counters(wagyu.interface)
+    assert go_handshake(device)
+  end
+
   describe "the data path" do
     test "SmolNet UDP and TCP sockets exchange data with wireguard-go's netstack", context do
       {device, go_port} = start_go(context, [])

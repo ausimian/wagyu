@@ -36,11 +36,29 @@
   of data that passes those checks, as well as of its handshakes, so a peer
   that roams keeps its tunnel.
 - A key is used for at most 180 seconds after its handshake, in either
-  direction, and never beyond 2^64 - 2^13 - 1 messages; the next packet then
-  waits for a new handshake. An initiator counts those seconds from its
-  initiation, so a response that arrives too late cannot leave it sending
-  under a key the responder has already retired. Automatic rekeying before that point is not
-  implemented yet.
+  direction, and never beyond 2^64 - 2^13 - 1 messages, however much traffic
+  there is and whatever the system clock does; it is then discarded and its
+  index retired. An initiator counts those seconds from its initiation, so a
+  response that arrives too late cannot leave it sending under a key the
+  responder has already retired.
+- Keys are replaced before they expire, as in WireGuard: the initiator of a
+  handshake starts a new one when it sends under a key 120 seconds old, or
+  when it receives under one 165 seconds old, and either side does after
+  2^60 messages.
+- An unanswered handshake initiation is retried every 5 seconds plus up to
+  333 ms of random jitter, for 90 seconds from the last packet that had to
+  wait for it, from the same peer process. Then the packets waiting for it
+  are dropped, and `Wagyu.info/1` counts the attempt in
+  `:handshakes_abandoned`.
+- A peer that has received data and sent nothing for 10 seconds sends a
+  keepalive, and one that has sent data and heard nothing for 15 seconds
+  starts a new handshake. Otherwise idle peers stay quiet.
+- A peer's `:persistent_keepalive` option, in seconds, sends a keepalive
+  whenever that long passes with no traffic in either direction, to keep
+  NAT mappings open. A peer with one starts with the interface.
+- 540 seconds after a peer's last handshake, all its keys are discarded, and
+  an idle peer's process exits, to start again when it is next needed with
+  the endpoint it last had, including one learned from its traffic.
 - Outbound packets are padded to a multiple of 16 bytes, but never beyond the
   MTU.
 - An interface completes WireGuard handshakes with its configured peers in
@@ -51,8 +69,7 @@
   the wall clock steps back. A peer with no configured endpoint responds to
   initiations and then uses the endpoint they came from; until it has one,
   it counts each handshake it could not start in `Wagyu.info/1`. A peer
-  starts a handshake at most once every 5 seconds, and not within 5 seconds
-  of responding to one.
+  sends a handshake message at most once every 5 seconds.
 - Each peer keeps next, current and previous keys, as wireguard-go does. The
   initiator of a handshake sends with the new keys at once and confirms
   them with the packets waiting for them, or with an empty keepalive if

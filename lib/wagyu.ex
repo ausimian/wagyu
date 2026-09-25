@@ -11,11 +11,37 @@ defmodule Wagyu do
   >
   > An interface completes WireGuard handshakes with its configured peers,
   > both ways, and carries the TCP and UDP traffic of sockets opened on its
-  > stack. A packet sent to a peer with no usable key waits while the peer
-  > starts a handshake. Handshakes that fail are not retried on a timer yet,
-  > and keys are not replaced before they expire: 180 seconds after a
-  > handshake, a key is no longer used, and the next packet starts a new
-  > handshake. `info/1` counts all of it.
+  > stack. It retries, rekeys and sends keepalives on WireGuard's timers.
+  > Cookies, preshared keys and changing the configuration while running
+  > are not supported yet.
+
+  ## Timers
+
+  Peers follow WireGuard's timers, as wireguard-go does:
+
+    * A packet sent to a peer with no usable key waits while the peer
+      starts a handshake. An initiation that gets no response is sent again
+      every 5 seconds plus up to 333 ms of random jitter, for 90 seconds
+      from the last packet that had to wait; then the waiting packets are
+      dropped. A peer never sends handshake messages less than 5 seconds
+      apart.
+    * The initiator of a handshake replaces its keys once they are 120
+      seconds old or have sent 2^60 messages, when it next sends, or at 165
+      seconds if it is only receiving. A responder replaces its keys only
+      after 2^60 messages; its initiator replaces them on time. No key is
+      used 180 seconds after its handshake or beyond 2^64 - 2^13 - 1
+      messages, whatever the traffic, and it is then discarded.
+    * A peer that has received data and sent nothing for 10 seconds sends
+      an empty keepalive, and one that has sent data and heard nothing for
+      15 seconds starts a new handshake. Otherwise an idle peer is quiet,
+      unless it has a persistent keepalive (see `Wagyu.Config`).
+    * 540 seconds after a peer's last handshake, or after its last attempt
+      ran out, it discards all its keys and, unless it has a persistent
+      keepalive, its process exits. The next packet for it, or initiation
+      from it, starts it again, with the endpoint it last had.
+
+  Timers use the monotonic clock, so changing the system time neither
+  extends a key's life nor delays a timer.
 
   ## Starting an interface
 
@@ -130,8 +156,7 @@ defmodule Wagyu do
   restarts, so a replay is refused even after the peer's own process
   restarts. At most 2 accepted handshakes wait for each peer's process,
   apart from its other queues; beyond that, new ones are refused until it
-  catches up. A peer starts a handshake at most once every 5 seconds, and
-  not within 5 seconds of responding to one, as wireguard-go does.
+  catches up.
 
   The one exception is the stack's own output. SmolNet sends each outbound
   batch to the interface without backpressure, so nothing bounds those
@@ -208,7 +233,8 @@ defmodule Wagyu do
     * `:responses_invalid` - responses that reached their peer but were not
       for its handshake in progress or did not authenticate
     * `:keepalives_sent` - empty transport messages sent to confirm a
-      handshake this interface initiated
+      handshake this interface initiated, to answer data after 10 seconds
+      of silence, or as persistent keepalives
     * `:keys_confirmed` - handshakes this interface responded to whose keys
       the initiator confirmed with its first transport message, after which
       the responder sends with them
@@ -230,8 +256,11 @@ defmodule Wagyu do
       address is not in their peer's AllowedIPs
     * `:staged_dropped` - packets dropped because their peer had no usable
       key and already held as many packets waiting for one as it may (128
-      packets or 256 KiB). A peer's total outbound loss is this plus
+      packets or 256 KiB), or because its handshake attempt ran out while
+      they waited. A peer's total outbound loss is this plus
       `:egress_peer_dropped`.
+    * `:handshakes_abandoned` - handshake attempts that got no response in
+      the 90 seconds they are retried for
     * `:send_errors` - datagrams that a peer failed to send
     * `:egress` - packets the stack sent
     * `:egress_dropped` - packets the stack sent that were dropped because

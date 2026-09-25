@@ -217,6 +217,30 @@ defmodule Wagyu.ConfigTest do
     end
   end
 
+  describe "persistent keepalives" do
+    test "default to none and accept 0..65535 seconds" do
+      assert {:ok, config} = Config.new(options())
+      assert [%Peer{persistent_keepalive: 0}] = Map.values(config.peers)
+
+      for seconds <- [0, 1, 25, 65_535] do
+        assert {:ok, config} = Config.new(options(peers: [peer(%{persistent_keepalive: seconds})]))
+        assert [%Peer{persistent_keepalive: ^seconds}] = Map.values(config.peers)
+      end
+    end
+
+    test "reject values outside 0..65535 and non-integers" do
+      path = [:peers, 0, :persistent_keepalive]
+
+      for seconds <- [-1, 65_536] do
+        assert Config.new(options(peers: [peer(%{persistent_keepalive: seconds})])) == invalid(path, :out_of_range)
+      end
+
+      for value <- [nil, 2.5, "25"] do
+        assert Config.new(options(peers: [peer(%{persistent_keepalive: value})])) == invalid(path, :invalid)
+      end
+    end
+  end
+
   describe "listen" do
     test "requires an address and a port in 0..65535" do
       for {listen, path, reason} <- [
