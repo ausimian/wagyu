@@ -229,7 +229,9 @@ defmodule Wagyu do
     * `:transport_source_denied` - authenticated packets whose source
       address is not in their peer's AllowedIPs
     * `:staged_dropped` - packets dropped because their peer had no usable
-      key and already held as many packets waiting for one as it may
+      key and already held as many packets waiting for one as it may (128
+      packets or 256 KiB). A peer's total outbound loss is this plus
+      `:egress_peer_dropped`.
     * `:send_errors` - datagrams that a peer failed to send
     * `:egress` - packets the stack sent
     * `:egress_dropped` - packets the stack sent that were dropped because
@@ -238,9 +240,12 @@ defmodule Wagyu do
     * `:egress_unroutable` - packets with a malformed IP header or no
       matching AllowedIPs prefix
     * `:egress_routed` - packets queued for their peer
-    * `:egress_peer_dropped` - packets dropped because the peer's queue was
-      full, it could not start, or it exited before taking them or while
-      they waited for a key
+    * `:egress_peer_dropped` - packets dropped on the way to their peer:
+      because the queue of packets sent to the peer's process was full, the
+      process could not start, or it exited before taking them or while
+      they waited for a key. Packets the peer took but had no room to keep
+      waiting for a key are counted in `:staged_dropped` instead, so the
+      two never count the same packet.
     * `:ingress` - packets the stack accepted
     * `:ingress_dropped` - packets bound for the stack that were dropped,
       because the link's queue was full or the stack refused them
