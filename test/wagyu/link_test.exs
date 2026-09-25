@@ -6,6 +6,7 @@ defmodule Wagyu.LinkTest do
   import Wagyu.TestHelpers
 
   alias Wagyu.Admission
+  alias Wagyu.EgressCredit
   alias Wagyu.FakeSmolNet
   alias Wagyu.Link
 
@@ -27,9 +28,9 @@ defmodule Wagyu.LinkTest do
 
   # Registers the test process as `root`'s interface, receiving egress.
   defp register_interface(root, max_packets \\ 256, max_bytes \\ 512 * 1024) do
-    egress = Admission.new(max_packets, max_bytes)
-    :ok = Wagyu.Registry.register(root, :interface, %{egress: egress})
-    egress
+    registration = %{egress: Admission.new(max_packets, max_bytes), credit: EgressCredit.new()}
+    :ok = Wagyu.Registry.register(root, :interface, registration)
+    registration
   end
 
   defp egress(link, options, packets) do
@@ -54,6 +55,7 @@ defmodule Wagyu.LinkTest do
       assert is_reference(ref)
       assert options[:limits] == %{input_packets: 32, bytes_copied: 65_536}
       assert options[:link_down] == :stop
+      assert options[:egress_credit] == {128, 256 * 1024}
       assert Keyword.take(options, [:addresses, :routes, :mtu]) == @stack_options
     end
 
@@ -79,17 +81,21 @@ defmodule Wagyu.LinkTest do
       egress(link, options, packets(1..4))
       assert eventually(fn -> match?({:ok, %{egress: 4, egress_dropped: 4}}, Link.counters(root)) end)
       refute_received {:wg_egress, _packets}
+
+      # Nothing holds what was dropped, so the stack gets its credit back.
+      assert_receive {:grant_egress, ^link, 4, 80}
     end
 
     test "admits packets in order up to the interface's bound and drops the rest",
          %{root: root, link: link, options: options} do
-      queue = register_interface(root, 3)
+      %{egress: queue} = register_interface(root, 3)
       egress(link, options, packets(1..5))
 
       assert_receive {:wg_egress, admitted}
       assert admitted == packets(1..3)
       assert eventually(fn -> match?({:ok, %{egress: 5, egress_dropped: 2}}, Link.counters(root)) end)
       assert Admission.usage(queue) == {3, 60}
+      assert_receive {:grant_egress, ^link, 2, 40}
 
       # The interface releases the batch when it takes it; room reopens.
       Admission.release_all(queue, admitted)
@@ -104,7 +110,12 @@ defmodule Wagyu.LinkTest do
       # An interface that takes nothing from its mailbox.
       interface =
         spawn(fn ->
-          :ok = Wagyu.Registry.register(root, :interface, %{egress: Admission.new(256, 512 * 1024)})
+          :ok =
+            Wagyu.Registry.register(root, :interface, %{
+              egress: Admission.new(256, 512 * 1024),
+              credit: EgressCredit.new()
+            })
+
           send(test, :registered)
           receive(do: (:never -> :ok))
         end)
@@ -113,17 +124,59 @@ defmodule Wagyu.LinkTest do
       egress(link, options, packets(1..3))
       _state = :sys.get_state(link)
       assert {:ok, %{egress: 3, egress_dropped: 0}} = Link.counters(root)
+      refute_received {:grant_egress, ^link, _packets, _bytes}
 
       # The three it never took are counted as soon as it exits, and once
-      # only: a batch for its replacement adds nothing.
+      # only: a batch for its replacement adds nothing. Their credit is
+      # the stack's again.
       Process.exit(interface, :kill)
       assert eventually(fn -> match?({:ok, %{egress: 3, egress_dropped: 3}}, Link.counters(root)) end)
+      assert_receive {:grant_egress, ^link, 3, 60}
 
       register_interface(root)
       egress(link, options, packets(4..4))
       assert_receive {:wg_egress, [_packet]}
       _state = :sys.get_state(link)
       assert {:ok, %{egress: 4, egress_dropped: 3}} = Link.counters(root)
+    end
+
+    test "grants credit back only as the interface retires what it holds",
+         %{root: root, link: link, options: options} do
+      %{credit: credit} = register_interface(root)
+      egress(link, options, packets(1..3))
+      assert_receive {:wg_egress, batch}
+      assert EgressCredit.outstanding(credit) == {3, 60}
+
+      # The interface still holds all three.
+      send(link, :wg_egress_retired)
+      _state = :sys.get_state(link)
+      refute_received {:grant_egress, ^link, _packets, _bytes}
+
+      EgressCredit.retire_all(credit, Enum.take(batch, 2))
+      {:ok, target} = Link.lookup(root)
+      Link.retired(target)
+      assert_receive {:grant_egress, ^link, 2, 40}
+
+      # Credit is granted once: a second notice finds nothing new.
+      Link.retired(target)
+      _state = :sys.get_state(link)
+      refute_received {:grant_egress, ^link, _packets, _bytes}
+    end
+
+    test "a credit notice does not end a run of queued plaintext", %{root: root, link: link} do
+      register_interface(root)
+      {:ok, target} = Link.lookup(root)
+
+      # Hold the link in an ingress call while plaintext and a notice queue
+      # behind it.
+      assert Link.deliver(root, packets(0..0)) == 0
+      assert_receive {:ingress, ^link, ref, [_first]}
+      assert Link.deliver(root, packets(1..2)) == 0
+      Link.retired(target)
+      assert Link.deliver(root, packets(3..4)) == 0
+      send(link, {ref, {:ok, 1}})
+
+      assert answer_ingress(link, &accept_all/1) == packets(1..4)
     end
 
     test "ignores egress for another link reference", %{root: root, link: link} do

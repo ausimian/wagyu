@@ -17,6 +17,9 @@ defmodule Wagyu.Peer do
   # releases a handoff as it takes it off the mailbox, each outbound packet
   # just before it sends or stages it, and each frame once it is done with
   # it, which for a data packet is once the packet has gone to the link.
+  # An outbound packet's egress credit (`Wagyu.EgressCredit`) is retired
+  # with it, and once the peer has taken a batch it tells the link, which
+  # may then grant the stack that credit again.
   #
   # Responding. After the interface authorizes an initiation for this peer,
   # the handshake worker hands its responder session, which has this peer's
@@ -195,6 +198,7 @@ defmodule Wagyu.Peer do
   alias Wagyu.AllowedIPs
   alias Wagyu.Config
   alias Wagyu.Cookie
+  alias Wagyu.EgressCredit
   alias Wagyu.Interface
   alias Wagyu.IP
   alias Wagyu.Link
@@ -257,7 +261,9 @@ defmodule Wagyu.Peer do
       socket: socket,
       counters: counters,
       inbound: inbound,
-      outbound: outbound,
+      # An outbound packet holds the link's egress credit as long as it
+      # holds room in the queue.
+      outbound: %{queue: outbound, credit: Map.fetch!(args, :credit)},
       handoffs: handoffs,
       staging: staging,
       mac1_key: Packet.mac1_key(peer.public_key),
@@ -331,7 +337,7 @@ defmodule Wagyu.Peer do
     {:noreply, state}
   end
 
-  defp handle({:wg_outbound, packets}, state), do: {:noreply, state |> send_packets(packets) |> arm()}
+  defp handle({:wg_outbound, packets}, state), do: {:noreply, state |> send_packets(packets) |> retired() |> arm()}
 
   # The armed process timer, or one that has been replaced since. Either
   # way only the timers already due run.
@@ -696,14 +702,34 @@ defmodule Wagyu.Peer do
   end
 
   defp send_outbound(packet, state) do
-    Admission.release(state.outbound, 1, byte_size(packet))
+    take_outbound(state, packet)
     send_packet(state, packet)
+  end
+
+  # The credit goes first. If the peer is killed between the two, the
+  # interface retires the packet's credit again from the queue's count,
+  # which the link may grant once too often, rather than never.
+  defp take_outbound(%{outbound: %{queue: queue, credit: credit}}, packet) do
+    EgressCredit.retire(credit, 1, byte_size(packet))
+    Admission.release(queue, 1, byte_size(packet))
+  end
+
+  # Tells the link that the credit of a batch taken is free again.
+  defp retired(state) do
+    case link(state) do
+      {:ok, link, state} ->
+        Link.retired(link)
+        state
+
+      :error ->
+        state
+    end
   end
 
   defp seal_batch(state, key_pair, [], sent, errors), do: sent_batch(state, key_pair, sent, errors)
 
   defp seal_batch(state, key_pair, [packet | rest], sent, errors) do
-    Admission.release(state.outbound, 1, byte_size(packet))
+    take_outbound(state, packet)
 
     case Noise.seal(key_pair.session, key_pair.remote_index, pad(packet, state.identity.stack[:mtu])) do
       {:ok, frame} ->

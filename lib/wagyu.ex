@@ -141,11 +141,10 @@ defmodule Wagyu do
   Every queue between the interface's own processes has a fixed bound, and
   anything beyond it is dropped and counted rather than queued: datagrams
   are read from the socket a bounded batch at a time, at most 8 handshake
-  workers run with at most 64 initiations waiting, each peer queues at most
-  128 packets or 256 KiB in each direction, and as many again waiting for a
-  key to send them with, and packets the stack sends
-  beyond what the interface has queued are dropped. At most 32 packets reach
-  the stack in one ingress call, one call at a time.
+  workers run with at most 64 initiations waiting, and each peer queues at
+  most 128 packets or 256 KiB in each direction, and as many again waiting
+  for a key to send them with. At most 32 packets reach the stack in one
+  ingress call, one call at a time.
 
   Handshake cryptography for initiations that arrive runs only in the
   workers, never in the process that reads the socket, so a flood of
@@ -172,12 +171,14 @@ defmodule Wagyu do
   peer under load keys MAC2 on the handshake messages sent to that peer
   for 120 seconds.
 
-  The one exception is the stack's own output. SmolNet sends each outbound
-  batch to the interface without backpressure, so nothing bounds those
-  messages before they arrive; the interface drains them promptly and drops
-  whatever its queue cannot take. Only the application's own sockets
-  produce that output, at most 32 packets per step of the stack, so it
-  keeps pace with the stack rather than with remote traffic.
+  The stack's own output is bounded before it is sent. The stack holds
+  SmolNet egress credit for at most 128 packets or 256 KiB between it and
+  the peers that encrypt them, and gets credit back only as they are sent,
+  wait for a key, or are dropped. So none of the interface's queues
+  overflows with outbound packets, and what the stack cannot send yet
+  waits in its sockets: TCP keeps the data in its send buffer and slows
+  down as it would for a slow network, and a UDP send waits for room in
+  its socket.
 
   ## Keys and logs
 
@@ -288,15 +289,13 @@ defmodule Wagyu do
     * `:send_errors` - datagrams that a peer failed to send
     * `:egress` - packets the stack sent
     * `:egress_dropped` - packets the stack sent that were dropped because
-      the interface's queue was full, it was restarting, or it exited before
-      taking them
+      the interface was restarting or exited before taking them
     * `:egress_unroutable` - packets with a malformed IP header or no
       matching AllowedIPs prefix
     * `:egress_routed` - packets queued for their peer
     * `:egress_peer_dropped` - packets dropped on the way to their peer:
-      because the queue of packets sent to the peer's process was full, the
-      process could not start, or it exited before taking them or while
-      they waited for a key. Packets the peer took but had no room to keep
+      because the peer's process could not start, or it exited before
+      taking them or while they waited for a key. Packets the peer took but had no room to keep
       waiting for a key are counted in `:staged_dropped` instead, so the
       two never count the same packet.
     * `:ingress` - packets the stack accepted

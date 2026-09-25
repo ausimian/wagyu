@@ -26,6 +26,11 @@ defmodule Wagyu.FakeSmolNet do
     end
   end
 
+  def grant_egress(%{controller: controller}, packets, bytes) do
+    send(controller, {:grant_egress, self(), packets, bytes})
+    :ok
+  end
+
   def stop_stack(%{stack: stack, controller: controller}) do
     send(controller, {:stop_stack, self()})
     send(stack, :stop)

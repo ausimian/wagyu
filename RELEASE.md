@@ -126,16 +126,21 @@
   the peer holding their receiver index. Indices are random and unique, and
   one that is retired, or whose peer has exited, drops at the interface
   and is not reused for 180 seconds.
-- Wagyu now depends on Decibel 1.1.1 or later and SmolNet 0.4.2 or later.
+- Wagyu now depends on Decibel 1.1.1 or later and SmolNet 0.5.0 or later.
 - If the stack fails, including when stopped with `SmolNet.stop_stack/1`,
   the interface restarts with a new stack and sockets opened on the old one
   must be reopened. Any other failure inside the interface keeps the stack
   and its open sockets.
 - Every queue between an interface's processes is bounded, and whatever
   does not fit is dropped and counted in `Wagyu.info/1` rather than queued.
-  The SmolNet stack's outbound packets are the exception: SmolNet sends them
-  without backpressure, so the interface drains them promptly and drops what
-  its queue cannot take.
+- The SmolNet stack sends outbound packets only as fast as the peers
+  encrypt them: it holds egress credit for at most 128 packets or 256 KiB
+  between it and the peers, and gets it back as they are sent, wait for a
+  key, or are dropped. What it cannot send yet waits in its sockets, so TCP
+  slows down rather than losing segments inside the interface. Over
+  loopback, eight parallel TCP streams through the tunnel now carry about
+  80 MiB/s where they collapsed to about 15 MiB/s, and none of the
+  interface's queues drops outbound packets.
 - Private and preshared keys stay out of logs: child specs and supervisors
   hold the validated configuration rather than the raw options, and
   processes that hold keys redact them from their status and crash reports.

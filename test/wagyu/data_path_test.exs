@@ -439,7 +439,7 @@ defmodule Wagyu.DataPathTest do
       as = for n <- 1..130, do: outbound(@a_host, "a #{n}")
       [b1, b2, b3] = for n <- 1..3, do: outbound(@b_host, "b #{n}")
       batch = [b1 | Enum.take(as, 60)] ++ [b2 | Enum.drop(as, 60)] ++ [b3]
-      assert {0, {_interface, egress}} = Wagyu.Interface.deliver(context.interface, batch)
+      assert {0, {_interface, egress, _credit}} = Wagyu.Interface.deliver(context.interface, batch)
       assert eventually(fn -> Admission.usage(egress) == {0, 0} end)
 
       assert message_queue_len(a.peer) == 1

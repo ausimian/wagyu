@@ -4,20 +4,28 @@ defmodule Wagyu.Link do
   # The interface's SmolNet link. It starts, owns and monitors one stack, and
   # it is the stack's only ingress feeder.
   #
-  # Egress. The stack sends `{:smol_stack, ref, :egress, packets}` without
-  # backpressure, so the link never blocks on it: it hands each ordered batch
-  # to the current interface, which it finds through the registry rather
-  # than a PID captured at start. Packets are admitted in order against the
+  # Egress. The stack sends `{:smol_stack, ref, :egress, packets}`, and the
+  # link never blocks on it: it hands each ordered batch to the current
+  # interface, which it finds through the registry rather than a PID
+  # captured at start. Packets are admitted in order against the
   # interface's bound, and whatever does not fit, or the whole batch while no
   # interface is registered, is dropped and counted.
   #
-  # This is the one queue that admission cannot bound, since the stack sends
-  # before anything can refuse. What bounds it in practice is that each batch
-  # comes from one step of the stack's own work, at most 32 packets, driven
-  # by application socket calls or the stack's timer, and that handling a
-  # batch here costs far less than producing it. The link is held up only
-  # during its own ingress calls, one at a time. A hard bound would need
-  # egress credit from SmolNet.
+  # The stack sends only what egress credit covers: it starts with
+  # `@egress_credit_packets` packets and `@egress_credit_bytes` bytes, and
+  # the link grants credit back only once packets have left the interface.
+  # The interface counts the packets it holds, in its own mailbox or a
+  # peer's, in a `Wagyu.EgressCredit` it registers, and it and the peers
+  # send `:wg_egress_retired` once they have sent, staged or dropped some.
+  # The link then grants whatever neither the stack, its batches on their
+  # way here, nor the interface holds. So the link's mailbox holds at most
+  # that credit of egress, no interface queue it feeds can overflow, and
+  # what the stack cannot send stays in its sockets, where TCP slows down
+  # as it would for a slow network instead of losing segments.
+  #
+  # A new interface registers a new count. When the one the link delivers
+  # to exits, it took its peers and whatever they held with it, so the link
+  # stops reading its count and grants that credit again.
   #
   # Ingress. Peers admit decrypted packets against the link's own bound with
   # `deliver/2`, or `deliver_to/2` with the target a peer looked up once
@@ -39,6 +47,7 @@ defmodule Wagyu.Link do
   use GenServer
 
   alias Wagyu.Admission
+  alias Wagyu.EgressCredit
 
   @ingress_packets 32
   # SmolNet's default, set explicitly because batches are sized against it.
@@ -46,6 +55,11 @@ defmodule Wagyu.Link do
   # The plaintext that peers may have queued for ingress at once.
   @queue_packets 256
   @queue_bytes 512 * 1024
+  # The egress the stack may have sent that has yet to leave the interface.
+  # It is within the interface's and each peer's outbound bounds, so neither
+  # refuses egress for want of room.
+  @egress_credit_packets 128
+  @egress_credit_bytes 256 * 1024
 
   @counters [egress: 1, egress_dropped: 2, ingress: 3, ingress_dropped: 4]
 
@@ -90,6 +104,16 @@ defmodule Wagyu.Link do
     refused
   end
 
+  @doc """
+  Tells a link found with `lookup/1` that egress it handed on has been sent,
+  staged or dropped, so that it can grant the stack that credit again.
+  """
+  @spec retired(target()) :: :ok
+  def retired(%{pid: link}) do
+    send(link, :wg_egress_retired)
+    :ok
+  end
+
   @doc "Returns the link's counters, or `:error` while no link is running."
   @spec counters(term()) :: {:ok, %{atom() => non_neg_integer()}} | :error
   def counters(root) do
@@ -115,6 +139,7 @@ defmodule Wagyu.Link do
       Keyword.fetch!(options, :stack) ++
         [
           egress: {self(), ref},
+          egress_credit: {@egress_credit_packets, @egress_credit_bytes},
           limits: %{input_packets: @ingress_packets, bytes_copied: @ingress_bytes},
           link_down: :stop
         ]
@@ -138,6 +163,9 @@ defmodule Wagyu.Link do
            pending: [],
            pending_count: 0,
            pending_bytes: 0,
+           # The credit the stack holds, together with its batches on their
+           # way here.
+           held: {@egress_credit_packets, @egress_credit_bytes},
            interface: nil
          }}
 
@@ -151,6 +179,9 @@ defmodule Wagyu.Link do
     Admission.release_all(state.queue, packets)
     state |> enqueue(packets) |> noreply()
   end
+
+  # Credit does not end a run of queued plaintext.
+  def handle_info(:wg_egress_retired, state), do: state |> top_up() |> noreply()
 
   # Any other message ends a run of queued plaintext, so the batch goes in
   # first.
@@ -171,16 +202,18 @@ defmodule Wagyu.Link do
 
   defp handle({:smol_stack, ref, :egress, packets}, %{ref: ref} = state) do
     count(state.counters, :egress, length(packets))
+    {held_packets, held_bytes} = state.held
+    state = %{state | held: {held_packets - length(packets), held_bytes - Admission.bytes(packets)}}
     {refused, interface} = Wagyu.Interface.deliver(state.root, packets)
     count(state.counters, :egress_dropped, refused)
-    {:noreply, track_interface(state, interface)}
+    state |> track_interface(interface) |> top_up() |> noreply()
   end
 
   defp handle({:DOWN, monitor, :process, _object, _reason}, %{monitor: monitor} = state),
     do: {:stop, {:shutdown, :stack_down}, state}
 
-  defp handle({:DOWN, monitor, :process, _object, _reason}, %{interface: {_pid, _egress, monitor}} = state),
-    do: {:noreply, reconcile(state)}
+  defp handle({:DOWN, monitor, :process, _object, _reason}, %{interface: {_pid, _egress, _credit, monitor}} = state),
+    do: state |> reconcile() |> top_up() |> noreply()
 
   # Besides its parent, which GenServer handles, only the registry is linked
   # to the link: registering links to it. If the registry exits, it takes
@@ -195,15 +228,17 @@ defmodule Wagyu.Link do
   # the interface it delivers to and, when that exits, counts whatever it
   # never took as dropped.
   defp track_interface(state, nil), do: state
-  defp track_interface(%{interface: {pid, _egress, _monitor}} = state, {pid, _same}), do: state
 
-  defp track_interface(state, {pid, egress}) do
+  defp track_interface(%{interface: {pid, _egress, _credit, _monitor}} = state, {pid, _same_egress, _same_credit}),
+    do: state
+
+  defp track_interface(state, {pid, egress, credit}) do
     # A different interface registered only once the one before it had
     # exited, even if its :DOWN has yet to arrive.
-    %{reconcile(state) | interface: {pid, egress, Process.monitor(pid)}}
+    %{reconcile(state) | interface: {pid, egress, credit, Process.monitor(pid)}}
   end
 
-  defp reconcile(%{interface: {_pid, egress, monitor}} = state) do
+  defp reconcile(%{interface: {_pid, egress, _credit, monitor}} = state) do
     Process.demonitor(monitor, [:flush])
     {lost, _bytes} = Admission.usage(egress)
     count(state.counters, :egress_dropped, lost)
@@ -211,6 +246,28 @@ defmodule Wagyu.Link do
   end
 
   defp reconcile(state), do: state
+
+  # Grants the stack the credit that neither it nor the interface holds.
+  # The interface's count is read after the retirements that prompted this,
+  # and can only have fallen since, so the grant never exceeds what is free.
+  defp top_up(state) do
+    {held_packets, held_bytes} = state.held
+    {taken_packets, taken_bytes} = taken(state)
+    packets = max(@egress_credit_packets - held_packets - taken_packets, 0)
+    bytes = max(@egress_credit_bytes - held_bytes - taken_bytes, 0)
+
+    if packets == 0 and bytes == 0 do
+      {:ok, state}
+    else
+      case state.smolnet.grant_egress(state.stack, packets, bytes) do
+        :ok -> {:ok, %{state | held: {held_packets + packets, held_bytes + bytes}}}
+        {:error, :closed} -> {:stop, {:shutdown, {:grant_egress, :closed}}, state}
+      end
+    end
+  end
+
+  defp taken(%{interface: {_pid, _egress, credit, _monitor}}), do: EgressCredit.outstanding(credit)
+  defp taken(_state), do: {0, 0}
 
   # Adds packets to the pending batch, sending the batch whenever the next
   # packet would take it past the stack's limits.
