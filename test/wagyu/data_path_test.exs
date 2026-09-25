@@ -71,8 +71,10 @@ defmodule Wagyu.DataPathTest do
     }
   end
 
+  # OTP 27 gives a UDP socket an 8 KiB receive buffer, which a burst of
+  # staged packets overflows on loopback, so set it as the interface does.
   defp udp_socket do
-    {:ok, socket} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+    {:ok, socket} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}, active: false, recbuf: 1_048_576])
     socket
   end
 
