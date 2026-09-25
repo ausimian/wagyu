@@ -488,17 +488,13 @@ defmodule Wagyu.Interface do
     {:noreply, state}
   end
 
-  # Each packet stays admitted until it has been routed, so if the interface
-  # dies part-way through a batch the link counts the unrouted rest as
-  # dropped. At most the one packet being routed at that instant may be
-  # counted twice.
+  # The batch is routed first, and each peer's share of it is forwarded as
+  # one message, in order. Each packet stays admitted until it has been
+  # dropped or forwarded, so if the interface dies part-way through a batch
+  # the link counts the rest as dropped. At most the share being forwarded
+  # at that instant may be counted twice.
   def handle_info({:wg_egress, packets}, state) do
-    {:noreply,
-     Enum.reduce(packets, state, fn packet, state ->
-       state = route(state, packet)
-       Admission.release(state.egress, 1, byte_size(packet))
-       state
-     end)}
+    {:noreply, packets |> route(state) |> Enum.reduce(state, &forward/2)}
   end
 
   def handle_info({:DOWN, monitor, :process, pid, reason}, state) do
@@ -724,30 +720,52 @@ defmodule Wagyu.Interface do
 
   # Egress
 
-  defp route(state, packet) do
+  # Groups routable packets by peer, keeping each peer's in order and the
+  # peers in the order their first packet came. Unroutable packets are
+  # dropped here.
+  defp route(packets, state) do
+    {keys, shares} =
+      Enum.reduce(packets, {[], %{}}, fn packet, {keys, shares} ->
+        case destination(state, packet) do
+          {:ok, key} when is_map_key(shares, key) -> {keys, Map.update!(shares, key, &[packet | &1])}
+          {:ok, key} -> {[key | keys], Map.put(shares, key, [packet])}
+          :error -> {keys, shares}
+        end
+      end)
+
+    keys |> Enum.reverse() |> Enum.map(&{&1, Enum.reverse(Map.fetch!(shares, &1))})
+  end
+
+  defp destination(state, packet) do
     with {:ok, %{destination: destination, length: length}} when length == byte_size(packet) <- IP.parse(packet),
-         {:ok, key} <- AllowedIPs.lookup(state.config.allowed_ips, destination) do
-      forward(state, key, packet)
+         {:ok, _key} = routed <- AllowedIPs.lookup(state.config.allowed_ips, destination) do
+      routed
     else
-      _unroutable -> count(state, :egress_unroutable, state)
+      _unroutable ->
+        count(state, :egress_unroutable)
+        Admission.release(state.egress, 1, byte_size(packet))
+        :error
     end
   end
 
-  defp forward(state, key, packet) do
-    case ensure_peer(state, key) do
-      {:ok, peer, state} ->
-        case Admission.admit(peer.outbound, 1, byte_size(packet)) do
-          :ok ->
-            send(peer.pid, {:wg_outbound, packet})
-            count(state, :egress_routed, state)
+  # A peer's packets are admitted in order until one does not fit, as the
+  # link admits egress, and go to it as one message.
+  defp forward({key, packets}, state) do
+    {refused, state} =
+      case ensure_peer(state, key) do
+        {:ok, peer, state} ->
+          {admitted, refused} = Admission.admit_prefix(peer.outbound, packets)
+          if admitted != [], do: send(peer.pid, {:wg_outbound, admitted})
+          {refused, state}
 
-          :full ->
-            count(state, :egress_peer_dropped, state)
-        end
+        {:error, state} ->
+          {length(packets), state}
+      end
 
-      {:error, state} ->
-        count(state, :egress_peer_dropped, state)
-    end
+    add(state, :egress_routed, length(packets) - refused)
+    add(state, :egress_peer_dropped, refused)
+    Admission.release_all(state.egress, packets)
+    state
   end
 
   # Returns the peer's process, starting it if it is not running. Egress and

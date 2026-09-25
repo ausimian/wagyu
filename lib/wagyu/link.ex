@@ -20,7 +20,8 @@ defmodule Wagyu.Link do
   # egress credit from SmolNet.
   #
   # Ingress. Peers admit decrypted packets against the link's own bound with
-  # `deliver/2`, which sends `{:wg_plaintext, packets}`. The link coalesces
+  # `deliver/2`, or `deliver_to/2` with the target a peer looked up once
+  # (`lookup/1`), which sends `{:wg_plaintext, packets}`. The link coalesces
   # consecutive queued lists into batches within the stack's `:input_packets`
   # and `:bytes_copied` limits and makes one `SmolNet.ingress/2` call at a
   # time. The stack admits a batch atomically, so a batch it refuses for an
@@ -48,26 +49,45 @@ defmodule Wagyu.Link do
 
   @counters [egress: 1, egress_dropped: 2, ingress: 3, ingress_dropped: 4]
 
+  @typedoc "What a sender needs to deliver to a link: its process, queue and counters."
+  @type target :: %{pid: pid(), queue: Admission.t(), counters: :counters.counters_ref()}
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(options), do: GenServer.start_link(__MODULE__, options)
 
   @doc """
   Admits decrypted packets for ingress into `root`'s stack and sends them to
   its link, in order. Returns how many were refused because the link's queue
-  was full or no link is running; the link counts them as ingress drops.
+  was full or no link is running; the link counts them as ingress drops,
+  except while none is running.
   """
   @spec deliver(term(), [binary()]) :: non_neg_integer()
   def deliver(root, packets) do
-    case Wagyu.Registry.lookup(root, :link) do
-      {:ok, link, %{queue: queue, counters: counters}} ->
-        {admitted, refused} = Admission.admit_prefix(queue, packets)
-        if admitted != [], do: send(link, {:wg_plaintext, admitted})
-        count(counters, :ingress_dropped, refused)
-        refused
-
-      :error ->
-        length(packets)
+    case lookup(root) do
+      {:ok, target} -> deliver_to(target, packets)
+      :error -> length(packets)
     end
+  end
+
+  @doc "Returns the target for `deliver_to/2` of `root`'s running link, or `:error`."
+  @spec lookup(term()) :: {:ok, target()} | :error
+  def lookup(root) do
+    case Wagyu.Registry.lookup(root, :link) do
+      {:ok, link, %{queue: queue, counters: counters}} -> {:ok, %{pid: link, queue: queue, counters: counters}}
+      :error -> :error
+    end
+  end
+
+  @doc """
+  Delivers as `deliver/2` does, to a link found with `lookup/1`. The caller
+  should monitor it: packets sent to a link that has exited are lost.
+  """
+  @spec deliver_to(target(), [binary()]) :: non_neg_integer()
+  def deliver_to(%{pid: link, queue: queue, counters: counters}, packets) do
+    {admitted, refused} = Admission.admit_prefix(queue, packets)
+    if admitted != [], do: send(link, {:wg_plaintext, admitted})
+    count(counters, :ingress_dropped, refused)
+    refused
   end
 
   @doc "Returns the link's counters, or `:error` while no link is running."
