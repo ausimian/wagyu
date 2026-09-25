@@ -2,17 +2,19 @@ defmodule Wagyu.Peer do
   @moduledoc false
 
   # One process per active configured peer, started by the interface when
-  # outbound traffic or an authorized initiation first needs it. The same
-  # process carries every handshake with its peer, so a rekey never starts
-  # another.
+  # outbound traffic or an authorized initiation first needs it, or when the
+  # interface starts, for a peer with a persistent keepalive. The same
+  # process carries every handshake with its peer, so neither a rekey nor a
+  # retry ever starts another.
   #
   # A peer owns its handshakes, its transport sessions and their key slots,
-  # and its endpoint, and it sends its own datagrams on the interface's UDP
-  # socket with `:gen_udp.send/4`. Every message sent here was admitted
-  # against one of its bounds first: `{:wg_outbound, ip_packet}` against
-  # `:outbound`, `{:wg_frame, local_index, frame, source}` against
-  # `:inbound`, and the handoff against `:handoffs`, which counts messages
-  # only. The peer releases each as it takes it off the mailbox.
+  # its endpoint and its timers, and it sends its own datagrams on the
+  # interface's UDP socket with `:gen_udp.send/4`. Every message sent here
+  # was admitted against one of its bounds first: `{:wg_outbound,
+  # ip_packet}` against `:outbound`, `{:wg_frame, local_index, frame,
+  # source}` against `:inbound`, and the handoff against `:handoffs`, which
+  # counts messages only. The peer releases each as it takes it off the
+  # mailbox.
   #
   # Responding. After the interface authorizes an initiation for this peer,
   # the handshake worker hands its responder session over with
@@ -29,7 +31,7 @@ defmodule Wagyu.Peer do
   # once both handshakes complete and neither waits for a retry.
   #
   # Initiating. A peer initiates when an outbound packet finds no usable
-  # current key, or on `:wg_initiate`, a rekey, whether or not it has one. The
+  # current key, and when one of the timers below calls for a rekey. The
   # interface allocates the initiation's sender index and timestamp
   # (`Wagyu.Interface.allocate_initiation/2`) before it is sent. The
   # timestamp is strictly greater than any the interface gave this peer
@@ -46,6 +48,17 @@ defmodule Wagyu.Peer do
   # instead. A response is taken only for the index of the initiation in
   # flight, and only once it authenticates; until then neither the key
   # slots nor the endpoint change. Its source then becomes the endpoint.
+  #
+  # Retrying. An initiation that gets no response is sent again, as a new
+  # initiation, REKEY_TIMEOUT plus up to 333 ms of random jitter after the
+  # last handshake message, for as long as the attempt lasts: REKEY_ATTEMPT_TIME
+  # (90 seconds) from when it began. Only an outbound packet that has to
+  # wait for a key extends the attempt, to 90 seconds from that packet; a
+  # timer that calls for a handshake while one is already being attempted
+  # joins it. An attempt ends when a handshake completes, as initiator or as
+  # the responder whose key is confirmed. If it runs out instead, the
+  # initiation is discarded and the packets waiting for a key are dropped
+  # and counted.
   #
   # Key slots. As in wireguard-go, a completed handshake is a key pair: its
   # transport session, its local index and the remote party's index. A peer
@@ -66,10 +79,11 @@ defmodule Wagyu.Peer do
   #     becomes `:previous`.
   #
   # A transport message authenticates under whichever slot holds its index,
-  # so packets delayed under `:previous` still decrypt. A key pair that
-  # leaves the slots is closed and its local index retired, which makes it a
-  # tombstone; the ones in the slots when the peer exits go with the
-  # process.
+  # so packets delayed under `:previous` still decrypt. A key pair leaves
+  # its slot when a newer handshake displaces it or when it reaches
+  # REJECT_AFTER_TIME, after which no packet under it can be accepted. It
+  # is then closed and its local index retired, which makes it a tombstone;
+  # the ones in the slots when the peer exits go with the process.
   #
   # Sending data. An outbound packet is sent under `:current` while that key
   # is less than REJECT_AFTER_TIME (180 seconds) old and below
@@ -94,10 +108,46 @@ defmodule Wagyu.Peer do
   # passes those checks, becomes the endpoint, as the source of an
   # authenticated handshake message does.
   #
-  # Nothing expires on a timer yet: an initiation whose response never comes
-  # waits for the next outbound packet after REKEY_TIMEOUT to replace it,
-  # and an expired key stays in its slot, unused, until a handshake displaces
-  # it.
+  # Timers. As in wireguard-go, with times from its constants:
+  #
+  #   * Rekey. A key this peer initiated is replaced once it is
+  #     REKEY_AFTER_TIME (120 seconds) old, when the peer next sends under
+  #     it, and any key once it has sent REKEY_AFTER_MESSAGES (2^60). A
+  #     responder never initiates just because its key is old; its
+  #     initiator does that. An initiator that receives under a key within
+  #     KEEPALIVE_TIMEOUT plus REKEY_TIMEOUT of REJECT_AFTER_TIME (at 165
+  #     seconds) initiates once more, in case it has nothing to send before
+  #     the key expires.
+  #   * Passive keepalive. KEEPALIVE_TIMEOUT (10 seconds) after data is
+  #     received with nothing sent since, not even a handshake message, the
+  #     peer sends a keepalive, so the other side knows its data arrived, or,
+  #     if its key has expired since, initiates. Keepalives received and
+  #     handshakes do not start this timer, so two idle peers stay quiet.
+  #   * New handshake. KEEPALIVE_TIMEOUT plus REKEY_TIMEOUT (15 seconds),
+  #     plus jitter, after data is sent with no authenticated packet
+  #     received since, the peer initiates, since its key may be stale on
+  #     the other side.
+  #   * Persistent keepalive. With one configured, the peer sends a
+  #     keepalive whenever that many seconds pass with no authenticated
+  #     packet sent or received, and once when it starts. Without a usable
+  #     key, it initiates instead.
+  #   * Zeroing. REJECT_AFTER_TIME times three (540 seconds) after its last
+  #     new key pair, or after an attempt that ran out when it has no such
+  #     timer running, the peer discards every key, and, unless it is
+  #     attempting a handshake, its initiation and staged packets too. A
+  #     peer with no persistent keepalive that is not attempting a handshake
+  #     then asks the interface to forget it (`Wagyu.Interface.release_peer/2`)
+  #     and exits; the interface starts a new one when it is next needed.
+  #
+  # Each timer is a deadline on `state.clock` in `state.timers`, and one
+  # process timer is armed for the earliest deadline. When a `{:wg_timer,
+  # tag}` message arrives the peer runs every timer whose deadline has
+  # passed, earliest first, then arms the process timer for the next.
+  # Cancelling a timer deletes its deadline, so a message from a timer that
+  # has since been cancelled or moved, or one that arrives early, finds
+  # nothing due and does nothing. The deadlines live in the process, so
+  # they go with it when it crashes, and the interface's supervisor stops
+  # peers with the interface.
   #
   # Handshake events are counted in the interface's shared counters. Frames
   # and packets the peer drops are counted in its own state.
@@ -107,7 +157,9 @@ defmodule Wagyu.Peer do
   # key pair and the peer's preshared key.
   #
   # Time comes from `state.clock`, monotonic milliseconds, which tests
-  # replace with a fake clock.
+  # replace with a fake clock. Wall-clock time is used only to wait for an
+  # initiation's timestamp, so stepping the wall clock neither extends a
+  # key's life nor delays a timer.
 
   use GenServer, restart: :temporary
 
@@ -123,9 +175,20 @@ defmodule Wagyu.Peer do
   alias Wagyu.Packet.{Response, Transport}
   alias Wagyu.TAI64N
 
-  # REKEY_TIMEOUT and REJECT_AFTER_TIME, in milliseconds.
+  # WireGuard's timer constants, in milliseconds.
   @rekey_timeout 5_000
+  @keepalive_timeout 10_000
+  @rekey_after_time 120_000
+  @rekey_attempt_time 90_000
   @reject_after_time 180_000
+  # When an initiator that is receiving initiates once more.
+  @last_minute_rekey @reject_after_time - @keepalive_timeout - @rekey_timeout
+  # How long keys are kept after the last new key pair.
+  @zero_after @reject_after_time * 3
+  # The most random jitter added to a retry or a new handshake.
+  @max_jitter 333
+  # REKEY_AFTER_MESSAGES: a key that has sent this many is replaced.
+  @rekey_after_messages 0x1000000000000000
   # Counters a key pair remembers behind the highest it has accepted, as in
   # wireguard-go and Linux.
   @replay_window 8128
@@ -134,6 +197,9 @@ defmodule Wagyu.Peer do
   @max_timestamp_wait 2 * 0x1000000
 
   @slots [:next, :current, :previous]
+  # The order in which timers due at the same moment run: an attempt that
+  # runs out is not retried, and keys are zeroed only after the rest.
+  @timers [:give_up, :retry, :new_handshake, :keepalive, :persistent_keepalive, :zero]
 
   @spec start_link(Config.t(), map()) :: GenServer.on_start()
   def start_link(%Config{} = identity, args), do: GenServer.start_link(__MODULE__, {identity, args})
@@ -142,54 +208,72 @@ defmodule Wagyu.Peer do
   def init({identity, %{root: root, peer: %Config.Peer{} = peer, socket: socket, counters: counters} = args}) do
     %{inbound: inbound, outbound: outbound, handoffs: handoffs, staging: staging, allowed_ips: allowed_ips} = args
     Process.flag(:sensitive, true)
+    clock = fn -> System.monotonic_time(:millisecond) end
 
-    {:ok,
-     %{
-       root: root,
-       public_key: peer.public_key,
-       identity: identity,
-       peer: peer,
-       allowed_ips: allowed_ips,
-       socket: socket,
-       counters: counters,
-       inbound: inbound,
-       outbound: outbound,
-       handoffs: handoffs,
-       staging: staging,
-       mac1_key: Packet.mac1_key(peer.public_key),
-       endpoint: endpoint(peer.endpoint),
-       initiation: nil,
-       received: nil,
-       handshake_sent_at: nil,
-       next: nil,
-       current: nil,
-       previous: nil,
-       staged: :queue.new(),
-       outbound_dropped: 0,
-       inbound_dropped: 0,
-       clock: fn -> System.monotonic_time(:millisecond) end
-     }}
+    state = %{
+      root: root,
+      public_key: peer.public_key,
+      identity: identity,
+      peer: peer,
+      allowed_ips: allowed_ips,
+      socket: socket,
+      counters: counters,
+      inbound: inbound,
+      outbound: outbound,
+      handoffs: handoffs,
+      staging: staging,
+      mac1_key: Packet.mac1_key(peer.public_key),
+      endpoint: endpoint(peer.endpoint),
+      initiation: nil,
+      received: nil,
+      handshake_sent_at: nil,
+      next: nil,
+      current: nil,
+      previous: nil,
+      staged: :queue.new(),
+      outbound_dropped: 0,
+      inbound_dropped: 0,
+      persistent_keepalive: peer.persistent_keepalive * 1_000,
+      last_minute_rekey: false,
+      timers: %{},
+      timer: nil,
+      clock: clock
+    }
+
+    # A persistent keepalive goes out as soon as the peer starts.
+    state = if state.persistent_keepalive > 0, do: set_timer(state, :persistent_keepalive, clock.()), else: state
+    {:ok, arm(state)}
   end
 
   @impl true
   def handle_info({:wg_handoff, ticket, metadata}, state) do
     Admission.release(state.handoffs, 1, 0)
-    {:noreply, accept_handshake(state, ticket, metadata)}
+    {:noreply, state |> accept_handshake(ticket, metadata) |> arm()}
   end
 
   def handle_info({:wg_outbound, packet}, state) do
     Admission.release(state.outbound, 1, byte_size(packet))
-    {:noreply, send_packet(state, packet)}
+    {:noreply, state |> send_packet(packet) |> arm()}
   end
 
   def handle_info({:wg_frame, index, frame, source}, state) do
     Admission.release(state.inbound, 1, byte_size(frame))
-    {:noreply, receive_frame(state, index, frame, source)}
+    {:noreply, state |> receive_frame(index, frame, source) |> arm()}
   end
 
-  # A rekey: a new handshake, whether or not there is a current key. Nothing
-  # sends this yet; rekey and retry timers will.
-  def handle_info(:wg_initiate, state), do: {:noreply, initiate(state)}
+  # The armed process timer, or one that has been replaced since. Either
+  # way only the timers already due run.
+  def handle_info({:wg_timer, tag}, state) do
+    state = if match?({^tag, _ref, _deadline}, state.timer), do: %{state | timer: nil}, else: state
+
+    case run_timers(state) do
+      {:stop, state} -> {:stop, :normal, state}
+      state -> {:noreply, arm(state)}
+    end
+  end
+
+  # A rekey, as the timers start. Tests send it to rekey without waiting.
+  def handle_info(:wg_initiate, state), do: {:noreply, state |> initiate(:rekey) |> arm()}
 
   def handle_info(_message, state), do: {:noreply, state}
 
@@ -231,7 +315,12 @@ defmodule Wagyu.Peer do
   defp respond(state, session, index, %{sender_index: remote_index, timestamp: timestamp, source: source}) do
     case Noise.write_response(session, index, remote_index, state.mac1_key) do
       {:ok, frame} ->
-        state = install_next(state, key_pair(session, index, remote_index, state.clock.()))
+        state =
+          state
+          |> received_authenticated()
+          |> install_next(key_pair(session, index, remote_index, state.clock.(), false))
+          |> new_key_pair()
+
         transmit(%{state | endpoint: source, received: timestamp}, frame, :responses_sent)
 
       :error ->
@@ -243,26 +332,44 @@ defmodule Wagyu.Peer do
 
   # Initiating
 
-  defp initiate(%{endpoint: nil} = state), do: count(state, :initiations_no_endpoint)
+  # `trigger` is `:demand` for an outbound packet that has to wait for a
+  # key, which begins or extends the attempt, `:retry` for the retry timer,
+  # and `:rekey` for anything else, which joins an attempt already under
+  # way. While a retry is pending, it sends the next initiation.
+  defp initiate(%{endpoint: nil} = state, _trigger), do: count(state, :initiations_no_endpoint)
 
-  defp initiate(state) do
-    with :ok <- due(state),
-         {:ok, index, timestamp} <- Interface.allocate_initiation(state.root, state.public_key) do
-      session = Noise.initiator(state.identity, state.public_key)
-      frame = Noise.write_initiation(session, index, timestamp, state.mac1_key)
-      :ok = wait_for(timestamp)
-      initiation = %{session: session, local_index: index, timestamp: timestamp, sent_at: state.clock.()}
-      transmit(%{discard_initiation(state) | initiation: initiation}, frame, :initiations_sent)
-    else
-      :error -> state
+  defp initiate(state, trigger) do
+    now = state.clock.()
+
+    state =
+      if trigger == :demand or not pending?(state, :give_up),
+        do: set_timer(state, :give_up, now + @rekey_attempt_time),
+        else: state
+
+    cond do
+      trigger != :retry and pending?(state, :retry) -> state
+      due?(state, now) -> send_initiation(state)
+      true -> set_timer(state, :retry, state.handshake_sent_at + @rekey_timeout + jitter())
     end
   end
 
-  defp due(%{handshake_sent_at: nil}), do: :ok
+  defp send_initiation(state) do
+    case Interface.allocate_initiation(state.root, state.public_key) do
+      {:ok, index, timestamp} ->
+        session = Noise.initiator(state.identity, state.public_key)
+        frame = Noise.write_initiation(session, index, timestamp, state.mac1_key)
+        :ok = wait_for(timestamp)
+        initiation = %{session: session, local_index: index, timestamp: timestamp, sent_at: state.clock.()}
+        state = transmit(%{discard_initiation(state) | initiation: initiation}, frame, :initiations_sent)
+        set_timer(state, :retry, state.handshake_sent_at + @rekey_timeout + jitter())
 
-  defp due(state) do
-    if state.clock.() - state.handshake_sent_at >= @rekey_timeout, do: :ok, else: :error
+      :error ->
+        state
+    end
   end
+
+  defp due?(%{handshake_sent_at: nil}, _now), do: true
+  defp due?(state, now), do: now - state.handshake_sent_at >= @rekey_timeout
 
   defp wait_for(timestamp) do
     {:ok, at} = TAI64N.to_unix(timestamp)
@@ -299,10 +406,13 @@ defmodule Wagyu.Peer do
       # younger than the responder's, which dates from the response: a
       # response that arrives too late yields a key already expired, and
       # the next packet starts a new handshake.
-      key_pair = key_pair(session, index, response.sender_index, sent_at)
+      key_pair = key_pair(session, index, response.sender_index, sent_at, true)
 
       %{state | initiation: nil, endpoint: source}
+      |> received_authenticated()
       |> install_current(key_pair)
+      |> new_key_pair()
+      |> handshake_complete()
       |> count(:responses_accepted)
       |> confirm_to_responder()
     else
@@ -319,11 +429,13 @@ defmodule Wagyu.Peer do
          {:replay, :ok} <- {:replay, ReplayWindow.check(key_pair.replay, counter)},
          {:ok, plaintext} <- Noise.open(key_pair.session, transport) do
       state = Map.put(state, slot, %{key_pair | replay: ReplayWindow.commit(key_pair.replay, counter)})
-      state = if slot == :next, do: confirm(state), else: state
+      state = received_authenticated(state)
+      state = if slot == :next, do: state |> confirm() |> handshake_complete(), else: state
       state = receive_plaintext(state, plaintext, source)
       # Staged packets go out only now, to the endpoint this message may
       # have just moved.
-      if slot == :next, do: send_staged(state), else: state
+      state = if slot == :next, do: send_staged(state), else: state
+      last_minute_rekey(state)
     else
       {:fresh, false} -> state |> count(:transport_expired) |> dropped()
       {:replay, {:error, _duplicate_or_stale}} -> state |> count(:transport_replayed) |> dropped()
@@ -334,6 +446,8 @@ defmodule Wagyu.Peer do
   defp receive_plaintext(state, "", source), do: %{state | endpoint: source} |> count(:keepalives_received)
 
   defp receive_plaintext(state, plaintext, source) do
+    state = received_data(state)
+
     with {:ip, {:ok, %{source: address, length: length}}} <- {:ip, IP.parse(plaintext)},
          {:allowed, true} <- {:allowed, AllowedIPs.allowed?(state.allowed_ips, address, state.public_key)} do
       state = %{state | endpoint: source}
@@ -349,6 +463,16 @@ defmodule Wagyu.Peer do
     end
   end
 
+  # An initiator still receiving under a key close to REJECT_AFTER_TIME
+  # starts one handshake, in case it sends nothing that would.
+  defp last_minute_rekey(%{last_minute_rekey: false, current: %{initiator: true} = key_pair} = state) do
+    if state.clock.() - key_pair.created_at >= @last_minute_rekey,
+      do: initiate(%{state | last_minute_rekey: true}, :rekey),
+      else: state
+  end
+
+  defp last_minute_rekey(state), do: state
+
   defp slot(state, index) do
     Enum.find_value(@slots, fn slot ->
       case Map.fetch!(state, slot) do
@@ -360,12 +484,13 @@ defmodule Wagyu.Peer do
 
   # Key slots
 
-  defp key_pair(session, local_index, remote_index, created_at) do
+  defp key_pair(session, local_index, remote_index, created_at, initiator) do
     %{
       session: session,
       local_index: local_index,
       remote_index: remote_index,
       created_at: created_at,
+      initiator: initiator,
       replay: ReplayWindow.new(@replay_window)
     }
   end
@@ -404,31 +529,67 @@ defmodule Wagyu.Peer do
     end)
   end
 
+  # Key pairs past REJECT_AFTER_TIME can accept nothing more.
+  defp discard_expired(state), do: discard(state, Enum.filter(@slots, &expired?(state, &1)))
+
+  defp expired?(state, slot) do
+    case Map.fetch!(state, slot) do
+      nil -> false
+      key_pair -> not fresh?(state, key_pair)
+    end
+  end
+
   # Sending
 
   # The initiator's first transport message under a new key confirms it:
   # staged data if there is any, and otherwise a keepalive.
-  defp confirm_to_responder(%{current: key_pair} = state) do
-    if :queue.is_empty(state.staged) do
-      case Noise.seal(key_pair.session, key_pair.remote_index, "") do
-        {:ok, frame} -> transmit(state, frame, :keepalives_sent)
-        :error -> state
-      end
-    else
-      send_staged(state)
-    end
+  defp confirm_to_responder(state) do
+    if :queue.is_empty(state.staged), do: send_keepalive(state), else: send_staged(state)
   end
 
-  defp send_packet(state, packet) do
-    with %{} = key_pair <- state.current,
-         true <- fresh?(state, key_pair),
+  # `demand` is false for a packet that was already waiting for a key, so
+  # staging it again does not extend the handshake attempt, and neither
+  # does a packet dropped because the staging queue is full.
+  defp send_packet(state, packet, demand \\ true) do
+    with %{} = key_pair <- usable(state),
          {:ok, frame} <- Noise.seal(key_pair.session, key_pair.remote_index, pad(packet, state.identity.stack[:mtu])) do
-      transmit(state, frame, :transport_sent)
+      state |> transmit(frame, :transport_sent) |> rekey_after_sending(key_pair)
     else
       # No key, one past REJECT_AFTER_TIME, or one that has sent
       # REJECT_AFTER_MESSAGES: the packet waits for a new handshake.
-      _no_usable_key -> state |> stage(packet) |> initiate()
+      _no_usable_key -> stage_and_initiate(state, packet, demand)
     end
+  end
+
+  defp stage_and_initiate(state, packet, demand) do
+    case stage(state, packet) do
+      {:staged, state} when demand -> initiate(state, :demand)
+      {_staged_or_dropped, state} -> initiate(state, :rekey)
+    end
+  end
+
+  # A keepalive, an empty transport message, when there is a usable key.
+  defp send_keepalive(state) do
+    with %{} = key_pair <- usable(state),
+         {:ok, frame} <- Noise.seal(key_pair.session, key_pair.remote_index, "") do
+      state |> transmit(frame, :keepalives_sent) |> rekey_after_sending(key_pair)
+    else
+      _no_usable_key -> state
+    end
+  end
+
+  # The current key pair while it is younger than REJECT_AFTER_TIME, or nil.
+  defp usable(%{current: key_pair} = state) do
+    if key_pair && fresh?(state, key_pair), do: key_pair
+  end
+
+  # REKEY_AFTER_MESSAGES for any key, and REKEY_AFTER_TIME for a key this
+  # peer initiated.
+  defp rekey_after_sending(state, key_pair) do
+    if Decibel.nonce(key_pair.session, :out) >= @rekey_after_messages or
+         (key_pair.initiator and state.clock.() - key_pair.created_at >= @rekey_after_time),
+       do: initiate(state, :rekey),
+       else: state
   end
 
   # Zero padding to a multiple of 16 bytes, capped at the MTU.
@@ -443,8 +604,8 @@ defmodule Wagyu.Peer do
   # process exits as dropped.
   defp stage(state, packet) do
     case Admission.admit(state.staging, 1, byte_size(packet)) do
-      :ok -> %{state | staged: :queue.in(packet, state.staged)}
-      :full -> state |> count(:staged_dropped) |> Map.update!(:outbound_dropped, &(&1 + 1))
+      :ok -> {:staged, %{state | staged: :queue.in(packet, state.staged)}}
+      :full -> {:dropped, state |> count(:staged_dropped) |> Map.update!(:outbound_dropped, &(&1 + 1))}
     end
   end
 
@@ -458,19 +619,155 @@ defmodule Wagyu.Peer do
     |> :queue.to_list()
     |> Enum.reduce(%{state | staged: :queue.new()}, fn packet, state ->
       Admission.release(state.staging, 1, byte_size(packet))
-      send_packet(state, packet)
+      send_packet(state, packet, false)
     end)
+  end
+
+  # Drops every staged packet, counting each.
+  defp drop_staged(state) do
+    packets = :queue.to_list(state.staged)
+    Admission.release(state.staging, length(packets), Admission.bytes(packets))
+
+    %{state | staged: :queue.new()}
+    |> count(:staged_dropped, length(packets))
+    |> Map.update!(:outbound_dropped, &(&1 + length(packets)))
   end
 
   # A handshake message starts the REKEY_TIMEOUT wait whether or not the
   # send succeeds, so a failing socket is not retried for every packet.
   defp transmit(%{endpoint: {address, port}} = state, frame, event) do
-    state =
-      if event in [:initiations_sent, :responses_sent], do: %{state | handshake_sent_at: state.clock.()}, else: state
+    state = sent_authenticated(state, event)
 
     case :gen_udp.send(state.socket, address, port, frame) do
       :ok -> count(state, event)
       {:error, _reason} -> count(state, :send_errors)
+    end
+  end
+
+  # Timer events
+
+  defp sent_authenticated(state, event) when event in [:initiations_sent, :responses_sent],
+    do: %{state | handshake_sent_at: state.clock.()} |> cancel_timer(:keepalive) |> persistent_keepalive()
+
+  defp sent_authenticated(state, event) do
+    state = state |> cancel_timer(:keepalive) |> persistent_keepalive()
+
+    if event == :transport_sent,
+      do:
+        set_timer_unless_pending(state, :new_handshake, state.clock.() + @keepalive_timeout + @rekey_timeout + jitter()),
+      else: state
+  end
+
+  defp received_authenticated(state), do: state |> cancel_timer(:new_handshake) |> persistent_keepalive()
+
+  defp received_data(state), do: set_timer_unless_pending(state, :keepalive, state.clock.() + @keepalive_timeout)
+
+  defp new_key_pair(state), do: %{set_timer(state, :zero, state.clock.() + @zero_after) | last_minute_rekey: false}
+
+  defp handshake_complete(state), do: state |> cancel_timer(:retry) |> cancel_timer(:give_up)
+
+  defp persistent_keepalive(%{persistent_keepalive: 0} = state), do: state
+
+  defp persistent_keepalive(state),
+    do: set_timer(state, :persistent_keepalive, state.clock.() + state.persistent_keepalive)
+
+  # Timers
+
+  # Runs the timers that are due, earliest first, until none is. Each is
+  # deleted before it runs, and may set or cancel others. Key pairs past
+  # REJECT_AFTER_TIME go first, so no timer sends under one.
+  defp run_timers(state) do
+    state = discard_expired(state)
+    now = state.clock.()
+
+    due =
+      state.timers
+      |> Enum.filter(fn {_name, deadline} -> deadline <= now end)
+      |> Enum.min_by(fn {name, deadline} -> {deadline, Enum.find_index(@timers, &(&1 == name))} end, fn -> nil end)
+
+    case due do
+      nil ->
+        state
+
+      {name, _deadline} ->
+        case fire(name, cancel_timer(state, name)) do
+          {:stop, state} -> {:stop, state}
+          state -> run_timers(state)
+        end
+    end
+  end
+
+  defp fire(:retry, state), do: initiate(state, :retry)
+
+  defp fire(:give_up, state) do
+    state
+    |> cancel_timer(:retry)
+    |> discard_initiation()
+    |> drop_staged()
+    |> count(:handshakes_abandoned)
+    |> set_timer_unless_pending(:zero, state.clock.() + @zero_after)
+  end
+
+  # A key that has expired since the data arrived calls for a handshake.
+  defp fire(:keepalive, state), do: if(usable(state), do: send_keepalive(state), else: initiate(state, :rekey))
+
+  defp fire(:new_handshake, state), do: initiate(state, :rekey)
+
+  defp fire(:persistent_keepalive, state) do
+    state = persistent_keepalive(state)
+    if usable(state), do: send_keepalive(state), else: initiate(state, :rekey)
+  end
+
+  defp fire(:zero, state) do
+    state = state |> discard(@slots) |> cancel_timer(:keepalive) |> cancel_timer(:new_handshake)
+
+    cond do
+      pending?(state, :give_up) -> state
+      state.persistent_keepalive > 0 -> state |> discard_initiation() |> drop_staged()
+      true -> state |> discard_initiation() |> drop_staged() |> exit_if_idle()
+    end
+  end
+
+  # The interface refuses while it has messages admitted for this process,
+  # which then arrive and are handled first; the peer asks again later.
+  defp exit_if_idle(state) do
+    case Interface.release_peer(state.root, state.public_key) do
+      :ok -> {:stop, state}
+      :busy -> set_timer(state, :zero, state.clock.() + @rekey_timeout)
+    end
+  end
+
+  defp pending?(state, name), do: Map.has_key?(state.timers, name)
+
+  defp set_timer(state, name, deadline), do: %{state | timers: Map.put(state.timers, name, deadline)}
+
+  defp set_timer_unless_pending(state, name, deadline),
+    do: if(pending?(state, name), do: state, else: set_timer(state, name, deadline))
+
+  defp cancel_timer(state, name), do: %{state | timers: Map.delete(state.timers, name)}
+
+  # Up to 333 ms, as in wireguard-go.
+  defp jitter, do: :rand.uniform(@max_jitter + 1) - 1
+
+  # Arms the process timer for the earliest deadline, including when each
+  # key pair expires, unless one is already armed for no later. A timer
+  # armed for later is cancelled; one that fires early finds nothing due
+  # and arms the next.
+  defp arm(state) do
+    expiries = for slot <- @slots, key_pair = Map.fetch!(state, slot), do: key_pair.created_at + @reject_after_time
+
+    case {Enum.min(Map.values(state.timers) ++ expiries, fn -> nil end), state.timer} do
+      {nil, _timer} ->
+        state
+
+      {deadline, {_tag, _ref, armed}} when armed <= deadline ->
+        state
+
+      {deadline, timer} ->
+        with {_tag, ref, _armed} <- timer, do: Process.cancel_timer(ref, async: true, info: false)
+        tag = make_ref()
+        ref = Process.send_after(self(), {:wg_timer, tag}, max(deadline - state.clock.(), 0))
+        %{state | timer: {tag, ref, deadline}}
     end
   end
 
@@ -482,8 +779,8 @@ defmodule Wagyu.Peer do
     :error
   end
 
-  defp count(state, name) do
-    :ok = Interface.count_peer_event(state.counters, name)
+  defp count(state, name, increment \\ 1) do
+    :ok = Interface.count_peer_event(state.counters, name, increment)
     state
   end
 

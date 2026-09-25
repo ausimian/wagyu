@@ -256,6 +256,15 @@ defmodule Wagyu.TestHelpers do
   @doc "Moves a fake clock forward by `milliseconds`."
   def advance(clock, milliseconds), do: :atomics.add(clock, 1, milliseconds)
 
+  @doc """
+  Makes a peer run the timers due on its clock, as a process timer that
+  fires does, and waits until it has. Returns the peer's state.
+  """
+  def run_timers(peer) do
+    send(peer, {:wg_timer, make_ref()})
+    :sys.get_state(peer)
+  end
+
   @doc "A complete IPv4 UDP packet with valid header and UDP checksums."
   def ipv4_udp({s1, s2, s3, s4} = _source, {d1, d2, d3, d4} = _destination, source_port, destination_port, payload) do
     source = <<s1, s2, s3, s4>>

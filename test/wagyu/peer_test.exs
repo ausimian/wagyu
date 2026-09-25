@@ -1,12 +1,15 @@
 defmodule Wagyu.PeerTest do
   # A peer's handshakes with a remote party that the test plays, with its
   # own UDP socket and Decibel sessions: initiating on outbound demand,
-  # responding, key confirmation and the key slots. The interface runs on a
-  # fake clock, and so does the peer once it has started.
+  # responding, key confirmation, the key slots and the timers. The
+  # interface runs on a fake clock, and so does the peer once it has
+  # started. Tests move the peer's clock and then make it run the timers
+  # due (`run_timers/1`) rather than wait for them.
   use ExUnit.Case, async: true
 
   import Wagyu.TestHelpers
 
+  alias Wagyu.Admission
   alias Wagyu.IndexTable
   alias Wagyu.Packet
   alias Wagyu.TAI64N
@@ -17,7 +20,12 @@ defmodule Wagyu.PeerTest do
     {:ok, remote_socket} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}, active: false])
     {:ok, remote_port} = :inet.port(remote_socket)
     endpoint = unless context[:no_endpoint], do: %{address: {127, 0, 0, 1}, port: remote_port}
-    peers = [%{public_key: remote_key, endpoint: endpoint, allowed_ips: [{{0, 0, 0, 0}, 0}]}]
+    keepalive = Map.get(context, :persistent_keepalive, 0)
+
+    peers = [
+      %{public_key: remote_key, endpoint: endpoint, allowed_ips: [{{0, 0, 0, 0}, 0}], persistent_keepalive: keepalive}
+    ]
+
     options = options(private_key: private_key, peers: peers)
 
     Map.merge(start_interface(options), %{
@@ -80,6 +88,12 @@ defmodule Wagyu.PeerTest do
     frame
   end
 
+  defp receive_datagram_within(context, timeout) do
+    port = context.port
+    assert {:ok, {{127, 0, 0, 1}, ^port, frame}} = :gen_udp.recv(context.remote_socket, 0, timeout)
+    frame
+  end
+
   defp refute_datagram(context), do: assert(:gen_udp.recv(context.remote_socket, 0, 100) == {:error, :timeout})
 
   defp lookup(context, index), do: IndexTable.lookup(:sys.get_state(context.children.interface).indices, index)
@@ -94,6 +108,34 @@ defmodule Wagyu.PeerTest do
     monitor = Process.monitor(pid)
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
+  end
+
+  # Moves a fake clock to `at`.
+  defp advance_to(clock, at), do: advance(clock, at - :atomics.get(clock, 1))
+
+  defp now(clock), do: :atomics.get(clock, 1)
+
+  # Completes a handshake the peer initiates on outbound demand, with the
+  # remote party's index `remote_index`, and takes the packet that confirms
+  # it. Returns the peer, its clock, the remote party's session and the
+  # peer's index.
+  defp initiated(context, remote_index \\ 99) do
+    demand(context)
+    initiation = receive_datagram(context)
+    {peer, clock} = started_peer(context)
+    {response, session, _sent} = respond_to(initiation, context.remote, remote_index)
+    to_wagyu(context, response)
+    assert {:ok, _plaintext} = open_transport(session, receive_datagram(context))
+    {peer, clock, session, sender_index(initiation)}
+  end
+
+  # The remote party sends a keepalive, which the peer has taken when this
+  # returns its state.
+  defp remote_keepalive(context, peer, session, index) do
+    %{keepalives_received: received} = counters(context.interface)
+    to_wagyu(context, transport_frame(session, index))
+    counters(context.interface, &(&1.keepalives_received == received + 1))
+    :sys.get_state(peer)
   end
 
   defp strictly_increasing?(timestamps),
@@ -128,7 +170,10 @@ defmodule Wagyu.PeerTest do
       assert plaintext == binary_part(plaintext, 0, length) <> <<0::size((byte_size(plaintext) - length) * 8)>>
 
       assert %{initiation: nil, next: nil, previous: nil, current: %{local_index: ^index, remote_index: 99}} =
-               :sys.get_state(peer)
+               state = :sys.get_state(peer)
+
+      # The handshake ends the attempt.
+      refute Map.has_key?(state.timers, :retry) or Map.has_key?(state.timers, :give_up)
 
       assert %{initiations_sent: 1, responses_accepted: 1, keepalives_sent: 0, transport_sent: 1} =
                counters(context.interface)
@@ -202,14 +247,17 @@ defmodule Wagyu.PeerTest do
       %{initiation: %{session: first_session}} = :sys.get_state(peer)
       {late_response, _session, _sent} = respond_to(first, context.remote, 11)
 
-      # No handshake message goes out within REKEY_TIMEOUT of the last one.
+      # The retry replaces the initiation REKEY_TIMEOUT plus jitter after
+      # it, and nothing sends one sooner.
+      %{handshake_sent_at: sent_at, timers: %{retry: retry}} = :sys.get_state(peer)
+      assert (retry - sent_at) in 5_000..5_333
       send(peer, :wg_initiate)
-      advance(clock, 4_999)
-      send(peer, :wg_initiate)
+      advance(clock, retry - sent_at - 1)
+      run_timers(peer)
       refute_datagram(context)
 
       advance(clock, 1)
-      send(peer, :wg_initiate)
+      run_timers(peer)
       second = receive_datagram(context)
       refute sender_index(second) == sender_index(first)
 
@@ -293,12 +341,12 @@ defmodule Wagyu.PeerTest do
       first = initiation_timestamp.(context)
       {peer, clock} = started_peer(context)
 
-      # Rekeys retriggered as fast as REKEY_TIMEOUT allows on the peer's
+      # Retries as fast as REKEY_TIMEOUT and jitter allow on the peer's
       # clock, within a few milliseconds of the wall clock.
       retriggered =
         for _n <- 1..4 do
-          advance(clock, 5_000)
-          send(peer, :wg_initiate)
+          advance(clock, 5_333)
+          run_timers(peer)
           initiation_timestamp.(context)
         end
 
@@ -334,14 +382,14 @@ defmodule Wagyu.PeerTest do
       assert :sys.get_state(peer).endpoint == context.remote_endpoint
 
       # It has no key to send with until the initiator confirms the new one,
-      # and it waits REKEY_TIMEOUT after its response before initiating
-      # itself, to the learned endpoint.
+      # and it waits REKEY_TIMEOUT, plus jitter, after its response before
+      # initiating itself, to the learned endpoint.
       demand(context)
       assert eventually(fn -> :queue.len(:sys.get_state(peer).staged) == 2 end)
       refute_datagram(context)
 
-      advance(clock, 5_000)
-      demand(context)
+      advance(clock, 5_333)
+      run_timers(peer)
       assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
       assert %{initiations_no_endpoint: 1, initiations_sent: 1} = counters(context.interface)
     end
@@ -432,6 +480,445 @@ defmodule Wagyu.PeerTest do
 
       %{current: %{local_index: third_index}} = :sys.get_state(peer)
       assert slots(peer) == %{next: nil, current: third_index, previous: second_index}
+    end
+  end
+
+  describe "retrying" do
+    # Runs each retry the peer schedules, checking its jitter, until the
+    # attempt runs out. Returns the index of every initiation sent.
+    defp retry_until_abandoned(context, peer, clock, indices) do
+      state = :sys.get_state(peer)
+
+      case state.timers do
+        %{retry: retry, give_up: give_up} when retry < give_up ->
+          assert (retry - state.handshake_sent_at) in 5_000..5_333
+          advance_to(clock, retry)
+          run_timers(peer)
+          retry_until_abandoned(context, peer, clock, [sender_index(receive_datagram(context)) | indices])
+
+        %{give_up: give_up} ->
+          advance_to(clock, give_up)
+          run_timers(peer)
+          Enum.reverse(indices)
+      end
+    end
+
+    # Killing the peer logs its exit.
+    test "an unanswered initiation is retried with jitter for 90 seconds, then its packet is dropped", context do
+      demand(context)
+      first = receive_datagram(context)
+      {peer, clock} = started_peer(context)
+      %{timers: %{give_up: give_up}, handshake_sent_at: started} = :sys.get_state(peer)
+      assert (give_up - started) in 89_900..90_000
+
+      # A new initiation every 5 to 5.333 seconds, each from a new index,
+      # all from the same process.
+      indices = retry_until_abandoned(context, peer, clock, [sender_index(first)])
+      assert length(indices) in 17..18
+      assert indices == Enum.uniq(indices)
+      assert peer(context) == peer
+      assert [_one] = DynamicSupervisor.which_children(context.children.peer_supervisor)
+
+      # Then the attempt ends: the initiation is discarded, its index
+      # retired, the staged packet dropped, and nothing more is sent.
+      refute_datagram(context)
+      assert Enum.all?(indices, &(lookup(context, &1) == :retired))
+      state = :sys.get_state(peer)
+      assert %{initiation: nil, timers: %{zero: zero} = timers} = state
+      assert :queue.is_empty(state.staged)
+      refute Map.has_key?(timers, :retry) or Map.has_key?(timers, :give_up)
+      assert zero == now(clock) + 540_000
+
+      count = length(indices)
+
+      assert %{initiations_sent: ^count, staged_dropped: 1, handshakes_abandoned: 1, egress_peer_dropped: 0} =
+               counters(context.interface)
+
+      # With no key left to keep, the idle peer exits 540 seconds later, and
+      # the next packet starts another.
+      monitor = Process.monitor(peer)
+      advance_to(clock, zero)
+      send(peer, {:wg_timer, make_ref()})
+      assert_receive {:DOWN, ^monitor, :process, ^peer, :normal}
+      assert peer(context) == nil
+
+      demand(context)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      assert peer(context) not in [nil, peer]
+    end
+
+    test "only an outbound packet that has to wait for a key extends the attempt", context do
+      demand(context)
+      _initiation = receive_datagram(context)
+      {peer, clock} = started_peer(context)
+      %{timers: %{give_up: give_up}} = :sys.get_state(peer)
+
+      # A rekey joins the attempt under way.
+      advance(clock, 30_000)
+      send(peer, :wg_initiate)
+      assert %{timers: %{give_up: ^give_up}} = :sys.get_state(peer)
+
+      # Another packet waiting for the key gives it 90 seconds from now.
+      demand(context)
+      extended = now(clock) + 90_000
+      assert eventually(fn -> :sys.get_state(peer).timers.give_up == extended end)
+
+      # One with no room to wait does not.
+      %{staging: staging} = :sys.get_state(peer)
+      {packets, bytes} = Admission.usage(staging)
+      free = staging.max_packets - packets
+      :ok = Admission.admit(staging, free, 0)
+      advance(clock, 30_000)
+      demand(context)
+      assert counters(context.interface, &(&1.staged_dropped == 1))
+      assert %{timers: %{give_up: ^extended}} = :sys.get_state(peer)
+      Admission.release(staging, free, 0)
+      assert Admission.usage(staging) == {packets, bytes}
+    end
+  end
+
+  describe "keepalives" do
+    test "a peer that receives data answers with a keepalive after 10 seconds, and is otherwise quiet", context do
+      {session, index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+      clock = fake_peer_clock(peer)
+
+      # A keepalive confirms the key, but asks for no answer.
+      to_wagyu(context, transport_frame(session, index))
+      assert eventually(fn -> :sys.get_state(peer).current end)
+      refute Map.has_key?(:sys.get_state(peer).timers, :keepalive)
+
+      # Data does, even data that is dropped for not being IP.
+      to_wagyu(context, transport_frame(session, index, "data"))
+      at = eventually(fn -> :sys.get_state(peer).timers[:keepalive] end)
+      assert at == now(clock) + 10_000
+
+      advance_to(clock, at - 1)
+      run_timers(peer)
+      refute_datagram(context)
+
+      advance(clock, 1)
+      run_timers(peer)
+      assert open_transport(session, receive_datagram(context)) == {:ok, ""}
+
+      # With no persistent keepalive configured, nothing else goes out.
+      advance(clock, 60_000)
+      run_timers(peer)
+      refute_datagram(context)
+      assert %{keepalives_sent: 1, initiations_sent: 0} = counters(context.interface)
+    end
+
+    test "a peer whose key expires before it can answer data starts a handshake instead", context do
+      {session, index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+      clock = fake_peer_clock(peer)
+      to_wagyu(context, transport_frame(session, index))
+      %{created_at: created} = eventually(fn -> :sys.get_state(peer).current end)
+
+      advance_to(clock, created + 179_999)
+      to_wagyu(context, transport_frame(session, index, "data"))
+      at = eventually(fn -> :sys.get_state(peer).timers[:keepalive] end)
+
+      advance_to(clock, at)
+      run_timers(peer)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      assert %{keepalives_sent: 0} = counters(context.interface)
+    end
+
+    test "sending data instead cancels the keepalive", context do
+      {session, index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+      clock = fake_peer_clock(peer)
+
+      to_wagyu(context, transport_frame(session, index, "data"))
+      assert eventually(fn -> :sys.get_state(peer).timers[:keepalive] end)
+
+      demand(context)
+      assert {:ok, _packet} = open_transport(session, receive_datagram(context))
+      refute Map.has_key?(:sys.get_state(peer).timers, :keepalive)
+
+      advance(clock, 10_000)
+      run_timers(peer)
+      refute_datagram(context)
+
+      # So does sending a handshake message.
+      to_wagyu(context, transport_frame(session, index, "more data"))
+      assert eventually(fn -> :sys.get_state(peer).timers[:keepalive] end)
+      send(peer, :wg_initiate)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      refute Map.has_key?(:sys.get_state(peer).timers, :keepalive)
+    end
+
+    test "a peer that sends data and hears nothing for 15 seconds starts a new handshake", context do
+      {peer, clock, session, index} = initiated(context)
+
+      # Anything authenticated from the other side puts it off.
+      refute Map.has_key?(remote_keepalive(context, peer, session, index).timers, :new_handshake)
+
+      demand(context)
+      assert <<4, 0, 0, 0, _rest::binary>> = receive_datagram(context)
+      sent = now(clock)
+      at = :sys.get_state(peer).timers.new_handshake
+      assert (at - sent) in 15_000..15_333
+
+      advance_to(clock, at - 1)
+      run_timers(peer)
+      refute_datagram(context)
+
+      # Well before REKEY_AFTER_TIME.
+      advance(clock, 1)
+      run_timers(peer)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      assert %{initiations_sent: 2} = counters(context.interface)
+    end
+
+    @tag persistent_keepalive: 25
+    test "a persistent keepalive starts with the interface and fills every 25-second silence", context do
+      # The peer starts without any traffic, and with no key its first
+      # keepalive starts a handshake, which the keepalive then confirms.
+      initiation = receive_datagram(context)
+      {peer, clock} = started_peer(context)
+      index = sender_index(initiation)
+      {response, session, _sent} = respond_to(initiation, context.remote, 7)
+      to_wagyu(context, response)
+      assert open_transport(session, receive_datagram(context)) == {:ok, ""}
+
+      for _n <- 1..2 do
+        at = :sys.get_state(peer).timers.persistent_keepalive
+        advance_to(clock, at - 1)
+        run_timers(peer)
+        refute_datagram(context)
+
+        advance(clock, 1)
+        run_timers(peer)
+        assert open_transport(session, receive_datagram(context)) == {:ok, ""}
+      end
+
+      # Traffic from the other side restarts the wait.
+      advance(clock, 10_000)
+      %{timers: %{persistent_keepalive: at}} = remote_keepalive(context, peer, session, index)
+      assert at == now(clock) + 25_000
+    end
+
+    # Killing the peer logs its exit.
+    @tag :capture_log
+    @tag persistent_keepalive: 25
+    test "a peer with a persistent keepalive is started again after it fails", context do
+      _initiation = receive_datagram(context)
+      peer = eventually(fn -> peer(context) end)
+      kill(peer)
+
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram_within(context, 3_000)
+      assert peer(context) not in [nil, peer]
+    end
+  end
+
+  describe "rekeying" do
+    test "an initiator rekeys when it sends under a key 120 seconds old", context do
+      {peer, clock, session, index} = initiated(context)
+      %{current: %{created_at: created}} = remote_keepalive(context, peer, session, index)
+
+      advance_to(clock, created + 119_999)
+      demand(context)
+      assert {:ok, _packet} = open_transport(session, receive_datagram(context))
+      refute_datagram(context)
+
+      # The packet still goes out under the old key, and a handshake
+      # follows it.
+      advance(clock, 1)
+      demand(context)
+      assert {:ok, _packet} = open_transport(session, receive_datagram(context))
+      {response, new_session, _sent} = respond_to(receive_datagram(context), context.remote, 100)
+      to_wagyu(context, response)
+      assert open_transport(new_session, receive_datagram(context)) == {:ok, ""}
+      assert %{current: %{remote_index: 100}, previous: %{local_index: ^index}} = :sys.get_state(peer)
+    end
+
+    test "a responder does not rekey on age alone, but does after 2^60 messages", context do
+      {session, index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+      clock = fake_peer_clock(peer)
+      to_wagyu(context, transport_frame(session, index))
+      %{created_at: created} = eventually(fn -> :sys.get_state(peer).current end)
+
+      advance_to(clock, created + 170_000)
+      demand(context)
+      assert {:ok, _packet} = open_transport(session, receive_datagram(context))
+      refute_datagram(context)
+
+      in_process(peer, fn %{current: key_pair} -> Decibel.set_nonce(key_pair.session, :out, 2 ** 60 - 1) end)
+      demand(context)
+      assert <<4, 0, 0, 0, 1::little-32, counter::little-64, _rest::binary>> = receive_datagram(context)
+      assert counter == 2 ** 60 - 1
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+    end
+
+    test "an initiator that is still receiving at 165 seconds starts a handshake", context do
+      {peer, clock, session, index} = initiated(context)
+      %{current: %{created_at: created}} = remote_keepalive(context, peer, session, index)
+
+      advance_to(clock, created + 164_999)
+      remote_keepalive(context, peer, session, index)
+      refute_datagram(context)
+
+      advance(clock, 1)
+      remote_keepalive(context, peer, session, index)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      assert %{last_minute_rekey: true} = :sys.get_state(peer)
+    end
+
+    test "no key sends REJECT_AFTER_MESSAGES messages", context do
+      {peer, _clock, session, index} = initiated(context)
+      remote_keepalive(context, peer, session, index)
+      reject_after_messages = 2 ** 64 - 2 ** 13 - 1
+
+      in_process(peer, fn %{current: key_pair} ->
+        Decibel.set_nonce(key_pair.session, :out, reject_after_messages - 1)
+      end)
+
+      demand(context)
+      assert <<4, 0, 0, 0, 99::little-32, counter::little-64, _rest::binary>> = receive_datagram(context)
+      assert counter == reject_after_messages - 1
+
+      # The next packet waits for a new key.
+      demand(context)
+      assert eventually(fn -> :queue.len(:sys.get_state(peer).staged) == 1 end)
+      assert %{transport_sent: 2} = counters(context.interface)
+    end
+  end
+
+  describe "key lifetimes" do
+    test "a responder keeps its old key until the new one is confirmed, and retires each at 180 seconds",
+         context do
+      {first, first_index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+      clock = fake_peer_clock(peer)
+      to_wagyu(context, transport_frame(first, first_index))
+      assert eventually(fn -> slots(peer) == %{next: nil, current: first_index, previous: nil} end)
+
+      advance(context.clock, 20)
+      advance(clock, 1_000)
+      {second, second_index} = remote_handshake(context, 2, 2)
+      assert eventually(fn -> slots(peer) == %{next: second_index, current: first_index, previous: nil} end)
+
+      # Until the new key is confirmed, the responder sends with the old.
+      demand(context)
+      assert <<4, 0, 0, 0, 1::little-32, _rest::binary>> = frame = receive_datagram(context)
+      assert {:ok, _packet} = open_transport(first, frame)
+
+      to_wagyu(context, transport_frame(second, second_index))
+      assert eventually(fn -> slots(peer) == %{next: nil, current: second_index, previous: first_index} end)
+
+      # A packet delayed under the old key still authenticates until that
+      # key is 180 seconds old, however much traffic there is.
+      %{previous: %{created_at: created}, inbound_dropped: dropped} = :sys.get_state(peer)
+      advance_to(clock, created + 179_999)
+      to_wagyu(context, transport_frame(first, first_index, "delayed"))
+      dropped_after(peer, dropped, 1)
+      assert %{transport_invalid: 0, transport_expired: 0, transport_malformed: 1} = counters(context.interface)
+
+      # Then it is retired, and another is dropped at the interface.
+      advance(clock, 1)
+      run_timers(peer)
+      assert slots(peer) == %{next: nil, current: second_index, previous: nil}
+      assert lookup(context, first_index) == :retired
+
+      %{unknown_index: unknown} = counters(context.interface)
+      to_wagyu(context, transport_frame(first, first_index, "late"))
+      assert counters(context.interface, &(&1.unknown_index == unknown + 1))
+    end
+
+    # Killing the peer logs its exit.
+    @tag :capture_log
+    test "540 seconds after its last new key pair an idle peer has no keys and exits", context do
+      {peer, clock, session, index} = initiated(context)
+      %{timers: %{zero: zero}} = remote_keepalive(context, peer, session, index)
+
+      # The key retires at 180 seconds, and nothing else happens.
+      advance_to(clock, zero - 1)
+      assert %{next: nil, current: nil, previous: nil, initiation: nil} = run_timers(peer)
+      assert lookup(context, index) == :retired
+      refute_datagram(context)
+
+      monitor = Process.monitor(peer)
+      advance(clock, 1)
+      send(peer, {:wg_timer, make_ref()})
+      assert_receive {:DOWN, ^monitor, :process, ^peer, :normal}
+      assert {:ok, %{peers: [%{running: false}]}} = Wagyu.info(context.interface)
+
+      demand(context)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      assert peer(context) not in [nil, peer]
+    end
+
+    test "a peer's process dictionary does not grow with its handshakes", context do
+      {peer, clock, _session, _index} = initiated(context)
+      entries = fn -> in_process(peer, fn _state -> length(Process.get()) end) end
+
+      rekey = fn remote_index ->
+        advance(clock, 5_000)
+        send(peer, :wg_initiate)
+        {response, session, _sent} = respond_to(receive_datagram(context), context.remote, remote_index)
+        to_wagyu(context, response)
+        assert open_transport(session, receive_datagram(context)) == {:ok, ""}
+        :ok = Decibel.close(session)
+      end
+
+      Enum.each(1..3, rekey)
+      after_three = entries.()
+      Enum.each(4..30, rekey)
+      assert entries.() == after_three
+    end
+  end
+
+  describe "crashes and shutdown" do
+    # Killing the peer logs its exit.
+    @tag :capture_log
+    test "a peer's timers go with it, and its indices are retired", context do
+      demand(context)
+      index = sender_index(receive_datagram(context))
+      {peer, _clock} = started_peer(context)
+      assert Map.has_key?(:sys.get_state(peer).timers, :retry)
+
+      kill(peer)
+      assert eventually(fn -> lookup(context, index) == :retired end)
+      assert peer(context) == nil
+
+      # Stopping the interface stops a peer and its pending retry too.
+      demand(context)
+      _initiation = receive_datagram(context)
+      {peer, _clock} = started_peer(context)
+      monitor = Process.monitor(peer)
+      :ok = stop_supervised(Wagyu)
+      assert_receive {:DOWN, ^monitor, :process, ^peer, :shutdown}
+      refute_datagram(context)
+    end
+
+    # Killing the peer logs its exit.
+    @tag :capture_log
+    test "the interface forgets a peer only when nothing is waiting for it", context do
+      {peer, _clock, _session, index} = initiated(context)
+      %{peers: %{} = peers} = :sys.get_state(context.children.interface)
+      %{outbound: outbound} = Map.fetch!(peers, context.remote_key)
+      release = fn -> in_process(peer, &Wagyu.Interface.release_peer(&1.root, &1.public_key)) end
+
+      :ok = Admission.admit(outbound, 1, 10)
+      assert release.() == :busy
+      assert peer(context) == peer
+
+      Admission.release(outbound, 1, 10)
+      assert release.() == :ok
+      assert peer(context) == nil
+      assert lookup(context, index) == :retired
+
+      # A packet now starts a new process, which the old one's exit leaves
+      # alone.
+      demand(context)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      new = peer(context)
+      assert new not in [nil, peer]
+      kill(peer)
+      assert peer(context) == new
     end
   end
 end

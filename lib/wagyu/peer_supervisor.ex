@@ -2,9 +2,10 @@ defmodule Wagyu.PeerSupervisor do
   @moduledoc false
 
   # Supervises one temporary process per active configured peer. Only the
-  # interface starts peers, on demand; configured peers are not started
-  # eagerly. The local key pair reaches peers as an extra argument, as it
-  # does for handshake workers.
+  # interface starts peers, on demand, and those with a persistent
+  # keepalive when this supervisor starts, which it tells the interface.
+  # The local key pair reaches peers as an extra argument, as it does for
+  # handshake workers.
 
   use DynamicSupervisor
 
@@ -14,7 +15,7 @@ defmodule Wagyu.PeerSupervisor do
 
   @spec start_link({pid(), Config.t()}) :: Supervisor.on_start()
   def start_link({root, %Config{} = identity}) do
-    DynamicSupervisor.start_link(__MODULE__, identity, name: Wagyu.Registry.via(root, :peer_supervisor))
+    DynamicSupervisor.start_link(__MODULE__, {root, identity}, name: Wagyu.Registry.via(root, :peer_supervisor))
   end
 
   @doc "Starts a peer under `root`'s peer supervisor."
@@ -30,7 +31,12 @@ defmodule Wagyu.PeerSupervisor do
   end
 
   @impl true
-  def init(identity) do
+  def init({root, identity}) do
+    # The interface starts before this supervisor, and its start_peer calls
+    # wait until this returns.
+    with {:ok, interface, _value} <- Wagyu.Registry.lookup(root, :interface),
+         do: send(interface, :peer_supervisor_started)
+
     DynamicSupervisor.init(strategy: :one_for_one, max_children: @max_peers, extra_arguments: [identity])
   end
 end

@@ -9,9 +9,8 @@ WireGuard peers over one UDP socket, with no host TUN device.
 > starts under supervision with its UDP socket and SmolNet stack, completes
 > WireGuard handshakes with its configured peers in both directions, and
 > carries TCP and UDP traffic for sockets on its stack, interoperating with
-> wireguard-go. Handshake retries, rekeys and keepalives on timers are not
-> implemented yet, so a key is used for at most 180 seconds and the next
-> packet then starts a new handshake. Progress is tracked in
+> wireguard-go. Handshakes are retried and keys replaced on WireGuard's
+> timers, with optional persistent keepalives. Progress is tracked in
 > [#2](https://github.com/ausimian/wagyu/issues/2).
 
 ## Why
