@@ -171,6 +171,52 @@ defmodule Wagyu.AllowedIPsTest do
     end
   end
 
+  describe "source_filter/2" do
+    test "keeps a peer's prefixes and the longer ones nested in them, and answers allowed?/3 alike" do
+      table =
+        table!([
+          {{{10, 0, 0, 0}, 8}, :a},
+          {{{10, 13, 5, 0}, 24}, :b},
+          {{{10, 13, 5, 7}, 32}, :a},
+          {{{192, 168, 0, 0}, 16}, :b},
+          {{{0, 0, 0, 0}, 0}, :c},
+          {{{0xFD00, 0, 0, 0, 0, 0, 0, 0}, 16}, :a},
+          {{{0xFD00, 0, 0, 0, 0, 0, 0, 5}, 128}, :b},
+          # IPv4 bits that match the IPv6 prefix's leading bits.
+          {{{253, 0, 0, 1}, 32}, :b}
+        ])
+
+      filter = AllowedIPs.source_filter(table, :a)
+
+      assert AllowedIPs.to_list(filter) == [
+               {{{10, 13, 5, 7}, 32}, :a},
+               {{{10, 13, 5, 0}, 24}, :b},
+               {{{10, 0, 0, 0}, 8}, :a},
+               {{{0xFD00, 0, 0, 0, 0, 0, 0, 5}, 128}, :b},
+               {{{0xFD00, 0, 0, 0, 0, 0, 0, 0}, 16}, :a}
+             ]
+
+      for address <- [
+            {10, 1, 1, 1},
+            {10, 13, 5, 1},
+            {10, 13, 5, 7},
+            {192, 168, 1, 1},
+            {8, 8, 8, 8},
+            {253, 0, 0, 1},
+            {0xFD00, 0, 0, 0, 0, 0, 0, 1},
+            {0xFD00, 0, 0, 0, 0, 0, 0, 5},
+            {0x2001, 0xDB8, 0, 0, 0, 0, 0, 1}
+          ] do
+        assert AllowedIPs.allowed?(filter, address, :a) == AllowedIPs.allowed?(table, address, :a)
+      end
+    end
+
+    test "is empty for a peer with no prefixes" do
+      table = table!([{{{10, 0, 0, 0}, 8}, :a}])
+      assert AllowedIPs.to_list(AllowedIPs.source_filter(table, :b)) == []
+    end
+  end
+
   test "to_list/1 returns normalized entries, longest prefix first" do
     table =
       table!([
