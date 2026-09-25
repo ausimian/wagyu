@@ -121,7 +121,7 @@
   the peer holding their receiver index. Indices are random and unique, and
   one that is retired, or whose peer has exited, drops at the interface
   and is not reused for 180 seconds.
-- Wagyu now depends on Decibel 1.1.1 or later and SmolNet 0.4.1 or later.
+- Wagyu now depends on Decibel 1.1.1 or later and SmolNet 0.4.2 or later.
 - If the stack fails, including when stopped with `SmolNet.stop_stack/1`,
   the interface restarts with a new stack and sockets opened on the old one
   must be reopened. Any other failure inside the interface keeps the stack
