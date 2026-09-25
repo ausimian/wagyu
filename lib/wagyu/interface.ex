@@ -551,8 +551,11 @@ defmodule Wagyu.Interface do
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
+  # A socket that has just closed may exit before it answers the close.
   def terminate(_reason, state) do
     :gen_udp.close(state.socket)
+  catch
+    :exit, _reason -> :ok
   end
 
   @impl true
