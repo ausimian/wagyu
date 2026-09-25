@@ -28,6 +28,11 @@
 - The interface's UDP socket uses OTP's `:socket` backend, which sends each
   datagram about a quarter faster than the inet driver; over loopback, one
   TCP stream through the tunnel carries about 15% more.
+- Packets move through a peer in batches: it receives outbound packets as
+  one message per batch, taking the time and updating its timers once for
+  each, and passes the packets it decrypts back to back to the stack
+  together. Over loopback, one or four TCP streams through the tunnel carry
+  about 50% more.
 - A packet for a peer with no usable key waits, in order, while the peer
   starts a handshake, and goes out under the new key. At most 128 packets
   or 256 KiB wait per peer; beyond that they are dropped and counted.
@@ -121,7 +126,7 @@
   the peer holding their receiver index. Indices are random and unique, and
   one that is retired, or whose peer has exited, drops at the interface
   and is not reused for 180 seconds.
-- Wagyu now depends on Decibel 1.1.1 or later and SmolNet 0.4.1 or later.
+- Wagyu now depends on Decibel 1.1.1 or later and SmolNet 0.4.2 or later.
 - If the stack fails, including when stopped with `SmolNet.stop_stack/1`,
   the interface restarts with a new stack and sockets opened on the old one
   must be reopened. Any other failure inside the interface keeps the stack

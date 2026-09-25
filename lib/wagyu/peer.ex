@@ -11,10 +11,12 @@ defmodule Wagyu.Peer do
   # its endpoint and its timers, and it sends its own datagrams on the
   # interface's UDP socket with `:gen_udp.send/4`. Every message sent here
   # was admitted against one of its bounds first: `{:wg_outbound,
-  # ip_packet}` against `:outbound`, `{:wg_frame, local_index, frame,
-  # source}` against `:inbound`, and the handoff against `:handoffs`, which
-  # counts messages only. The peer releases each as it takes it off the
-  # mailbox.
+  # ip_packets}`, a batch admitted packet by packet, against `:outbound`,
+  # `{:wg_frame, local_index, frame, source}` against `:inbound`, and the
+  # handoff against `:handoffs`, which counts messages only. The peer
+  # releases a handoff as it takes it off the mailbox, each outbound packet
+  # just before it sends or stages it, and each frame once it is done with
+  # it, which for a data packet is once the packet has gone to the link.
   #
   # Responding. After the interface authorizes an initiation for this peer,
   # the handshake worker hands its responder session, which has this peer's
@@ -114,10 +116,23 @@ defmodule Wagyu.Peer do
   # AllowedIPs match is this peer. (The interface gives each peer only the
   # part of the table that decides that: `Wagyu.AllowedIPs.source_filter/2`.)
   # Such a packet goes to the link, admitted
-  # against the link's own bound (`Wagyu.Link.deliver/2`); anything else is
+  # against the link's own bound (`Wagyu.Link.deliver_to/2`); anything else is
   # counted and dropped. The source of a keepalive, or of a data packet that
   # passes those checks, becomes the endpoint, as the source of an
   # authenticated handshake message does.
+  #
+  # Batching. The interface sends a peer its share of each egress batch as
+  # one message, which goes out under one key as of one moment: the clock is
+  # read, and the timers updated and armed, once for the batch. Decrypted
+  # packets wait in `state.plaintext` while more frames are queued, and go
+  # to the link together once the mailbox is empty, another kind of message
+  # arrives, or the peer has taken 32 frames since the first of them
+  # waited, whether or not those frames carried packets, so a flood of
+  # frames that carry none cannot hold one back. The timers are armed then
+  # too. The
+  # link is looked up once and monitored, rather than for every packet. A
+  # waiting packet's frame stays admitted, so if the peer dies the
+  # interface counts it as dropped.
   #
   # Timers. As in wireguard-go, with times from its constants:
   #
@@ -210,6 +225,14 @@ defmodule Wagyu.Peer do
   @max_timestamp_wait 2 * 0x1000000
   # How long a cookie keys MAC2 after it arrives (COOKIE_REFRESH_TIME).
   @cookie_lifetime 120_000
+  # The most frames a peer takes while decrypted packets wait for the link,
+  # and so the most packets that go to it together: the link's own ingress
+  # batch.
+  @deliver_frames 32
+  # Decrypted packets waiting for the link, newest first, the bytes of the
+  # frames they came in, which stay admitted until they go, and the frames
+  # taken since the first of them waited.
+  @no_plaintext %{packets: [], count: 0, frame_bytes: 0, frames: 0}
 
   @slots [:next, :current, :previous]
   # The order in which timers due at the same moment run: an attempt that
@@ -249,6 +272,8 @@ defmodule Wagyu.Peer do
       current: nil,
       previous: nil,
       staged: :queue.new(),
+      plaintext: @no_plaintext,
+      link: nil,
       outbound_dropped: 0,
       inbound_dropped: 0,
       persistent_keepalive: peer.persistent_keepalive * 1_000,
@@ -264,29 +289,53 @@ defmodule Wagyu.Peer do
   end
 
   @impl true
-  def handle_info({:wg_handoff, ticket, metadata}, state) do
+  def handle_info({:wg_frame, index, frame, source}, state) do
+    waiting = state.plaintext.count
+    state = receive_frame(state, index, frame, source)
+
+    # A frame whose packet now waits for the link is released with it.
+    state =
+      if state.plaintext.count > waiting do
+        update_in(state.plaintext.frame_bytes, &(&1 + byte_size(frame)))
+      else
+        Admission.release(state.inbound, 1, byte_size(frame))
+        state
+      end
+
+    if state.plaintext.count == 0 do
+      {:noreply, arm(state)}
+    else
+      state = update_in(state.plaintext.frames, &(&1 + 1))
+
+      # Waits for the mailbox to empty (a zero timeout) before delivering,
+      # so that frames queued back to back reach the link together, but
+      # counts every frame, so that frames carrying no packet cannot keep
+      # the mailbox busy and hold back one that waits.
+      if state.plaintext.frames >= @deliver_frames, do: {:noreply, settle(state)}, else: {:noreply, state, 0}
+    end
+  end
+
+  # Any other message ends a run of frames, so their packets go first.
+  def handle_info(message, state), do: handle(message, settle(state))
+
+  @impl true
+  def format_status(status), do: Wagyu.Redact.format_status(status, [:identity, :peer, :staged, :plaintext])
+
+  defp handle({:wg_handoff, ticket, metadata}, state) do
     Admission.release(state.handoffs, 1, 0)
     {:noreply, state |> accept_handshake(ticket, metadata) |> arm()}
   end
 
-  def handle_info(:wg_handoff_abandoned, state) do
+  defp handle(:wg_handoff_abandoned, state) do
     Admission.release(state.handoffs, 1, 0)
     {:noreply, state}
   end
 
-  def handle_info({:wg_outbound, packet}, state) do
-    Admission.release(state.outbound, 1, byte_size(packet))
-    {:noreply, state |> send_packet(packet) |> arm()}
-  end
-
-  def handle_info({:wg_frame, index, frame, source}, state) do
-    Admission.release(state.inbound, 1, byte_size(frame))
-    {:noreply, state |> receive_frame(index, frame, source) |> arm()}
-  end
+  defp handle({:wg_outbound, packets}, state), do: {:noreply, state |> send_packets(packets) |> arm()}
 
   # The armed process timer, or one that has been replaced since. Either
   # way only the timers already due run.
-  def handle_info({:wg_timer, tag}, state) do
+  defp handle({:wg_timer, tag}, state) do
     state = if match?({^tag, _ref, _deadline}, state.timer), do: %{state | timer: nil}, else: state
 
     case run_timers(state) do
@@ -296,12 +345,16 @@ defmodule Wagyu.Peer do
   end
 
   # A rekey, as the timers start. Tests send it to rekey without waiting.
-  def handle_info(:wg_initiate, state), do: {:noreply, state |> initiate(:rekey) |> arm()}
+  defp handle(:wg_initiate, state), do: {:noreply, state |> initiate(:rekey) |> arm()}
 
-  def handle_info(_message, state), do: {:noreply, state}
+  # The mailbox emptied while packets waited for the link, which `settle/1`
+  # has sent them to.
+  defp handle(:timeout, state), do: {:noreply, state}
 
-  @impl true
-  def format_status(status), do: Wagyu.Redact.format_status(status, [:identity, :peer, :staged])
+  defp handle({:DOWN, monitor, :process, _link, _reason}, %{link: %{monitor: monitor}} = state),
+    do: {:noreply, %{state | link: nil}}
+
+  defp handle(_message, state), do: {:noreply, state}
 
   # Responding
 
@@ -499,18 +552,51 @@ defmodule Wagyu.Peer do
 
     with {:ip, {:ok, %{source: address, length: length}}} <- {:ip, IP.parse(plaintext)},
          {:allowed, true} <- {:allowed, AllowedIPs.allowed?(state.allowed_ips, address, state.public_key)} do
-      state = %{state | endpoint: source}
-
-      # The link counts a packet it refuses as an ingress drop.
-      case Link.deliver(state.root, [binary_part(plaintext, 0, length)]) do
-        0 -> count(state, :transport_received)
-        _refused -> state
-      end
+      %{packets: packets, count: waiting} = state.plaintext
+      packets = [binary_part(plaintext, 0, length) | packets]
+      %{state | endpoint: source, plaintext: %{state.plaintext | packets: packets, count: waiting + 1}}
     else
       {:ip, {:error, _reason}} -> state |> count(:transport_malformed) |> dropped()
       {:allowed, false} -> state |> count(:transport_source_denied) |> dropped()
     end
   end
+
+  # Sends the packets waiting for the link, and arms the timers, which
+  # frames leave unarmed while packets wait.
+  defp settle(%{plaintext: %{count: 0}} = state), do: state
+  defp settle(state), do: state |> deliver() |> arm()
+
+  # The link counts a packet it refuses as an ingress drop. The frames are
+  # released only once their packets have gone, so if the peer dies first
+  # the interface counts them as dropped.
+  defp deliver(state) do
+    %{packets: packets, count: waiting, frame_bytes: frame_bytes} = state.plaintext
+
+    {refused, state} =
+      case link(state) do
+        {:ok, link, state} -> {Link.deliver_to(link, Enum.reverse(packets)), state}
+        :error -> {waiting, state}
+      end
+
+    Admission.release(state.inbound, waiting, frame_bytes)
+    count(%{state | plaintext: @no_plaintext}, :transport_received, waiting - refused)
+  end
+
+  # The link, looked up when first needed and monitored until it exits. A
+  # link that fails restarts its peers too, but the monitor keeps a peer
+  # from sending to one that has gone in the meantime.
+  defp link(%{link: nil} = state) do
+    case Link.lookup(state.root) do
+      {:ok, link} ->
+        link = Map.put(link, :monitor, Process.monitor(link.pid))
+        {:ok, link, %{state | link: link}}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp link(state), do: {:ok, state.link, state}
 
   # An initiator still receiving under a key close to REJECT_AFTER_TIME
   # starts one handshake, in case it sends nothing that would.
@@ -594,6 +680,54 @@ defmodule Wagyu.Peer do
   # staged data if there is any, and otherwise a keepalive.
   defp confirm_to_responder(state) do
     if :queue.is_empty(state.staged), do: send_keepalive(state), else: send_staged(state)
+  end
+
+  # A batch from the interface goes out under one key as of one moment, so
+  # the clock is read, and the timers updated, once for all of it. Each
+  # packet is released just before it is sent or staged, so if the peer
+  # dies part-way the interface counts the unsent rest, missing at most the
+  # one being sent. Packets that find no usable key go one at a time, as
+  # does the rest of a batch once its key has sent REJECT_AFTER_MESSAGES.
+  defp send_packets(state, packets) do
+    case usable(state) do
+      nil -> Enum.reduce(packets, state, &send_outbound/2)
+      key_pair -> seal_batch(state, key_pair, packets, 0, 0)
+    end
+  end
+
+  defp send_outbound(packet, state) do
+    Admission.release(state.outbound, 1, byte_size(packet))
+    send_packet(state, packet)
+  end
+
+  defp seal_batch(state, key_pair, [], sent, errors), do: sent_batch(state, key_pair, sent, errors)
+
+  defp seal_batch(state, key_pair, [packet | rest], sent, errors) do
+    Admission.release(state.outbound, 1, byte_size(packet))
+
+    case Noise.seal(key_pair.session, key_pair.remote_index, pad(packet, state.identity.stack[:mtu])) do
+      {:ok, frame} ->
+        case send_frame(state, frame) do
+          :ok -> seal_batch(state, key_pair, rest, sent + 1, errors)
+          :error -> seal_batch(state, key_pair, rest, sent, errors + 1)
+        end
+
+      :error ->
+        state = state |> sent_batch(key_pair, sent, errors) |> send_packet(packet)
+        Enum.reduce(rest, state, &send_outbound/2)
+    end
+  end
+
+  # What `transmit/3` and `send_packet/3` do after each packet, once for
+  # the batch.
+  defp sent_batch(state, _key_pair, 0, 0), do: state
+
+  defp sent_batch(state, key_pair, sent, errors) do
+    state
+    |> sent_authenticated(:transport_sent)
+    |> count(:transport_sent, sent)
+    |> count(:send_errors, errors)
+    |> rekey_after_sending(key_pair)
   end
 
   # `demand` is false for a packet that was already waiting for a key, so
@@ -684,12 +818,19 @@ defmodule Wagyu.Peer do
 
   # A handshake message starts the REKEY_TIMEOUT wait whether or not the
   # send succeeds, so a failing socket is not retried for every packet.
-  defp transmit(%{endpoint: {address, port}} = state, frame, event) do
+  defp transmit(state, frame, event) do
     state = sent_authenticated(state, event)
 
-    case :gen_udp.send(state.socket, address, port, frame) do
+    case send_frame(state, frame) do
       :ok -> count(state, event)
-      {:error, _reason} -> count(state, :send_errors)
+      :error -> count(state, :send_errors)
+    end
+  end
+
+  defp send_frame(%{endpoint: {address, port}} = state, frame) do
+    case :gen_udp.send(state.socket, address, port, frame) do
+      :ok -> :ok
+      {:error, _reason} -> :error
     end
   end
 
@@ -702,14 +843,13 @@ defmodule Wagyu.Peer do
     state = state |> cancel_timer(:keepalive) |> persistent_keepalive()
 
     if event == :transport_sent,
-      do:
-        set_timer_unless_pending(state, :new_handshake, state.clock.() + @keepalive_timeout + @rekey_timeout + jitter()),
+      do: set_timer_unless_pending(state, :new_handshake, @keepalive_timeout + @rekey_timeout + jitter()),
       else: state
   end
 
   defp received_authenticated(state), do: state |> cancel_timer(:new_handshake) |> persistent_keepalive()
 
-  defp received_data(state), do: set_timer_unless_pending(state, :keepalive, state.clock.() + @keepalive_timeout)
+  defp received_data(state), do: set_timer_unless_pending(state, :keepalive, @keepalive_timeout)
 
   defp new_key_pair(state), do: %{set_timer(state, :zero, state.clock.() + @zero_after) | last_minute_rekey: false}
 
@@ -754,7 +894,7 @@ defmodule Wagyu.Peer do
     |> discard_initiation()
     |> drop_staged()
     |> count(:handshakes_abandoned)
-    |> set_timer_unless_pending(:zero, state.clock.() + @zero_after)
+    |> set_timer_unless_pending(:zero, @zero_after)
   end
 
   # A key that has expired since the data arrived calls for a handshake.
@@ -790,8 +930,10 @@ defmodule Wagyu.Peer do
 
   defp set_timer(state, name, deadline), do: %{state | timers: Map.put(state.timers, name, deadline)}
 
-  defp set_timer_unless_pending(state, name, deadline),
-    do: if(pending?(state, name), do: state, else: set_timer(state, name, deadline))
+  # Sets a timer `delay` from now, reading the clock only if it is not
+  # already pending.
+  defp set_timer_unless_pending(state, name, delay),
+    do: if(pending?(state, name), do: state, else: set_timer(state, name, state.clock.() + delay))
 
   defp cancel_timer(state, name), do: %{state | timers: Map.delete(state.timers, name)}
 
@@ -828,7 +970,10 @@ defmodule Wagyu.Peer do
     :error
   end
 
-  defp count(state, name, increment \\ 1) do
+  defp count(state, name, increment \\ 1)
+  defp count(state, _name, 0), do: state
+
+  defp count(state, name, increment) do
     :ok = Interface.count_peer_event(state.counters, name, increment)
     state
   end

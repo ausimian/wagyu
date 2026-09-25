@@ -140,6 +140,19 @@ defmodule Wagyu.DataPathTest do
 
   defp inbound(source, port, payload), do: ipv6_udp(source, @local6, 4_000, port, payload) <> <<0::64>>
 
+  # An egress packet from a SmolNet socket to `destination`.
+  defp outbound(destination, payload), do: ipv4_udp(@local, destination, 4_000, 9, payload)
+
+  # The payload of the next packet `remote` receives under `key`.
+  defp receive_payload(context, remote, key) do
+    {:ok, plaintext} = open_transport(key.session, receive_datagram(context, remote))
+    {:ok, %{length: length}} = IP.parse(plaintext)
+    <<_headers::binary-28, payload::binary>> = binary_part(plaintext, 0, length)
+    payload
+  end
+
+  defp message_queue_len(pid), do: elem(Process.info(pid, :message_queue_len), 1)
+
   defp staged(peer), do: peer |> :sys.get_state() |> Map.fetch!(:staged) |> :queue.to_list()
 
   describe "inbound" do
@@ -154,6 +167,70 @@ defmodule Wagyu.DataPathTest do
       assert smolnet_recv(udp) == {@a_host, "over IPv4"}
       assert smolnet_recv(udp6) == {@a_host6, "over IPv6"}
       assert %{transport_received: 2, keepalives_received: 1, ingress: 2} = counters(context.interface)
+    end
+
+    test "packets decrypted back to back go to the link together, and their frames stay admitted until then",
+         context do
+      key = handshake(context, context.a)
+      {udp, port} = smolnet_udp(context, :inet)
+      link = context.children.link
+      a_key = context.a.key
+      %{peers: %{^a_key => %{inbound: inbound}}} = :sys.get_state(context.children.interface)
+
+      # Ten frames wait for the peer, and the link waits too.
+      :ok = :sys.suspend(key.peer)
+      :ok = :sys.suspend(link)
+      for n <- 1..10, do: send_data(context, context.a, key, inbound(@a_host, port, "packet #{n}"))
+      assert eventually(fn -> match?({10, _bytes}, Admission.usage(inbound)) end)
+
+      # The peer takes all ten before its mailbox empties, and then sends
+      # their packets, trimmed, in one message.
+      :ok = :sys.resume(key.peer)
+      {:messages, messages} = eventually(fn -> message_queue_len(link) > 0 and Process.info(link, :messages) end)
+      assert [packets] = for({:wg_plaintext, packets} <- messages, do: packets)
+      assert packets == for(n <- 1..10, do: ipv4_udp(@a_host, @local, 4_000, port, "packet #{n}"))
+      assert eventually(fn -> Admission.usage(inbound) == {0, 0} end)
+
+      :ok = :sys.resume(link)
+      for n <- 1..10, do: assert(smolnet_recv(udp) == {@a_host, "packet #{n}"})
+      assert %{transport_received: 10, ingress: 10} = counters(context.interface, &(&1.ingress == 10))
+    end
+
+    test "frames that carry no packet cannot hold back one waiting for the link", context do
+      key = handshake(context, context.a)
+      {_udp, port} = smolnet_udp(context, :inet)
+      link = context.children.link
+      a_key = context.a.key
+      %{peers: %{^a_key => %{inbound: inbound}}} = :sys.get_state(context.children.interface)
+      :ok = :sys.suspend(key.peer)
+      :ok = :sys.suspend(link)
+
+      # A packet, 40 replays of it, which the peer refuses, and another.
+      first = transport_frame(key.session, key.index, inbound(@a_host, port, "first"))
+      for _n <- 0..40, do: to_wagyu(context, first, context.a.socket)
+      send_data(context, context.a, key, inbound(@a_host, port, "second"))
+      assert eventually(fn -> match?({42, _bytes}, Admission.usage(inbound)) end)
+
+      # The first goes once the peer has taken 32 frames, without waiting for
+      # its mailbox to empty.
+      :ok = :sys.resume(key.peer)
+
+      deliveries =
+        eventually(fn ->
+          {:messages, messages} = Process.info(link, :messages)
+          deliveries = for {:wg_plaintext, packets} <- messages, do: packets
+          length(deliveries) == 2 and deliveries
+        end)
+
+      assert deliveries == [
+               [ipv4_udp(@a_host, @local, 4_000, port, "first")],
+               [ipv4_udp(@a_host, @local, 4_000, port, "second")]
+             ]
+
+      :ok = :sys.resume(link)
+
+      assert %{transport_replayed: 40, transport_received: 2} =
+               counters(context.interface, &(&1.transport_received == 2))
     end
 
     test "packets whose source's longest AllowedIPs match is another peer, or none, are dropped", context do
@@ -349,6 +426,35 @@ defmodule Wagyu.DataPathTest do
       assert payloads == Enum.map(1..128, &"packet #{&1}")
       assert staged(peer) == []
       assert %{keepalives_sent: 0, transport_sent: 128} = counters(context.interface, &(&1.transport_sent == 128))
+    end
+
+    test "each peer gets its share of an egress batch as one message, in order, admitted up to its bound", context do
+      a = handshake(context, context.a)
+      b = handshake(context, context.b)
+      :ok = :sys.suspend(a.peer)
+      :ok = :sys.suspend(b.peer)
+
+      # One batch from the link, with B's packets among A's and more of A's
+      # than its queue holds.
+      as = for n <- 1..130, do: outbound(@a_host, "a #{n}")
+      [b1, b2, b3] = for n <- 1..3, do: outbound(@b_host, "b #{n}")
+      batch = [b1 | Enum.take(as, 60)] ++ [b2 | Enum.drop(as, 60)] ++ [b3]
+      assert {0, {_interface, egress}} = Wagyu.Interface.deliver(context.interface, batch)
+      assert eventually(fn -> Admission.usage(egress) == {0, 0} end)
+
+      assert message_queue_len(a.peer) == 1
+      assert message_queue_len(b.peer) == 1
+      assert %{egress_routed: 131, egress_peer_dropped: 2} = counters(context.interface)
+      peers = :sys.get_state(context.children.interface).peers
+      assert {128, _bytes} = Admission.usage(peers[context.a.key].outbound)
+      assert {3, _bytes} = Admission.usage(peers[context.b.key].outbound)
+
+      :ok = :sys.resume(a.peer)
+      :ok = :sys.resume(b.peer)
+      assert for(_n <- 1..128, do: receive_payload(context, context.a, a)) == Enum.map(1..128, &"a #{&1}")
+      assert for(_n <- 1..3, do: receive_payload(context, context.b, b)) == ["b 1", "b 2", "b 3"]
+      assert %{transport_sent: 131} = counters(context.interface, &(&1.transport_sent == 131))
+      assert Admission.usage(peers[context.a.key].outbound) == {0, 0}
     end
 
     @tag mtu: 16_384
