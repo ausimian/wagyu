@@ -59,6 +59,12 @@ defmodule Wagyu.Config do
         rather than being silently replaced by zeros. `nil` is rejected as
         `:invalid` rather than treated as omitted, so an unset variable
         cannot quietly disable a key.
+      * `:persistent_keepalive` - seconds, from 1 to 65,535, after which the
+        interface sends the peer a keepalive if nothing else has passed
+        between them, to keep a NAT or firewall mapping open. `0`, the
+        default, sends none. A peer with one starts with the interface and
+        sends its first keepalive then. As in WireGuard, 25 seconds suits
+        most NATs.
 
   Unknown or repeated options fail validation at every level.
 
@@ -75,7 +81,7 @@ defmodule Wagyu.Config do
     * `:reserved` - a stack option that Wagyu sets itself
     * `:invalid` - the wrong type or shape, or an unusable peer public key
     * `:invalid_length` - a key that is not exactly 32 bytes
-    * `:out_of_range` - a port or MTU outside its range
+    * `:out_of_range` - a port, MTU or persistent keepalive outside its range
     * `:too_many` - more addresses, routes or peers than allowed
     * `:family_mismatch` - an endpoint or gateway in the wrong address family
     * `:duplicate` - a repeated option, public key, address, route or prefix
@@ -101,7 +107,7 @@ defmodule Wagyu.Config do
   @options [:name, :private_key, :listen, :stack, :peers]
   @stack_options [:addresses, :routes, :mtu]
   @reserved_stack_options [:egress, :limits, :link_down]
-  @peer_options [:public_key, :endpoint, :allowed_ips, :preshared_key]
+  @peer_options [:public_key, :endpoint, :allowed_ips, :preshared_key, :persistent_keepalive]
   @endpoint_options [:address, :port]
 
   @default_listen %{address: {0, 0, 0, 0}, port: 0}
@@ -323,8 +329,17 @@ defmodule Wagyu.Config do
          {:ok, public_key} <- peer_public_key(value.public_key, path ++ [:public_key], local_keys),
          {:ok, endpoint} <- endpoint(Map.get(value, :endpoint), path ++ [:endpoint], listen_family),
          {:ok, allowed_ips} <- peer_allowed_ips(Map.get(value, :allowed_ips, []), path ++ [:allowed_ips]),
-         {:ok, preshared_key} <- preshared_key(Map.fetch(value, :preshared_key), path ++ [:preshared_key]) do
-      {:ok, %Peer{public_key: public_key, endpoint: endpoint, allowed_ips: allowed_ips, preshared_key: preshared_key}}
+         {:ok, preshared_key} <- preshared_key(Map.fetch(value, :preshared_key), path ++ [:preshared_key]),
+         {:ok, keepalive} <-
+           persistent_keepalive(Map.get(value, :persistent_keepalive, 0), path ++ [:persistent_keepalive]) do
+      {:ok,
+       %Peer{
+         public_key: public_key,
+         endpoint: endpoint,
+         allowed_ips: allowed_ips,
+         preshared_key: preshared_key,
+         persistent_keepalive: keepalive
+       }}
     end
   end
 
@@ -378,6 +393,10 @@ defmodule Wagyu.Config do
   defp preshared_key({:ok, @zero_key}, _path), do: {:ok, @zero_key}
   defp preshared_key({:ok, <<_::binary-32>>}, _path), do: {:error, :unsupported_preshared_key}
   defp preshared_key({:ok, value}, path), do: key(value, path)
+
+  defp persistent_keepalive(seconds, _path) when is_integer(seconds) and seconds in 0..65_535, do: {:ok, seconds}
+  defp persistent_keepalive(seconds, path) when is_integer(seconds), do: invalid(path, :out_of_range)
+  defp persistent_keepalive(_seconds, path), do: invalid(path, :invalid)
 
   # Every exact prefix may appear once across all peers.
   defp allowed_ips(peers) do
