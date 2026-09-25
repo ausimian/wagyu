@@ -34,14 +34,12 @@ routing or how the rest of the node connects.
 
 ### Installation
 
-Wagyu is not on Hex yet, so add it from GitHub. Add SmolNet as well if your
-application calls SmolNet directly, as the examples below do:
+Wagyu is not on Hex yet, so add it from GitHub:
 
 ```elixir
 def deps do
   [
-    {:wagyu, github: "ausimian/wagyu"},
-    {:smolnet, "~> 0.4"}
+    {:wagyu, github: "ausimian/wagyu"}
   ]
 end
 ```
@@ -75,26 +73,32 @@ under its own supervisor:
 To run it in your own supervision tree instead, list `{Wagyu, options}` as a
 child.
 
-### Open sockets on its stack
+### Connect through the tunnel with `:gen_tcp`
 
-`Wagyu.stack/1` returns the interface's SmolNet stack. Sockets opened on it
-send their packets through the tunnel:
+`Wagyu.stack/1` returns the interface's network stack. Pass it, together with
+SmolNet's TCP module, in the options of an ordinary `:gen_tcp` call, and that
+socket's traffic goes through the tunnel:
 
 ```elixir
 {:ok, stack} = Wagyu.stack(:wg0)
-{:ok, socket} = SmolNet.open(:inet, :stream, :tcp, stack: stack)
-```
 
-Standard `:gen_tcp` calls can use the stack too, one socket at a time, without
-changing the node-wide TCP backend:
+options = [
+  {:tcp_module, SmolNet.Inet.Tcp},
+  {:smolnet_stack, stack},
+  :inet,
+  :binary,
+  {:active, false}
+]
 
-```elixir
-options = [{:tcp_module, SmolNet.Inet.Tcp}, {:smolnet_stack, stack}, :inet, :binary, {:active, false}]
 {:ok, socket} = :gen_tcp.connect({10, 13, 0, 1}, 443, options, 5_000)
+:ok = :gen_tcp.send(socket, "hello")
+{:ok, reply} = :gen_tcp.recv(socket, 0, 5_000)
+:ok = :gen_tcp.close(socket)
 ```
 
-For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`. A destination must be
-reachable through the stack's routes and a peer's `allowed_ips`.
+The options apply to that socket only; the node's other TCP connections are
+unaffected. For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`. The destination
+must be reachable through the stack's routes and a peer's `allowed_ips`.
 
 `Wagyu.info/1` reports counters and peer state, and `Wagyu.stop/1` stops the
 interface. The `Wagyu` and `Wagyu.Config` module documentation covers every
