@@ -33,6 +33,7 @@ defmodule Wagyu.MixProject do
 
   defp deps do
     [
+      {:benchee, "~> 1.5", only: :dev},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:decibel, ">= 1.1.1 and < 2.0.0"},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
