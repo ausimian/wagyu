@@ -25,6 +25,9 @@
   matches its destination, and a packet from a peer reaches the stack only
   if the most specific prefix matching its source is that peer's. Over a
   50 ms round trip, one TCP stream carries about 1 MB/s.
+- The interface's UDP socket uses OTP's `:socket` backend, which sends each
+  datagram about a quarter faster than the inet driver; over loopback, one
+  TCP stream through the tunnel carries about 15% more.
 - A packet for a peer with no usable key waits, in order, while the peer
   starts a handshake, and goes out under the new key. At most 128 packets
   or 256 KiB wait per peer; beyond that they are dropped and counted.
