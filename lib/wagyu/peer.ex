@@ -708,7 +708,8 @@ defmodule Wagyu.Peer do
 
   # The credit goes first. If the peer is killed between the two, the
   # interface retires the packet's credit again from the queue's count,
-  # which the link may grant once too often, rather than never.
+  # which the link then settles (`Wagyu.EgressCredit.settle/1`), rather
+  # than the credit never coming back.
   defp take_outbound(%{outbound: %{queue: queue, credit: credit}}, packet) do
     EgressCredit.retire(credit, 1, byte_size(packet))
     Admission.release(queue, 1, byte_size(packet))

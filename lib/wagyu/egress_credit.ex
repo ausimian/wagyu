@@ -12,11 +12,16 @@ defmodule Wagyu.EgressCredit do
   # the peers retire them, then tell the link (`Wagyu.Link.retired/1`), which
   # reads the count again and grants the difference. The counts live in
   # `:counters`, so a count the link reads can only be stale by being too
-  # high, and it never grants credit that is still held. The one exception
-  # is a peer killed while it takes a packet, which may have that packet
-  # retired twice (see `Wagyu.Peer`): a packet's worth too much credit,
-  # which the queues' own bounds still hold, rather than credit lost for
-  # good.
+  # high, and it never grants credit that is still held.
+  #
+  # The one exception is a peer killed while it takes a packet, which may
+  # have that packet retired twice (see `Wagyu.Peer`) rather than never. A
+  # packet is always taken before it can be retired, so a count below zero
+  # can only mean that, and `settle/1` adds the shortfall back whenever the
+  # link sees one. That can never lift the count above what is really held,
+  # since between the read and the add the count can only fall. So a double
+  # retirement grants a packet too many only until the interface next
+  # drains, and the queues' own bounds hold it meanwhile.
   #
   # The count belongs to one interface incarnation, as `Wagyu.Admission` does
   # to one receiver. When the interface exits, its peers exit with it, and
@@ -50,6 +55,17 @@ defmodule Wagyu.EgressCredit do
   @spec outstanding(t()) :: {integer(), integer()}
   def outstanding(%__MODULE__{counters: counters}),
     do: {:counters.get(counters, @packets), :counters.get(counters, @bytes)}
+
+  @doc """
+  Returns the count as `outstanding/1` does, having first added back any
+  shortfall below zero. Only the link, which alone takes packets, calls it.
+  """
+  @spec settle(t()) :: {non_neg_integer(), non_neg_integer()}
+  def settle(credit) do
+    {packets, bytes} = outstanding(credit)
+    add(credit, max(-packets, 0), max(-bytes, 0))
+    {max(packets, 0), max(bytes, 0)}
+  end
 
   defp add(%__MODULE__{counters: counters}, packets, bytes) do
     :ok = :counters.add(counters, @packets, packets)

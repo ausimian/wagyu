@@ -266,7 +266,7 @@ defmodule Wagyu.Link do
     end
   end
 
-  defp taken(%{interface: {_pid, _egress, credit, _monitor}}), do: EgressCredit.outstanding(credit)
+  defp taken(%{interface: {_pid, _egress, credit, _monitor}}), do: EgressCredit.settle(credit)
   defp taken(_state), do: {0, 0}
 
   # Adds packets to the pending batch, sending the batch whenever the next

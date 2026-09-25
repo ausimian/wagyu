@@ -163,6 +163,22 @@ defmodule Wagyu.LinkTest do
       refute_received {:grant_egress, ^link, _packets, _bytes}
     end
 
+    test "settles a packet retired twice rather than granting it twice",
+         %{root: root, link: link, options: options} do
+      %{credit: credit} = register_interface(root)
+      egress(link, options, packets(1..1))
+      assert_receive {:wg_egress, [packet]}
+
+      # A peer killed while taking a packet can have it retired twice.
+      EgressCredit.retire_all(credit, [packet])
+      EgressCredit.retire_all(credit, [packet])
+      {:ok, target} = Link.lookup(root)
+      Link.retired(target)
+
+      assert_receive {:grant_egress, ^link, 1, 20}
+      assert EgressCredit.outstanding(credit) == {0, 0}
+    end
+
     test "a credit notice does not end a run of queued plaintext", %{root: root, link: link} do
       register_interface(root)
       {:ok, target} = Link.lookup(root)
