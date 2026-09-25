@@ -39,8 +39,8 @@ stack (`tun/netstack`), which needs no TUN device or root. They build a small
 Go helper in `test/interop`, pinned by its own `go.mod` and `go.sum`. The
 helper runs a wireguard-go peer, with TCP and UDP echo servers and a TCP
 sink on its netstack and an optional delay on the datagrams it sends. Its
-`vectors` command prints a fixed-key handshake transcript that a golden test
-compares byte for byte.
+`vectors` command prints a fixed-key handshake transcript, with a cookie
+reply and MAC2, that a golden test compares byte for byte.
 
 - With `go` on the `PATH`, `mix test` and `mix precommit` run them.
 - Without `go`, they are skipped.

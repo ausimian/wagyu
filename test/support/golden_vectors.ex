@@ -7,7 +7,10 @@ defmodule Wagyu.GoldenVectors do
   # Decibel or Wagyu; the interop tests check that it still prints exactly
   # this. Keys are hex, the initiator's index is 0x11223344 and the
   # responder's 0x55667788, and each keepalive is the first transport
-  # message its sender sends.
+  # message its sender sends. The cookie reply answers the initiation, as
+  # though it came from 127.0.0.1:51820, from a fixed cookie secret and
+  # nonce, and `initiation_mac2` is the initiation with MAC2 under its
+  # cookie.
 
   @vectors [
     initiator_private: "30f840b57759f1b03f2881d249d8440535438013bb60c4e3ca186eec5baa6543",
@@ -25,7 +28,17 @@ defmodule Wagyu.GoldenVectors do
       "0200000088776655443322119fecf3a3b59f4db692fc60bd80be4db76e002477fea089cf63780509e3b0fd01bbbc7e06808d05e4" <>
         "a8c65bd79edc09e52d38a7e43a219f4ff72f6cc2b7f930c600000000000000000000000000000000",
     initiator_keepalive: "04000000887766550000000000000000c4bfa7e570337f89d91edf4828f132e4",
-    responder_keepalive: "04000000443322110000000000000000885cbca697398d78d5f38da2cb2c92dc"
+    responder_keepalive: "04000000443322110000000000000000885cbca697398d78d5f38da2cb2c92dc",
+    cookie_secret: "ad20899ce88e6f857eccf3e2990541a93e61361433de8fa033a2769ac82eb50c",
+    cookie_nonce: "54ea968e86a8bf2f238b4f1f81faafc65dc0036f6bc598d2",
+    cookie: "ea10f7a1003ff579742c3752aa42551f",
+    cookie_reply:
+      "030000004433221154ea968e86a8bf2f238b4f1f81faafc65dc0036f6bc598d263a50b792250f09ae044c9012c9c58df" <>
+        "09d950706b6a7c7f6a9034836a68e429",
+    initiation_mac2:
+      "01000000443322116753afd63220b4bc669fc51be6a98c4ca498dc9f07cfa599ccb1ab60585ebf26ff4daeda1210129a7ae289f2" <>
+        "e08f2d67ed6b3a29d9036cb70c1fefb746ef68122d380bc41954fe0663c66a116b36156f32eac6f967e7188dc05c671220d9bcb2" <>
+        "4061d5e7461c776abe65f75912946c06a2130e38f001eeef43fca8f1f39e1685b4f2b3fcb1d502abc2d04cb9"
   ]
 
   @doc "The vectors in the order `wgpeer vectors` prints them, as hex."
