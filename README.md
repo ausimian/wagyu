@@ -6,10 +6,12 @@ Elixir. It carries IPv4 and IPv6 packets between a SmolNet network stack and
 WireGuard peers over one UDP socket, with no host TUN device.
 
 > **Status:** Wagyu is under development and not yet on Hex. An interface
-> starts under supervision with its UDP socket and SmolNet stack, and completes
-> WireGuard handshakes with its configured peers in both directions, including
-> with wireguard-go. The encrypted data path is not implemented yet, so no
-> traffic crosses the tunnel. Progress is tracked in
+> starts under supervision with its UDP socket and SmolNet stack, completes
+> WireGuard handshakes with its configured peers in both directions, and
+> carries TCP and UDP traffic for sockets on its stack, interoperating with
+> wireguard-go. Handshake retries, rekeys and keepalives on timers are not
+> implemented yet, so a key is used for at most 180 seconds and the next
+> packet then starts a new handshake. Progress is tracked in
 > [#2](https://github.com/ausimian/wagyu/issues/2).
 
 ## Why
@@ -74,10 +76,6 @@ To run it in your own supervision tree instead, list `{Wagyu, options}` as a
 child.
 
 ### Connect through the tunnel with `:gen_tcp`
-
-> **Not yet working:** this example needs the encrypted data path
-> ([#7](https://github.com/ausimian/wagyu/issues/7)). Until it lands, peers
-> drop every packet, so `:gen_tcp.connect/4` times out.
 
 `Wagyu.stack/1` returns the interface's network stack. Pass it, together with
 SmolNet's TCP module, in the options of an ordinary `:gen_tcp` call, and that

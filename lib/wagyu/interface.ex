@@ -76,7 +76,8 @@ defmodule Wagyu.Interface do
   # Egress the link may have queued for the interface at once.
   @egress_packets 256
   @egress_bytes 512 * 1024
-  # Each peer's inbound and outbound queues, bounded separately.
+  # Each peer's inbound and outbound queues, bounded separately, and again
+  # the outbound packets it holds while it has no key to send them with.
   @peer_packets 128
   @peer_bytes 256 * 1024
   # Handoffs waiting for a peer: one it is taking and one more. A newer
@@ -125,7 +126,15 @@ defmodule Wagyu.Interface do
     keys_confirmed: 23,
     keepalives_sent: 24,
     transport_invalid: 25,
-    send_errors: 26
+    send_errors: 26,
+    transport_sent: 27,
+    staged_dropped: 28,
+    transport_received: 29,
+    keepalives_received: 30,
+    transport_replayed: 31,
+    transport_expired: 32,
+    transport_malformed: 33,
+    transport_source_denied: 34
   ]
 
   # The counters peers update.
@@ -138,7 +147,15 @@ defmodule Wagyu.Interface do
     :keys_confirmed,
     :keepalives_sent,
     :transport_invalid,
-    :send_errors
+    :send_errors,
+    :transport_sent,
+    :staged_dropped,
+    :transport_received,
+    :keepalives_received,
+    :transport_replayed,
+    :transport_expired,
+    :transport_malformed,
+    :transport_source_denied
   ]
 
   @claim_errors [
@@ -590,22 +607,25 @@ defmodule Wagyu.Interface do
     {:ok, config} = Config.fetch_peer(state.config, key)
     inbound = Admission.new(@peer_packets, @peer_bytes)
     outbound = Admission.new(@peer_packets, @peer_bytes)
+    staging = Admission.new(@peer_packets, @peer_bytes)
     handoffs = Admission.new(@peer_handoffs, 1)
 
     args = %{
       root: state.root,
       peer: config,
+      allowed_ips: AllowedIPs.source_filter(state.config.allowed_ips, key),
       socket: state.socket,
       counters: state.counters,
       inbound: inbound,
       outbound: outbound,
+      staging: staging,
       handoffs: handoffs
     }
 
     case PeerSupervisor.start_peer(state.root, args) do
       {:ok, pid} ->
         monitor = Process.monitor(pid)
-        peer = %{pid: pid, inbound: inbound, outbound: outbound, handoffs: handoffs}
+        peer = %{pid: pid, inbound: inbound, outbound: outbound, staging: staging, handoffs: handoffs}
 
         {:ok, peer,
          %{state | peers: Map.put(state.peers, key, peer), monitors: Map.put(state.monitors, monitor, {:peer, key})}}
@@ -615,15 +635,16 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # Packets admitted to a peer that it never took were lost with it; its
-  # queues' counts say how many. Its indices become tombstones, so messages
+  # Packets admitted to a peer that it never took, or that it staged and
+  # never sent, were lost with it; its queues' counts say how many. Its indices become tombstones, so messages
   # for them drop here and none is reused while the remote party may still
   # send to it.
   defp peer_down(state, key, pid) do
     {peer, peers} = Map.pop!(state.peers, key)
     {lost_outbound, _bytes} = Admission.usage(peer.outbound)
+    {lost_staged, _bytes} = Admission.usage(peer.staging)
     {lost_inbound, _bytes} = Admission.usage(peer.inbound)
-    add(state, :egress_peer_dropped, lost_outbound)
+    add(state, :egress_peer_dropped, lost_outbound + lost_staged)
     add(state, :inbound_peer_dropped, lost_inbound)
     indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
     schedule_expiry(%{state | peers: peers, indices: indices})

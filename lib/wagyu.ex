@@ -9,14 +9,13 @@ defmodule Wagyu do
 
   > #### Status {: .warning}
   >
-  > An interface starts, opens its UDP socket and its SmolNet stack, runs
-  > under supervision, and completes WireGuard handshakes with its
-  > configured peers, both ways, but it carries no traffic yet. A packet
-  > that a socket sends to a peer with no session starts a handshake and is
-  > then dropped, as is every other packet sent; the handshake's initiator
-  > confirms the new keys with an empty keepalive. Data that a peer sends
-  > is authenticated and dropped. Handshakes that fail are not retried on a
-  > timer, and keys do not expire yet. `info/1` counts all of it.
+  > An interface completes WireGuard handshakes with its configured peers,
+  > both ways, and carries the TCP and UDP traffic of sockets opened on its
+  > stack. A packet sent to a peer with no usable key waits while the peer
+  > starts a handshake. Handshakes that fail are not retried on a timer yet,
+  > and keys are not replaced before they expire: 180 seconds after a
+  > handshake, a key is no longer used, and the next packet starts a new
+  > handshake. `info/1` counts all of it.
 
   ## Starting an interface
 
@@ -117,7 +116,8 @@ defmodule Wagyu do
   anything beyond it is dropped and counted rather than queued: datagrams
   are read from the socket a bounded batch at a time, at most 8 handshake
   workers run with at most 64 initiations waiting, each peer queues at most
-  128 packets or 256 KiB in each direction, and packets the stack sends
+  128 packets or 256 KiB in each direction, and as many again waiting for a
+  key to send them with, and packets the stack sends
   beyond what the interface has queued are dropped. At most 32 packets reach
   the stack in one ingress call, one call at a time.
 
@@ -214,6 +214,24 @@ defmodule Wagyu do
       the responder sends with them
     * `:transport_invalid` - transport messages that reached their peer but
       did not authenticate under any of its keys
+    * `:transport_replayed` - transport messages refused, before
+      decryption, because their counter was already accepted or is too old
+      for the key's replay window
+    * `:transport_expired` - transport messages refused because their key
+      is 180 seconds old or more
+    * `:transport_sent` - packets encrypted and sent to peers
+    * `:transport_received` - packets that authenticated, came from an
+      address in their peer's AllowedIPs and were queued for the stack; the
+      link counts those it could not queue in `:ingress_dropped`
+    * `:keepalives_received` - authenticated empty transport messages
+    * `:transport_malformed` - authenticated packets that are not valid IP,
+      including those whose IP length exceeds the decrypted data
+    * `:transport_source_denied` - authenticated packets whose source
+      address is not in their peer's AllowedIPs
+    * `:staged_dropped` - packets dropped because their peer had no usable
+      key and already held as many packets waiting for one as it may (128
+      packets or 256 KiB). A peer's total outbound loss is this plus
+      `:egress_peer_dropped`.
     * `:send_errors` - datagrams that a peer failed to send
     * `:egress` - packets the stack sent
     * `:egress_dropped` - packets the stack sent that were dropped because
@@ -222,8 +240,12 @@ defmodule Wagyu do
     * `:egress_unroutable` - packets with a malformed IP header or no
       matching AllowedIPs prefix
     * `:egress_routed` - packets queued for their peer
-    * `:egress_peer_dropped` - packets dropped because the peer's queue was
-      full, it could not start, or it exited before taking them
+    * `:egress_peer_dropped` - packets dropped on the way to their peer:
+      because the queue of packets sent to the peer's process was full, the
+      process could not start, or it exited before taking them or while
+      they waited for a key. Packets the peer took but had no room to keep
+      waiting for a key are counted in `:staged_dropped` instead, so the
+      two never count the same packet.
     * `:ingress` - packets the stack accepted
     * `:ingress_dropped` - packets bound for the stack that were dropped,
       because the link's queue was full or the stack refused them

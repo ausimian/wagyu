@@ -37,14 +37,19 @@ The tests tagged `interop` run Wagyu against
 [wireguard-go](https://git.zx2c4.com/wireguard-go) on its userspace network
 stack (`tun/netstack`), which needs no TUN device or root. They build a small
 Go helper in `test/interop`, pinned by its own `go.mod` and `go.sum`. The
-helper runs a wireguard-go peer, and its `vectors` command prints a
-fixed-key handshake transcript that a golden test compares byte for byte.
+helper runs a wireguard-go peer, with TCP and UDP echo servers and a TCP
+sink on its netstack and an optional delay on the datagrams it sends. Its
+`vectors` command prints a fixed-key handshake transcript that a golden test
+compares byte for byte.
 
 - With `go` on the `PATH`, `mix test` and `mix precommit` run them.
 - Without `go`, they are skipped.
 - `WAGYU_INTEROP=1` turns a missing `go` into an error instead of a skip. CI
   sets it.
 - `mix test --exclude interop` skips them regardless.
+- One of them measures single-stream TCP throughput over a simulated 50 ms
+  round trip, against a loose floor. `WAGYU_THROUGHPUT=1` prints the rate it
+  measured.
 
 ## CI
 

@@ -83,8 +83,8 @@ defmodule Wagyu.ExchangeTest do
     Enum.any?(slots, &(Map.get(b, &1) == {hash, remote, local}))
   end
 
-  # Sends a data message from `from`'s current key to `to`, which
-  # authenticates and drops it, since there is no data path yet.
+  # Sends a message under `from`'s current key to `to`, which authenticates
+  # it and then drops it, since it is not an IP packet.
   defp transport_to(from, to) do
     frame =
       in_process(peer(from), fn %{current: key_pair} ->
@@ -93,9 +93,9 @@ defmodule Wagyu.ExchangeTest do
       end)
 
     {:ok, socket} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}])
-    dropped = :sys.get_state(peer(to)).inbound_dropped
+    %{transport_malformed: malformed} = counters(to.interface)
     :ok = :gen_udp.send(socket, {127, 0, 0, 1}, to.port, frame)
-    assert eventually(fn -> :sys.get_state(peer(to)).inbound_dropped == dropped + 1 end)
+    assert counters(to.interface, &(&1.transport_malformed == malformed + 1))
   end
 
   defp peer_count(side), do: DynamicSupervisor.count_children(side.children.peer_supervisor).active
@@ -104,9 +104,10 @@ defmodule Wagyu.ExchangeTest do
     demand(a)
     assert eventually(fn -> established?(a) and established?(b) end)
 
-    # A initiated and B responded; A's keepalive confirmed the key to B.
+    # A initiated and B responded; the packet that started it confirmed the
+    # key to B.
     assert matches?(a, b, [:current])
-    assert %{initiations_sent: 1, responses_accepted: 1, keepalives_sent: 1} = counters(a.interface)
+    assert %{initiations_sent: 1, responses_accepted: 1, transport_sent: 1} = counters(a.interface)
     assert %{responses_sent: 1, keys_confirmed: 1} = counters(b.interface)
 
     # Each side's sending key is the other's receiving key.

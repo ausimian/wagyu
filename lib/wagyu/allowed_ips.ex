@@ -89,9 +89,36 @@ defmodule Wagyu.AllowedIPs do
   @spec allowed?(t(), term(), peer()) :: boolean()
   def allowed?(%__MODULE__{} = table, source, peer), do: lookup(table, source) == {:ok, peer}
 
+  @doc """
+  Returns the part of the table that decides where `peer` may send from:
+  its own prefixes and every longer prefix nested in one of them. An
+  address's longest match can belong to `peer` only if the address is in
+  one of its prefixes, and every longer prefix holding that address is
+  nested in that prefix, so `allowed?/3` answers the same for `peer` on the
+  result as on the whole table.
+  """
+  @spec source_filter(t(), peer()) :: t()
+  def source_filter(%__MODULE__{} = table, peer) do
+    entries = to_list(table)
+    own = for {prefix, ^peer} <- entries, do: prefix
+
+    {:ok, filter} =
+      entries
+      |> Enum.filter(fn {prefix, owner} -> owner == peer or Enum.any?(own, &nested?(prefix, &1)) end)
+      |> new()
+
+    filter
+  end
+
   @doc "Returns the table's `{prefix, peer}` pairs, IPv4 first, longest prefix first."
   @spec to_list(t()) :: [{prefix(), peer()}]
   def to_list(%__MODULE__{ipv4: ipv4, ipv6: ipv6}), do: entries(ipv4, 32) ++ entries(ipv6, 128)
+
+  # Whether `prefix` is longer than `outer` and inside it. Prefixes of
+  # different families are never nested: normalizing an address to the
+  # other family's length either fails or yields the wrong family.
+  defp nested?({address, length}, {_network, outer_length} = outer),
+    do: length > outer_length and normalize({address, outer_length}) == {:ok, outer}
 
   defp add(seen, {prefix, peer}) do
     case normalize(prefix) do

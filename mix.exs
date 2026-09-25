@@ -39,7 +39,7 @@ defmodule Wagyu.MixProject do
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
       {:excoveralls, "~> 0.18", only: :test},
       {:publisho, "~> 1.0", only: :dev, runtime: false},
-      {:smolnet, "~> 0.4"}
+      {:smolnet, "~> 0.4.1"}
     ]
   end
 

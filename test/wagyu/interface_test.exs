@@ -226,8 +226,10 @@ defmodule Wagyu.InterfaceTest do
 
       Process.exit(peer, :kill)
 
-      assert %{egress_routed: 11, egress_peer_dropped: 10} =
-               counters(context.interface, &(&1.egress_peer_dropped == 10))
+      # The first packet, which the peer took, was waiting for a key, so it
+      # is lost with the peer too.
+      assert %{egress_routed: 11, egress_peer_dropped: 11} =
+               counters(context.interface, &(&1.egress_peer_dropped == 11))
 
       assert running_peers(context.interface) == []
     end

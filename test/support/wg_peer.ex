@@ -34,14 +34,20 @@ defmodule Wagyu.WgPeer do
   Starts a device whose netstack has `address`, configures it with `uapi`
   (a keyword list of UAPI keys and values, in order), brings it up, and
   returns the port and the device's UDP port.
+
+  Options are `:mtu` (default 1280) and `:delay`, milliseconds by which the
+  device holds back every datagram it sends (default 0).
   """
-  def start!(binary, address, uapi, mtu \\ 1280) do
+  def start!(binary, address, uapi, options \\ []) do
+    mtu = Keyword.get(options, :mtu, 1280)
+    delay = Keyword.get(options, :delay, 0)
+
     port =
       Port.open({:spawn_executable, binary}, [
         :binary,
         :exit_status,
         {:line, 65_536},
-        args: ["peer", :inet.ntoa(address) |> to_string(), Integer.to_string(mtu)]
+        args: ["peer", :inet.ntoa(address) |> to_string(), Integer.to_string(mtu), Integer.to_string(delay)]
       ])
 
     :ok = command(port, ["set" | Enum.map(uapi, &uapi_line/1)] ++ [""])
@@ -71,6 +77,16 @@ defmodule Wagyu.WgPeer do
   def send_udp(port, address, udp_port, payload) do
     command(port, ["send #{:inet.ntoa(address)} #{udp_port} #{payload}"])
   end
+
+  @doc "Echoes UDP datagrams, or TCP streams, arriving on a netstack port."
+  def echo(port, protocol, netstack_port) when protocol in [:udp, :tcp],
+    do: command(port, ["echo #{protocol} #{netstack_port}"])
+
+  @doc """
+  Reads each TCP connection on a netstack port until the client shuts down
+  its side, then replies with the number of bytes read, in decimal.
+  """
+  def sink(port, netstack_port), do: command(port, ["sink #{netstack_port}"])
 
   defp command(port, lines) do
     Port.command(port, Enum.map(lines, &[&1, "\n"]))

@@ -14,10 +14,35 @@
   reference `Wagyu.stack/1` returns for opening sockets. `Wagyu.info/1`
   reports counters, peer state and public keys, and `Wagyu.stop/1` stops the
   interface, its socket and its stack. All three accept the interface's PID
-  or its registered name. The encrypted data path is not complete yet, so
-  no traffic crosses the tunnel: packets sent on the stack are routed to
-  their peer and dropped there, and data arriving from a peer is dropped
-  once it authenticates.
+  or its registered name.
+- TCP and UDP sockets opened on an interface's stack exchange data with its
+  peers through the tunnel, interoperating with wireguard-go, over IPv4 and
+  IPv6. A packet goes to the peer whose AllowedIPs prefix most specifically
+  matches its destination, and a packet from a peer reaches the stack only
+  if the most specific prefix matching its source is that peer's. Over a
+  50 ms round trip, one TCP stream carries about 1 MB/s.
+- A packet for a peer with no usable key waits, in order, while the peer
+  starts a handshake, and goes out under the new key. At most 128 packets
+  or 256 KiB wait per peer; beyond that they are dropped and counted.
+- A transport message is refused before decryption when its counter was
+  already accepted or is 8128 or more behind the highest accepted, and
+  its counter is recorded only once it authenticates, so reordered packets
+  pass and forged ones cannot shut genuine ones out. Messages that do not
+  authenticate, carry a packet that is not valid IP (including one whose IP
+  length exceeds the data), or come from a source outside the peer's
+  AllowedIPs are dropped and counted, and none of them changes the peer's
+  endpoint.
+- A peer's endpoint follows the source of its authenticated keepalives and
+  of data that passes those checks, as well as of its handshakes, so a peer
+  that roams keeps its tunnel.
+- A key is used for at most 180 seconds after its handshake, in either
+  direction, and never beyond 2^64 - 2^13 - 1 messages; the next packet then
+  waits for a new handshake. An initiator counts those seconds from its
+  initiation, so a response that arrives too late cannot leave it sending
+  under a key the responder has already retired. Automatic rekeying before that point is not
+  implemented yet.
+- Outbound packets are padded to a multiple of 16 bytes, but never beyond the
+  MTU.
 - An interface completes WireGuard handshakes with its configured peers in
   both directions, interoperating with wireguard-go. A packet sent to a peer
   with no session starts a handshake, from a random registered sender index
@@ -30,9 +55,9 @@
   of responding to one.
 - Each peer keeps next, current and previous keys, as wireguard-go does. The
   initiator of a handshake sends with the new keys at once and confirms
-  them with an empty keepalive; the responder keeps sending with its
-  current keys until the initiator's first transport message arrives under
-  the new ones. Transport messages still authenticate under the previous
+  them with the packets waiting for them, or with an empty keepalive if
+  none are; the responder keeps sending with its current keys until the
+  initiator's first transport message arrives under the new ones. Transport messages still authenticate under the previous
   keys, for packets delayed across a rekey. A rekey keeps the same peer
   process, and keys that leave the three slots are closed and their indices
   retired.
@@ -42,7 +67,8 @@
 - `Wagyu.info/1` counts handshake initiations, responses and keepalives
   sent, responses accepted and refused, confirmed keys, transport messages
   that do not authenticate, handshakes a peer could not start for want of an
-  endpoint, and failed sends.
+  endpoint, and failed sends, as well as packets sent and received through
+  the tunnel, keepalives received, and each reason a packet was dropped.
 - The interface authenticates WireGuard handshake initiations and identifies
   the configured peer that sent each one. It refuses, silently, initiations
   from unknown keys, replayed or stale timestamps (including after a peer's
@@ -55,7 +81,7 @@
   the peer holding their receiver index. Indices are random and unique, and
   one that is retired, or whose peer has exited, drops at the interface
   and is not reused for 180 seconds.
-- Wagyu now depends on Decibel 1.1.1 or later.
+- Wagyu now depends on Decibel 1.1.1 or later and SmolNet 0.4.1 or later.
 - If the stack fails, including when stopped with `SmolNet.stop_stack/1`,
   the interface restarts with a new stack and sockets opened on the old one
   must be reopened. Any other failure inside the interface keeps the stack

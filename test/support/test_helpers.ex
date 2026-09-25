@@ -278,6 +278,24 @@ defmodule Wagyu.TestHelpers do
     header.(checksum(header.(0))) <> udp
   end
 
+  @doc "A complete IPv6 UDP packet with a valid UDP checksum."
+  def ipv6_udp(source, destination, source_port, destination_port, payload) do
+    source = ipv6_binary(source)
+    destination = ipv6_binary(destination)
+    udp_length = 8 + byte_size(payload)
+
+    udp_checksum =
+      checksum(
+        <<source::binary, destination::binary, udp_length::32, 0::24, 17, source_port::16, destination_port::16,
+          udp_length::16, 0::16, payload::binary>>
+      )
+
+    <<6::4, 0::28, udp_length::16, 17, 64, source::binary, destination::binary, source_port::16, destination_port::16,
+      udp_length::16, udp_checksum::16, payload::binary>>
+  end
+
+  defp ipv6_binary(address), do: for(hextet <- Tuple.to_list(address), into: <<>>, do: <<hextet::16>>)
+
   defp checksum(data) do
     padded = if rem(byte_size(data), 2) == 1, do: data <> <<0>>, else: data
     sum = for <<word::16 <- padded>>, reduce: 0, do: (sum -> sum + word)
