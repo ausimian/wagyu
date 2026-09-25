@@ -101,6 +101,22 @@
   `Wagyu.info/1` counts each outcome. Handshake cryptography runs in at
   most 8 workers, off the socket's receive path, and at most 2 accepted
   handshakes wait for each peer.
+- Under load, as in wireguard-go and Linux, an interface answers handshake
+  initiations and responses that lack a valid MAC2 with an encrypted
+  cookie reply instead of doing handshake cryptography, and lets those
+  with one through at most 20 a second, in bursts of 5, from each IPv4
+  address or IPv6 /64. It is under load while 8 or more initiations wait
+  for a worker, or when a worker cannot start, and for a second after.
+  Cookies are bound to the sender's address and port and expire with the
+  cookie secret after 120 seconds, and a handshake message with an invalid
+  MAC1 is never answered. Existing sessions carry traffic throughout.
+  `Wagyu.info/1` counts the cookie replies sent and the messages refused
+  for their source's budget.
+- A peer takes a cookie reply from a remote party under load, such as
+  wireguard-go, and puts MAC2 on its handshake messages for 120 seconds,
+  so its handshake completes on the next retry. Forged replies, and
+  replies that do not answer the peer's last handshake message, are
+  refused and counted.
 - Responses, cookie replies and transport messages are delivered only to
   the peer holding their receiver index. Indices are random and unique, and
   one that is retired, or whose peer has exited, drops at the interface

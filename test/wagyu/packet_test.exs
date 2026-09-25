@@ -230,4 +230,63 @@ defmodule Wagyu.PacketTest do
       assert_raise ArgumentError, fn -> Packet.put_mac1(@captured_initiation, <<0::128>>) end
     end
   end
+
+  describe "MAC2" do
+    test "is keyed BLAKE2s-128 with the cookie over every byte before it, MAC1 included" do
+      key = Packet.mac1_key(@responder_public)
+      cookie = bytes(16)
+
+      for frame <- [@captured_initiation, @captured_response] do
+        mac1_key = if frame == @captured_initiation, do: key, else: Packet.mac1_key(@initiator_public)
+        with_mac2 = Packet.put_macs(frame, mac1_key, cookie)
+        size = byte_size(frame) - 16
+        <<covered::binary-size(^size), mac2::binary-16>> = with_mac2
+
+        # MAC1 is unchanged, and MAC2 covers it.
+        assert covered == binary_part(frame, 0, size)
+        assert mac2 == Wagyu.Blake2s.hash(covered, cookie, 16)
+        assert Packet.valid_mac1?(with_mac2, mac1_key)
+        assert Packet.valid_mac2?(with_mac2, cookie)
+        assert Packet.mac1(with_mac2) == Packet.mac1(frame)
+
+        # Without a cookie, MAC2 is zero, as put_mac1/2 leaves it.
+        assert Packet.put_macs(frame, mac1_key, nil) == frame
+        assert Packet.put_mac1(with_mac2, mac1_key) == frame
+      end
+    end
+
+    test "valid_mac2?/2 detects a change to any byte, and never raises" do
+      cookie = bytes(16)
+      frame = Packet.put_macs(@captured_initiation, Packet.mac1_key(@responder_public), cookie)
+
+      for offset <- 0..147 do
+        <<before::binary-size(^offset), byte, rest::binary>> = frame
+        refute Packet.valid_mac2?(<<before::binary, Bitwise.bxor(byte, 1), rest::binary>>, cookie), "offset #{offset}"
+      end
+
+      refute Packet.valid_mac2?(frame, bytes(16))
+      refute Packet.valid_mac2?(@captured_initiation, <<0::128>>)
+
+      for {frame, cookie} <- [
+            {binary_part(frame, 0, 147), cookie},
+            {Packet.encode(cookie_reply()), cookie},
+            {nil, cookie},
+            {frame, bytes(32)},
+            {frame, nil}
+          ] do
+        refute Packet.valid_mac2?(frame, cookie)
+      end
+    end
+
+    test "mac1/1 reads only full handshake frames, and put_macs/3 rejects bad cookies" do
+      <<_covered::binary-116, mac1::binary-16, _mac2::binary-16>> = @captured_initiation
+      assert Packet.mac1(@captured_initiation) == {:ok, mac1}
+      assert Packet.mac1(Packet.encode(cookie_reply())) == :error
+      assert Packet.mac1(nil) == :error
+
+      key = Packet.mac1_key(@responder_public)
+      assert_raise ArgumentError, fn -> Packet.put_macs(@captured_initiation, key, bytes(32)) end
+      assert_raise ArgumentError, fn -> Packet.put_macs(Packet.encode(cookie_reply()), key, bytes(16)) end
+    end
+  end
 end

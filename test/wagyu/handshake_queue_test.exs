@@ -20,6 +20,22 @@ defmodule Wagyu.HandshakeQueueTest do
     assert %{active: 8, queued: 64} = queue
   end
 
+  test "is loaded once an eighth of the waiting room is taken" do
+    {_results, queue} = admit_all(HandshakeQueue.new(), 1..15)
+    assert %{active: 8, queued: 7} = queue
+    refute HandshakeQueue.loaded?(queue)
+
+    {:queued, queue} = HandshakeQueue.admit(queue, 16)
+    assert HandshakeQueue.loaded?(queue)
+
+    {:start, 9, queue} = HandshakeQueue.release(queue)
+    refute HandshakeQueue.loaded?(queue)
+
+    # Busy workers alone, with no room to wait, are not load by this measure.
+    {_results, queue} = admit_all(HandshakeQueue.new(max_queued: 0), 1..9)
+    refute HandshakeQueue.loaded?(queue)
+  end
+
   test "a released slot goes to the oldest waiting candidate" do
     {_results, queue} = admit_all(HandshakeQueue.new(max_active: 1, max_queued: 2), [:a, :b, :c])
 

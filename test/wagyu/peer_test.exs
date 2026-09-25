@@ -10,6 +10,7 @@ defmodule Wagyu.PeerTest do
   import Wagyu.TestHelpers
 
   alias Wagyu.Admission
+  alias Wagyu.Cookie
   alias Wagyu.IndexTable
   alias Wagyu.Packet
   alias Wagyu.TAI64N
@@ -480,6 +481,86 @@ defmodule Wagyu.PeerTest do
 
       %{current: %{local_index: third_index}} = :sys.get_state(peer)
       assert slots(peer) == %{next: nil, current: third_index, previous: second_index}
+    end
+  end
+
+  describe "cookies" do
+    # A cookie reply carrying `cookie` to `frame`, a handshake message sent
+    # to the holder of `public_key`, as that party encrypts it when under
+    # load.
+    defp cookie_reply(frame, cookie, public_key) do
+      {:ok, mac1} = Packet.mac1(frame)
+      Cookie.seal(Cookie.key(public_key), cookie, sender_index(frame), :crypto.strong_rand_bytes(24), mac1)
+    end
+
+    defp cookie_replies(context, accepted, invalid) do
+      counters(context.interface, &(&1.cookie_replies_accepted == accepted and &1.cookie_replies_invalid == invalid))
+    end
+
+    test "a cookie reply to the last initiation keys MAC2 on the next ones for 120 seconds", context do
+      demand(context)
+      first = receive_datagram(context)
+      {peer, clock} = started_peer(context)
+      assert <<_covered::binary-132, 0::128>> = first
+      cookie = :crypto.strong_rand_bytes(16)
+      {other_key, _private_key} = keypair()
+
+      # Only a reply that decrypts with the remote party's key and this
+      # initiation's MAC1 is taken: not one for another key, nor one to
+      # another message from the same index.
+      <<head::binary-116, _mac1::binary-16, _mac2::binary-16>> = first
+      other_message = <<head::binary, :crypto.strong_rand_bytes(16)::binary, 0::128>>
+      to_wagyu(context, cookie_reply(first, cookie, other_key))
+      to_wagyu(context, cookie_reply(other_message, cookie, context.remote_key))
+      assert cookie_replies(context, 0, 2)
+
+      # The genuine reply is taken once, and sends nothing by itself.
+      reply = cookie_reply(first, cookie, context.remote_key)
+      to_wagyu(context, reply)
+      assert cookie_replies(context, 1, 2)
+      received_at = now(clock)
+      to_wagyu(context, reply)
+      assert cookie_replies(context, 1, 3)
+      refute_datagram(context)
+
+      # The retry carries MAC2 under the cookie, as well as MAC1.
+      %{timers: %{retry: retry}} = :sys.get_state(peer)
+      advance_to(clock, retry)
+      run_timers(peer)
+      second = receive_datagram(context)
+      assert Packet.valid_mac1?(second, Packet.mac1_key(context.remote_key))
+      assert Packet.valid_mac2?(second, cookie)
+
+      # So does a retry just before the cookie is 120 seconds old, which is
+      # also when the attempt runs out. The next initiation, after that, has
+      # no MAC2.
+      advance_to(clock, received_at + 119_999)
+      run_timers(peer)
+      assert Packet.valid_mac2?(receive_datagram(context), cookie)
+
+      advance_to(clock, received_at + 125_000)
+      demand(context)
+      assert <<_covered::binary-132, 0::128>> = receive_datagram(context)
+    end
+
+    test "a cookie reply to a response keys MAC2 on the next response", context do
+      {initiation, _session} = initiate_to(context.public_key, context.remote, timestamp(1), 1)
+      to_wagyu(context, initiation)
+      response = receive_datagram(context)
+      assert <<_covered::binary-76, 0::128>> = response
+
+      # The reply goes to the response's sender index, the peer's new one.
+      cookie = :crypto.strong_rand_bytes(16)
+      to_wagyu(context, cookie_reply(response, cookie, context.remote_key))
+      assert cookie_replies(context, 1, 0)
+
+      advance(context.clock, 20)
+      {initiation, session} = initiate_to(context.public_key, context.remote, timestamp(2), 2)
+      to_wagyu(context, initiation)
+      response = receive_datagram(context)
+      assert Packet.valid_mac1?(response, Packet.mac1_key(context.remote_key))
+      assert Packet.valid_mac2?(response, cookie)
+      assert complete(session, response) == :ok
     end
   end
 

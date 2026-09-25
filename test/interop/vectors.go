@@ -22,6 +22,7 @@ const (
 	construction   = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
 	identifier     = "WireGuard v1 zx2c4 Jason@zx2c4.com"
 	labelMAC1      = "mac1----"
+	labelCookie    = "cookie--"
 	initiatorIndex = 0x11223344
 	responderIndex = 0x55667788
 )
@@ -94,6 +95,27 @@ func transcript() []vector {
 	keys = kdf(2, chain, nil)
 	initiatorSend, responderSend := keys[0], keys[1]
 
+	// A cookie reply to the initiation, as a responder under load sends it
+	// from a fixed secret and nonce, and the initiation again with MAC2 under
+	// that cookie. The cookie is keyed BLAKE2s-128 of the initiation's
+	// source, 127.0.0.1:51820, as its address and big-endian port.
+	cookieSecret := hashOf([]byte("wagyu golden vector cookie secret"))
+	cookieNonce := hashOf([]byte("wagyu golden vector cookie nonce"))[:24]
+	cookie := macOf(cookieSecret, []byte{127, 0, 0, 1, 0xca, 0x6c})
+	cookieCipher, err := chacha20poly1305.NewX(hashOf([]byte(labelCookie), responderPublic))
+	if err != nil {
+		panic(err)
+	}
+	mac1 := initiation[len(initiation)-32 : len(initiation)-16]
+
+	cookieReply := header(3)
+	cookieReply = binary.LittleEndian.AppendUint32(cookieReply, initiatorIndex)
+	cookieReply = append(cookieReply, cookieNonce...)
+	cookieReply = cookieCipher.Seal(cookieReply, cookieNonce, cookie, mac1)
+
+	covered := initiation[: len(initiation)-16 : len(initiation)-16]
+	initiationMAC2 := append(covered, macOf(cookie, covered)...)
+
 	return []vector{
 		{"initiator_private", initiatorPrivate},
 		{"initiator_public", initiatorPublic},
@@ -106,7 +128,22 @@ func transcript() []vector {
 		{"response", response},
 		{"initiator_keepalive", keepalive(responderIndex, initiatorSend)},
 		{"responder_keepalive", keepalive(initiatorIndex, responderSend)},
+		{"cookie_secret", cookieSecret},
+		{"cookie_nonce", cookieNonce},
+		{"cookie", cookie},
+		{"cookie_reply", cookieReply},
+		{"initiation_mac2", initiationMAC2},
 	}
+}
+
+// Keyed BLAKE2s-128, as MAC1, MAC2 and cookies use it.
+func macOf(key, message []byte) []byte {
+	mac, err := blake2s.New128(key)
+	if err != nil {
+		panic(err)
+	}
+	mac.Write(message)
+	return mac.Sum(nil)
 }
 
 // A clamped X25519 key pair derived from a label.

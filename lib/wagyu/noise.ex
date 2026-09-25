@@ -74,10 +74,11 @@ defmodule Wagyu.Noise do
   @doc """
   Writes an initiator session's first handshake message and frames it as a
   148-byte initiation from `sender_index` carrying `timestamp`, with MAC1
-  keyed by `mac1_key` (the responder's) and a zero MAC2.
+  keyed by `mac1_key` (the responder's) and MAC2 by `cookie`, the
+  responder's latest, or zero without one.
   """
-  @spec write_initiation(Decibel.session(), IndexTable.index(), <<_::96>>, <<_::256>>) :: binary()
-  def write_initiation(session, sender_index, <<_::binary-12>> = timestamp, mac1_key) do
+  @spec write_initiation(Decibel.session(), IndexTable.index(), <<_::96>>, <<_::256>>, <<_::128>> | nil) :: binary()
+  def write_initiation(session, sender_index, <<_::binary-12>> = timestamp, mac1_key, cookie \\ nil) do
     <<ephemeral::binary-32, static::binary-48, encrypted_timestamp::binary-28>> =
       session |> Decibel.handshake_encrypt(timestamp) |> IO.iodata_to_binary()
 
@@ -88,7 +89,7 @@ defmodule Wagyu.Noise do
       encrypted_timestamp: encrypted_timestamp
     }
     |> Packet.encode()
-    |> Packet.put_mac1(mac1_key)
+    |> Packet.put_macs(mac1_key, cookie)
   end
 
   @doc """
@@ -120,15 +121,16 @@ defmodule Wagyu.Noise do
   Writes a responder session's second handshake message, which has an empty
   payload, once it has read an initiation, and frames it as a 92-byte
   response from `sender_index` to the initiator's `receiver_index`, with
-  MAC1 keyed by `mac1_key` (the initiator's) and a zero MAC2. The session is
-  then ready for transport.
+  MAC1 keyed by `mac1_key` (the initiator's) and MAC2 by `cookie`, the
+  initiator's latest, or zero without one. The session is then ready for
+  transport.
 
   Returns `:error`, leaving the session unchanged, if the initiator's keys
   turn out to be unusable.
   """
-  @spec write_response(Decibel.session(), IndexTable.index(), IndexTable.index(), <<_::256>>) ::
+  @spec write_response(Decibel.session(), IndexTable.index(), IndexTable.index(), <<_::256>>, <<_::128>> | nil) ::
           {:ok, binary()} | :error
-  def write_response(session, sender_index, receiver_index, mac1_key) do
+  def write_response(session, sender_index, receiver_index, mac1_key, cookie \\ nil) do
     <<ephemeral::binary-32, nothing::binary-16>> = session |> Decibel.handshake_encrypt("") |> IO.iodata_to_binary()
 
     frame =
@@ -139,7 +141,7 @@ defmodule Wagyu.Noise do
         encrypted_nothing: nothing
       }
       |> Packet.encode()
-      |> Packet.put_mac1(mac1_key)
+      |> Packet.put_macs(mac1_key, cookie)
 
     {:ok, frame}
   rescue

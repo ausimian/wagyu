@@ -1,7 +1,7 @@
 defmodule Wagyu.Packet do
   @moduledoc false
 
-  # WireGuard message framing and MAC1.
+  # WireGuard message framing, MAC1 and MAC2.
   #
   # Every message starts with a one-byte type and three reserved bytes that
   # must be zero. Indices and counters are little-endian. Handshake and cookie
@@ -157,21 +157,44 @@ defmodule Wagyu.Packet do
   def mac1_key(<<public_key::binary-32>>), do: Blake2s.hash(@mac1_label <> public_key)
 
   @doc """
-  Fills in MAC1 on an encoded initiation or response and clears MAC2.
-
-  MAC1 is keyed BLAKE2s-128 over every byte before the MAC1 field. MAC2 covers
-  MAC1, so any MAC2 already in the frame is stale; it is set to zero, which is
-  what a sender without a cookie transmits.
-
-  Raises `ArgumentError` for any other frame or a key that is not 32 bytes.
+  Fills in MAC1 on an encoded initiation or response and clears MAC2, as
+  `put_macs/3` does without a cookie.
   """
   @spec put_mac1(binary(), <<_::256>>) :: binary()
-  def put_mac1(frame, key) do
-    with true <- is_bytes(key, 32),
+  def put_mac1(frame, key), do: put_macs(frame, key, nil)
+
+  @doc """
+  Fills in MAC1 and MAC2 on an encoded initiation or response.
+
+  MAC1 is keyed BLAKE2s-128 over every byte before the MAC1 field. MAC2 is
+  keyed BLAKE2s-128 with `cookie` over every byte before the MAC2 field,
+  MAC1 included, or zero without a cookie, which is what a sender that has
+  none transmits.
+
+  Raises `ArgumentError` for any other frame, a key that is not 32 bytes or
+  a cookie that is neither nil nor 16 bytes.
+  """
+  @spec put_macs(binary(), <<_::256>>, <<_::128>> | nil) :: binary()
+  def put_macs(frame, key, cookie) do
+    with true <- is_bytes(key, 32) and (is_nil(cookie) or is_bytes(cookie, @mac_size)),
          {:ok, covered, _mac1, _mac2} <- split_macs(frame) do
-      <<covered::binary, mac1(key, covered)::binary, 0::size(@mac_size * 8)>>
+      mac1 = mac(key, covered)
+      mac2 = if cookie, do: mac(cookie, covered <> mac1), else: <<0::size(@mac_size * 8)>>
+      <<covered::binary, mac1::binary, mac2::binary>>
     else
-      _invalid -> raise ArgumentError, "MAC1 applies only to encoded initiation and response messages"
+      _invalid -> raise ArgumentError, "MACs apply only to encoded initiation and response messages"
+    end
+  end
+
+  @doc """
+  Returns the MAC1 field of an initiation or response of the exact size, or
+  `:error` for anything else.
+  """
+  @spec mac1(term()) :: {:ok, <<_::128>>} | :error
+  def mac1(frame) do
+    case split_macs(frame) do
+      {:ok, _covered, mac1, _mac2} -> {:ok, mac1}
+      :error -> :error
     end
   end
 
@@ -183,14 +206,30 @@ defmodule Wagyu.Packet do
   @spec valid_mac1?(term(), term()) :: boolean()
   def valid_mac1?(frame, key) when is_bytes(key, 32) do
     case split_macs(frame) do
-      {:ok, covered, mac1, _mac2} -> :crypto.hash_equals(mac1(key, covered), mac1)
+      {:ok, covered, mac1, _mac2} -> :crypto.hash_equals(mac(key, covered), mac1)
       :error -> false
     end
   end
 
   def valid_mac1?(_frame, _key), do: false
 
-  defp mac1(key, covered), do: Blake2s.hash(covered, key, @mac_size)
+  @doc """
+  Returns `true` when `frame` is an initiation or response of the exact size
+  whose MAC2 was made with `cookie`, as `put_macs/3` makes it. Returns
+  `false` for anything else and never raises. The comparison takes constant
+  time.
+  """
+  @spec valid_mac2?(term(), term()) :: boolean()
+  def valid_mac2?(frame, cookie) when is_bytes(cookie, @mac_size) do
+    case split_macs(frame) do
+      {:ok, covered, mac1, mac2} -> :crypto.hash_equals(mac(cookie, covered <> mac1), mac2)
+      :error -> false
+    end
+  end
+
+  def valid_mac2?(_frame, _cookie), do: false
+
+  defp mac(key, covered), do: Blake2s.hash(covered, key, @mac_size)
 
   defp split_macs(<<@initiation, 0, 0, 0, _rest::binary>> = frame) when byte_size(frame) == @initiation_size,
     do: split_macs(frame, @initiation_size - 2 * @mac_size)

@@ -63,6 +63,14 @@ defmodule Wagyu.Peer do
   # initiation is discarded and the packets waiting for a key are dropped
   # and counted.
   #
+  # Cookies. A remote party under load answers a handshake message without
+  # a valid MAC2 with a cookie reply to the message's sender index, which is
+  # this peer's. The peer takes a reply only if it decrypts with the MAC1
+  # of the last handshake message it sent, initiation or response, and then
+  # only once, as in Linux, and keys MAC2 on its handshake messages with the
+  # cookie for 120 seconds after it arrived. A reply sends nothing sooner:
+  # the next initiation goes out on the retry timer, as in wireguard-go.
+  #
   # Key slots. As in wireguard-go, a completed handshake is a key pair: its
   # transport session, its local index and the remote party's index. A peer
   # holds up to three, `:next`, `:current` and `:previous`, and sends only
@@ -171,12 +179,13 @@ defmodule Wagyu.Peer do
   alias Wagyu.Admission
   alias Wagyu.AllowedIPs
   alias Wagyu.Config
+  alias Wagyu.Cookie
   alias Wagyu.Interface
   alias Wagyu.IP
   alias Wagyu.Link
   alias Wagyu.Noise
   alias Wagyu.Packet
-  alias Wagyu.Packet.{Response, Transport}
+  alias Wagyu.Packet.{CookieReply, Response, Transport}
   alias Wagyu.TAI64N
 
   # WireGuard's timer constants, in milliseconds.
@@ -199,6 +208,8 @@ defmodule Wagyu.Peer do
   # The longest a peer waits for the wall clock to reach its initiation's
   # timestamp: two TAI64N rounding steps, in nanoseconds.
   @max_timestamp_wait 2 * 0x1000000
+  # How long a cookie keys MAC2 after it arrives (COOKIE_REFRESH_TIME).
+  @cookie_lifetime 120_000
 
   @slots [:next, :current, :previous]
   # The order in which timers due at the same moment run: an attempt that
@@ -227,6 +238,9 @@ defmodule Wagyu.Peer do
       handoffs: handoffs,
       staging: staging,
       mac1_key: Packet.mac1_key(peer.public_key),
+      cookie_key: Cookie.key(peer.public_key),
+      cookie: nil,
+      last_mac1: nil,
       endpoint: Map.get(args, :endpoint) || endpoint(peer.endpoint),
       initiation: nil,
       received: nil,
@@ -322,10 +336,11 @@ defmodule Wagyu.Peer do
   end
 
   defp respond(state, session, index, %{sender_index: remote_index, timestamp: timestamp, source: source}) do
-    case Noise.write_response(session, index, remote_index, state.mac1_key) do
+    case Noise.write_response(session, index, remote_index, state.mac1_key, cookie(state)) do
       {:ok, frame} ->
         state =
           state
+          |> sent_mac1(frame)
           |> received_authenticated()
           |> install_next(key_pair(session, index, remote_index, state.clock.(), false))
           |> new_key_pair()
@@ -366,10 +381,11 @@ defmodule Wagyu.Peer do
     case Interface.allocate_initiation(state.root, state.public_key) do
       {:ok, index, timestamp} ->
         session = Noise.initiator(state.identity, state.public_key, state.peer.preshared_key)
-        frame = Noise.write_initiation(session, index, timestamp, state.mac1_key)
+        frame = Noise.write_initiation(session, index, timestamp, state.mac1_key, cookie(state))
         :ok = wait_for(timestamp)
         initiation = %{session: session, local_index: index, timestamp: timestamp, sent_at: state.clock.()}
-        state = transmit(%{discard_initiation(state) | initiation: initiation}, frame, :initiations_sent)
+        state = %{discard_initiation(state) | initiation: initiation} |> sent_mac1(frame)
+        state = transmit(state, frame, :initiations_sent)
         set_timer(state, :retry, state.handshake_sent_at + @rekey_timeout + jitter())
 
       :error ->
@@ -403,9 +419,33 @@ defmodule Wagyu.Peer do
     case Packet.decode(frame) do
       {:ok, %Response{} = response} -> response(state, index, response, source)
       {:ok, %Transport{} = transport} -> transport(state, index, transport, source)
-      # Cookie replies wait for cookie support.
-      _cookie_reply -> dropped(state)
+      {:ok, %CookieReply{} = reply} -> cookie_reply(state, reply)
+      _unexpected -> dropped(state)
     end
+  end
+
+  # Cookies
+
+  defp cookie_reply(%{last_mac1: <<_::binary-16>> = mac1} = state, reply) do
+    case Cookie.open(reply, state.cookie_key, mac1) do
+      {:ok, cookie} -> count(%{state | cookie: {cookie, state.clock.()}, last_mac1: nil}, :cookie_replies_accepted)
+      :error -> state |> count(:cookie_replies_invalid) |> dropped()
+    end
+  end
+
+  defp cookie_reply(state, _reply), do: state |> count(:cookie_replies_invalid) |> dropped()
+
+  # The latest cookie while it is younger than COOKIE_REFRESH_TIME, or nil.
+  defp cookie(%{cookie: {cookie, received_at}} = state) do
+    if state.clock.() - received_at < @cookie_lifetime, do: cookie
+  end
+
+  defp cookie(_state), do: nil
+
+  # A cookie reply to a handshake message is encrypted with its MAC1.
+  defp sent_mac1(state, frame) do
+    {:ok, mac1} = Packet.mac1(frame)
+    %{state | last_mac1: mac1}
   end
 
   defp response(state, index, response, source) do
