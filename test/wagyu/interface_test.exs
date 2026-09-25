@@ -174,6 +174,16 @@ defmodule Wagyu.InterfaceTest do
       assert options[:buffer] >= 65_507
       assert options[:recbuf] >= 65_536
     end
+
+    test "stops when its socket closes", context do
+      interface = child(context.interface, :interface)
+      %{socket: socket} = :sys.get_state(interface)
+      monitor = Process.monitor(interface)
+
+      :ok = :gen_udp.close(socket)
+
+      assert_receive {:DOWN, ^monitor, :process, ^interface, {:shutdown, {:socket_closed, :closed}}}
+    end
   end
 
   defp sample(interface, supervisor, maxima) do

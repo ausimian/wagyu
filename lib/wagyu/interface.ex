@@ -115,11 +115,17 @@ defmodule Wagyu.Interface do
   # OTP 27 gives a UDP socket an 8 KiB receive buffer, which a burst of
   # small datagrams overflows while the interface is busy; OTP 28 leaves the
   # OS default. Set it explicitly so the interface behaves the same on both.
-  # The kernel may cap it lower. The driver's own buffer must hold the
+  # The kernel may cap it lower. The backend's own buffer must hold the
   # largest datagram whole: a transport message is up to the MTU plus 32
   # bytes, and the MTU may be up to 65,475.
   @recbuf 1_048_576
   @buffer 65_535
+  # The socket backend sends from the calling process through the socket
+  # NIF, about a quarter faster per datagram than the inet driver. Peers
+  # send their own datagrams on this socket, so they get that too. Before
+  # OTP 27.2 (kernel 10.2) the backend sets `ipv6_v6only` only after binding,
+  # which fails, so an IPv6 socket there keeps the inet driver.
+  @v6only_before_bind [10, 2]
   # How long after a peer with a persistent keepalive fails the interface
   # starts it again, so a peer that fails at once cannot spin.
   @peer_restart 1_000
@@ -363,6 +369,9 @@ defmodule Wagyu.Interface do
            root: root,
            config: config,
            socket: socket,
+           # The backend's socket is not linked to its owner, so a monitor
+           # reports that it closed.
+           socket_monitor: :inet.monitor(socket),
            port: port,
            mac1_key: Packet.mac1_key(config.public_key),
            egress: egress,
@@ -536,14 +545,17 @@ defmodule Wagyu.Interface do
     {:noreply, schedule_expiry(%{state | indices: indices, expiry_timer: nil})}
   end
 
-  def handle_info({:EXIT, socket, reason}, %{socket: socket} = state),
+  def handle_info({:DOWN, monitor, _type, _socket, reason}, %{socket_monitor: monitor} = state),
     do: {:stop, {:shutdown, {:socket_closed, reason}}, state}
 
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
+  # A socket that has just closed may exit before it answers the close.
   def terminate(_reason, state) do
     :gen_udp.close(state.socket)
+  catch
+    :exit, _reason -> :ok
   end
 
   @impl true
@@ -829,8 +841,17 @@ defmodule Wagyu.Interface do
 
   defp open_socket(%{address: address, port: port}) do
     family = if tuple_size(address) == 4, do: [:inet], else: [:inet6, ipv6_v6only: true]
-    options = [:binary, ip: address, active: @active, recbuf: @recbuf, buffer: @buffer] ++ family
+    # The backend option must come first.
+    options = [{:inet_backend, inet_backend(address)}, :binary, ip: address, active: @active]
+    options = options ++ [recbuf: @recbuf, buffer: @buffer] ++ family
     open_socket(port, options, @bind_attempts)
+  end
+
+  defp inet_backend(address) when tuple_size(address) == 4, do: :socket
+
+  defp inet_backend(_address) do
+    kernel = :kernel |> Application.spec(:vsn) |> to_string() |> String.split(".") |> Enum.map(&String.to_integer/1)
+    if kernel >= @v6only_before_bind, do: :socket, else: :inet
   end
 
   defp open_socket(port, options, attempts) do
