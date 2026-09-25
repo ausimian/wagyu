@@ -4,6 +4,7 @@ defmodule Wagyu.InterfaceTest do
   import Wagyu.TestHelpers
 
   alias Wagyu.Admission
+  alias Wagyu.EgressCredit
   alias Wagyu.Packet
 
   setup context do
@@ -228,23 +229,34 @@ defmodule Wagyu.InterfaceTest do
                counters(context.interface, &(&1.egress_routed + &1.egress_unroutable == 3))
     end
 
-    test "bounds each peer's outbound queue", context do
+    test "a peer that falls behind holds egress back in the stack instead of dropping it", context do
+      %{credit: credit} = :sys.get_state(child(context.interface, :interface))
       socket = open_udp(context.stack)
       send_egress(socket, 1)
       counters(context.interface, &(&1.egress_routed == 1))
       %{pid: peer, outbound: outbound} = peer(context.interface, context.peer_key)
       assert eventually(fn -> Admission.usage(outbound) == {0, 0} end)
+      assert eventually(fn -> EgressCredit.outstanding(credit) == {0, 0} end)
 
+      # The stack sends only as much as the link's credit, which fits the
+      # peer's queue, and the rest waits in the socket.
       :ok = :sys.suspend(peer)
-      send_egress(socket, 200)
+      sender = Task.async(fn -> send_egress(socket, 200) end)
+      assert eventually(fn -> match?({128, _bytes}, Admission.usage(outbound)) end)
+      assert {128, _bytes} = EgressCredit.outstanding(credit)
+      assert {:ok, %{egress: 129, egress_dropped: 0}} = Wagyu.Link.counters(context.interface)
+      assert %{egress_routed: 129, egress_peer_dropped: 0} = counters(context.interface)
 
-      assert %{egress_routed: 129, egress_peer_dropped: 72} =
-               counters(context.interface, &(&1.egress_routed + &1.egress_peer_dropped == 201))
-
-      assert {128, _bytes} = Admission.usage(outbound)
-
+      # The peer has no key, so it stages what it takes, within its own
+      # bound, and each packet it takes frees credit for the next.
       :ok = :sys.resume(peer)
+      assert :ok = Task.await(sender)
+
+      assert %{egress_routed: 201, egress_peer_dropped: 0, staged_dropped: 73} =
+               counters(context.interface, &(&1.egress_routed == 201 and &1.staged_dropped == 73))
+
       assert eventually(fn -> Admission.usage(outbound) == {0, 0} end)
+      assert eventually(fn -> EgressCredit.outstanding(credit) == {0, 0} end)
     end
 
     # Killing the peer logs its exit.
@@ -263,11 +275,15 @@ defmodule Wagyu.InterfaceTest do
       Process.exit(peer, :kill)
 
       # The first packet, which the peer took, was waiting for a key, so it
-      # is lost with the peer too.
+      # is lost with the peer too. The ten it never took free their credit.
       assert %{egress_routed: 11, egress_peer_dropped: 11} =
                counters(context.interface, &(&1.egress_peer_dropped == 11))
 
       assert running_peers(context.interface) == []
+      %{credit: credit} = :sys.get_state(child(context.interface, :interface))
+      assert EgressCredit.outstanding(credit) == {0, 0}
+      send_egress(socket, 1)
+      assert %{egress_routed: 12} = counters(context.interface, &(&1.egress_routed == 12))
     end
 
     # Killing the interface logs its exit.
@@ -289,26 +305,52 @@ defmodule Wagyu.InterfaceTest do
              end)
     end
 
-    test "the link drops egress beyond what the interface has queued", context do
+    test "an interface that falls behind holds egress back in the stack instead of dropping it", context do
       interface = child(context.interface, :interface)
-      %{egress: egress} = :sys.get_state(interface)
+      %{egress: egress, credit: credit} = :sys.get_state(interface)
 
       :ok = :sys.suspend(interface)
-      send_egress(open_udp(context.stack), 300)
+      sender = Task.async(fn -> send_egress(open_udp(context.stack), 300) end)
 
-      assert eventually(fn ->
-               match?({:ok, %{egress: 300, egress_dropped: 44}}, Wagyu.Link.counters(context.interface))
-             end)
-
-      assert {256, _bytes} = Admission.usage(egress)
+      assert eventually(fn -> match?({128, _bytes}, Admission.usage(egress)) end)
+      assert {128, _bytes} = EgressCredit.outstanding(credit)
+      assert {:ok, %{egress: 128, egress_dropped: 0}} = Wagyu.Link.counters(context.interface)
 
       :ok = :sys.resume(interface)
+      assert :ok = Task.await(sender)
 
-      counters =
-        counters(context.interface, &(&1.egress_routed + &1.egress_peer_dropped == 256))
+      counters = counters(context.interface, &(&1.egress_routed == 300))
+      assert %{egress_peer_dropped: 0, egress_unroutable: 0} = counters
+      assert {:ok, %{egress: 300, egress_dropped: 0}} = Wagyu.Link.counters(context.interface)
+      assert eventually(fn -> Admission.usage(egress) == {0, 0} end)
+      assert eventually(fn -> EgressCredit.outstanding(credit) == {0, 0} end)
+    end
 
-      assert counters.egress_unroutable == 0
-      assert Admission.usage(egress) == {0, 0}
+    # Killing the interface logs its exit.
+    @tag :capture_log
+    test "the stack gets back the credit of egress lost with an interface", context do
+      interface = child(context.interface, :interface)
+      socket = open_udp(context.stack)
+
+      # The suspended interface holds all the credit when it is killed.
+      :ok = :sys.suspend(interface)
+      sender = Task.async(fn -> send_egress(socket, 129) end)
+      assert eventually(fn -> match?({:ok, %{egress: 128}}, Wagyu.Link.counters(context.interface)) end)
+      Process.exit(interface, :kill)
+      assert :ok = Task.await(sender)
+
+      # The 129th goes out once the link grants the lost credit again, to
+      # the new interface or, before it registers, to be dropped.
+      assert eventually(fn ->
+               match?(
+                 {:ok, %{egress: 129, egress_dropped: dropped}} when dropped >= 128,
+                 Wagyu.Link.counters(context.interface)
+               )
+             end)
+
+      assert eventually(fn -> child(context.interface, :interface) != interface end)
+      send_egress(socket, 1)
+      assert counters(context.interface, &(&1.egress_routed >= 1))
     end
   end
 end

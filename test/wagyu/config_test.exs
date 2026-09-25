@@ -360,7 +360,7 @@ defmodule Wagyu.ConfigTest do
       assert Config.new(options(stack: [mtu: 1420, mtu: 1500])) == invalid([:stack, :mtu], :duplicate)
       assert Config.new(options(stack: [name: :stack])) == invalid([:stack, :name], :unknown)
 
-      for key <- [:egress, :limits, :link_down] do
+      for key <- [:egress, :egress_credit, :limits, :link_down] do
         assert Config.new(options(stack: [{key, :stop}])) == invalid([:stack, key], :reserved)
       end
     end

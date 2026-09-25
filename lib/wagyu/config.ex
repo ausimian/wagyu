@@ -33,8 +33,8 @@ defmodule Wagyu.Config do
         fits the largest IPv4 UDP payload (65,507 bytes). Defaults to 1420, as
         in wg-quick.
 
-      Wagyu sets SmolNet's `:egress`, `:limits` and `:link_down` options
-      itself, so passing them is an error. Addresses and routes follow
+      Wagyu sets SmolNet's `:egress`, `:egress_credit`, `:limits` and
+      `:link_down` options itself, so passing them is an error. Addresses and routes follow
       SmolNet's own checks, so a configuration that passes here is one
       SmolNet accepts: no multicast or IPv4-mapped IPv6 addresses, no IPv4
       broadcast interface address or gateway, and no unspecified gateway.
@@ -109,7 +109,7 @@ defmodule Wagyu.Config do
 
   @options [:name, :private_key, :listen, :stack, :peers]
   @stack_options [:addresses, :routes, :mtu]
-  @reserved_stack_options [:egress, :limits, :link_down]
+  @reserved_stack_options [:egress, :egress_credit, :limits, :link_down]
   @peer_options [:public_key, :endpoint, :allowed_ips, :preshared_key, :persistent_keepalive]
   @endpoint_options [:address, :port]
 

@@ -62,6 +62,15 @@ defmodule Wagyu.Interface do
   # the only process that starts peers, so there is at most one per key.
   # Every send to a peer is admitted against that peer's bound first.
   # Messages that cannot be admitted or acted on are dropped and counted.
+  # Egress also counts against the link's credit (`Wagyu.EgressCredit`)
+  # while the interface or a peer's queue holds it, so that the stack sends
+  # no more than they have room for. The interface records the credit each
+  # peer holds, what it has admitted to the peer's queue and not yet
+  # retired. When the peer has taken a batch (`outbound_taken/2`), the
+  # interface retires whatever the queue no longer holds, and when the peer
+  # goes, all of it. The queue's own count is the only one the peer
+  # changes, so this is exact however the peer exits. Whenever the interface
+  # retires credit it tells the link.
   #
   # A peer that has been idle long enough to discard its keys asks to be
   # forgotten (`release_peer/3`) and exits once it is. The interface agrees
@@ -85,10 +94,12 @@ defmodule Wagyu.Interface do
   alias Wagyu.AllowedIPs
   alias Wagyu.Config
   alias Wagyu.Cookie
+  alias Wagyu.EgressCredit
   alias Wagyu.HandshakeQueue
   alias Wagyu.HandshakeSupervisor
   alias Wagyu.IndexTable
   alias Wagyu.IP
+  alias Wagyu.Link
   alias Wagyu.Packet
   alias Wagyu.Packet.{CookieReply, Initiation, Response, Transport}
   alias Wagyu.PeerSupervisor
@@ -215,16 +226,18 @@ defmodule Wagyu.Interface do
   @doc """
   Admits egress packets from the link and sends them to `root`'s interface,
   in order. Returns how many were refused because its queue was full or no
-  interface is running, and the interface and queue that took the rest, so
-  that the link can account for them if that interface exits first.
+  interface is running, and the interface, queue and credit count that took
+  the rest, so that the link can account for them, and grant credit back as
+  they leave, or when that interface exits.
   """
-  @spec deliver(term(), [binary()]) :: {non_neg_integer(), {pid(), Admission.t()} | nil}
+  @spec deliver(term(), [binary()]) :: {non_neg_integer(), {pid(), Admission.t(), EgressCredit.t()} | nil}
   def deliver(root, packets) do
     case Wagyu.Registry.lookup(root, :interface) do
-      {:ok, interface, %{egress: egress}} ->
+      {:ok, interface, %{egress: egress, credit: credit}} ->
         {admitted, refused} = Admission.admit_prefix(egress, packets)
+        EgressCredit.take(credit, admitted)
         if admitted != [], do: send(interface, {:wg_egress, admitted})
-        {refused, {interface, egress}}
+        {refused, {interface, egress, credit}}
 
       :error ->
         {length(packets), nil}
@@ -321,6 +334,21 @@ defmodule Wagyu.Interface do
     do: :counters.add(counters, Keyword.fetch!(@counters, name), increment)
 
   @doc """
+  Tells `root`'s interface that the calling peer, the running peer for
+  `public_key`, has taken outbound packets off its queue, so that their
+  egress credit is free again.
+  """
+  @spec outbound_taken(term(), <<_::256>>) :: :ok
+  def outbound_taken(root, public_key) do
+    case Wagyu.Registry.lookup(root, :interface) do
+      {:ok, interface, _value} -> send(interface, {:wg_outbound_taken, public_key, self()})
+      :error -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Forgets the calling peer, the running peer for `public_key`, which then
   exits: traffic for it starts a new process, with `endpoint` as its
   endpoint unless that is nil, and its indices are retired.
@@ -362,7 +390,8 @@ defmodule Wagyu.Interface do
     case open_socket(config.listen) do
       {:ok, socket, port} ->
         egress = Admission.new(@egress_packets, @egress_bytes)
-        :ok = Wagyu.Registry.register(root, :interface, %{egress: egress})
+        credit = EgressCredit.new()
+        :ok = Wagyu.Registry.register(root, :interface, %{egress: egress, credit: credit})
 
         {:ok,
          %{
@@ -375,6 +404,7 @@ defmodule Wagyu.Interface do
            port: port,
            mac1_key: Packet.mac1_key(config.public_key),
            egress: egress,
+           credit: credit,
            counters: :counters.new(length(@counters), []),
            handshakes: HandshakeQueue.new(),
            cookies: Cookie.checker(config.public_key),
@@ -494,7 +524,17 @@ defmodule Wagyu.Interface do
   # the link counts the rest as dropped. At most the share being forwarded
   # at that instant may be counted twice.
   def handle_info({:wg_egress, packets}, state) do
-    {:noreply, packets |> route(state) |> Enum.reduce(state, &forward/2)}
+    {state, forwarded} = packets |> route(state) |> Enum.reduce({state, 0}, &forward/2)
+    # The rest were dropped, and the link may grant their credit again.
+    if forwarded < length(packets), do: retired(state)
+    {:noreply, state}
+  end
+
+  def handle_info({:wg_outbound_taken, key, pid}, state) do
+    case state.peers do
+      %{^key => %{pid: ^pid}} -> {:noreply, settle_peer(state, key)}
+      _not_this_peer -> {:noreply, state}
+    end
   end
 
   def handle_info({:DOWN, monitor, :process, pid, reason}, state) do
@@ -744,28 +784,62 @@ defmodule Wagyu.Interface do
       _unroutable ->
         count(state, :egress_unroutable)
         Admission.release(state.egress, 1, byte_size(packet))
+        EgressCredit.retire(state.credit, 1, byte_size(packet))
         :error
     end
   end
 
   # A peer's packets are admitted in order until one does not fit, as the
   # link admits egress, and go to it as one message.
-  defp forward({key, packets}, state) do
-    {refused, state} =
+  defp forward({key, packets}, {state, forwarded}) do
+    {admitted, state} =
       case ensure_peer(state, key) do
         {:ok, peer, state} ->
-          {admitted, refused} = Admission.admit_prefix(peer.outbound, packets)
+          {admitted, _refused} = Admission.admit_prefix(peer.outbound, packets)
           if admitted != [], do: send(peer.pid, {:wg_outbound, admitted})
-          {refused, state}
+          {credited_packets, credited_bytes} = peer.credited
+          credited = {credited_packets + length(admitted), credited_bytes + Admission.bytes(admitted)}
+          {length(admitted), put_in(state.peers[key].credited, credited)}
 
         {:error, state} ->
-          {length(packets), state}
+          {0, state}
       end
 
-    add(state, :egress_routed, length(packets) - refused)
-    add(state, :egress_peer_dropped, refused)
+    add(state, :egress_routed, admitted)
+    add(state, :egress_peer_dropped, length(packets) - admitted)
     Admission.release_all(state.egress, packets)
-    state
+    EgressCredit.retire_all(state.credit, Enum.drop(packets, admitted))
+    {state, forwarded + admitted}
+  end
+
+  # Tells the link that egress credit is free again.
+  defp retired(state) do
+    with {:ok, link} <- Link.lookup(state.root), do: Link.retired(link)
+  end
+
+  # Retires the credit of what the peer's queue no longer holds. Only the
+  # peer releases from the queue, so its count can only fall between
+  # reads, and what is retired has left it.
+  defp settle_peer(state, key) do
+    peer = Map.fetch!(state.peers, key)
+    {held_packets, held_bytes} = Admission.usage(peer.outbound)
+    {credited_packets, credited_bytes} = peer.credited
+    taken = {credited_packets - held_packets, credited_bytes - held_bytes}
+
+    if taken == {0, 0} do
+      state
+    else
+      EgressCredit.retire(state.credit, elem(taken, 0), elem(taken, 1))
+      retired(state)
+      put_in(state.peers[key].credited, {held_packets, held_bytes})
+    end
+  end
+
+  # Retires all the credit a peer that is being forgotten still holds.
+  defp retire_peer(state, peer) do
+    {credited_packets, credited_bytes} = peer.credited
+    EgressCredit.retire(state.credit, credited_packets, credited_bytes)
+    if peer.credited != {0, 0}, do: retired(state)
   end
 
   # Returns the peer's process, starting it if it is not running. Egress and
@@ -796,7 +870,15 @@ defmodule Wagyu.Interface do
     case PeerSupervisor.start_peer(state.root, args) do
       {:ok, pid} ->
         monitor = Process.monitor(pid)
-        peer = %{pid: pid, inbound: inbound, outbound: outbound, staging: staging, handoffs: handoffs}
+
+        peer = %{
+          pid: pid,
+          inbound: inbound,
+          outbound: outbound,
+          staging: staging,
+          handoffs: handoffs,
+          credited: {0, 0}
+        }
 
         {:ok, peer,
          %{state | peers: Map.put(state.peers, key, peer), monitors: Map.put(state.monitors, monitor, {:peer, key})}}
@@ -807,9 +889,10 @@ defmodule Wagyu.Interface do
   end
 
   # Packets admitted to a peer that it never took, or that it staged and
-  # never sent, were lost with it; its queues' counts say how many. Its indices become tombstones, so messages
-  # for them drop here and none is reused while the remote party may still
-  # send to it.
+  # never sent, were lost with it; its queues' counts say how many. All the
+  # credit it held is free again. Its indices become
+  # tombstones, so messages for them drop here and none is reused while the
+  # remote party may still send to it.
   #
   # A peer that was released has been forgotten already, and another
   # process may hold its key by now.
@@ -820,6 +903,7 @@ defmodule Wagyu.Interface do
         {lost_staged, _bytes} = Admission.usage(peer.staging)
         {lost_inbound, _bytes} = Admission.usage(peer.inbound)
         add(state, :egress_peer_dropped, lost_outbound + lost_staged)
+        retire_peer(state, peer)
         add(state, :inbound_peer_dropped, lost_inbound)
         indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
         {:ok, config} = Config.fetch_peer(state.config, key)
@@ -832,6 +916,7 @@ defmodule Wagyu.Interface do
   end
 
   defp release(state, key, pid, endpoint) do
+    retire_peer(state, Map.fetch!(state.peers, key))
     indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
     endpoints = if endpoint, do: Map.put(state.endpoints, key, endpoint), else: state.endpoints
     schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices, endpoints: endpoints})

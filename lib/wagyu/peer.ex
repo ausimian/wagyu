@@ -17,6 +17,9 @@ defmodule Wagyu.Peer do
   # releases a handoff as it takes it off the mailbox, each outbound packet
   # just before it sends or stages it, and each frame once it is done with
   # it, which for a data packet is once the packet has gone to the link.
+  # Once it has taken an outbound batch it tells the interface
+  # (`Wagyu.Interface.outbound_taken/2`), which frees the link's egress
+  # credit for what the queue no longer holds.
   #
   # Responding. After the interface authorizes an initiation for this peer,
   # the handshake worker hands its responder session, which has this peer's
@@ -331,7 +334,11 @@ defmodule Wagyu.Peer do
     {:noreply, state}
   end
 
-  defp handle({:wg_outbound, packets}, state), do: {:noreply, state |> send_packets(packets) |> arm()}
+  defp handle({:wg_outbound, packets}, state) do
+    state = send_packets(state, packets)
+    Interface.outbound_taken(state.root, state.public_key)
+    {:noreply, arm(state)}
+  end
 
   # The armed process timer, or one that has been replaced since. Either
   # way only the timers already due run.
