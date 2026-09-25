@@ -75,6 +75,10 @@ child.
 
 ### Connect through the tunnel with `:gen_tcp`
 
+> **Not yet working:** this example needs the encrypted data path
+> ([#7](https://github.com/ausimian/wagyu/issues/7)). Until it lands, peers
+> drop every packet, so `:gen_tcp.connect/4` times out.
+
 `Wagyu.stack/1` returns the interface's network stack. Pass it, together with
 SmolNet's TCP module, in the options of an ordinary `:gen_tcp` call, and that
 socket's traffic goes through the tunnel:
