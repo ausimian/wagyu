@@ -105,4 +105,5 @@ queued work.
 
 MIT. See [LICENSE](LICENSE).
 
-Working on Wagyu itself? See [MAINTAINING.md](MAINTAINING.md).
+Working on Wagyu itself? See
+[MAINTAINING.md](https://github.com/ausimian/wagyu/blob/main/MAINTAINING.md).
