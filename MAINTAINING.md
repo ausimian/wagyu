@@ -25,7 +25,9 @@ performs, in order:
 2. `deps.unlock --unused`, which removes unused entries from `mix.lock`
 3. `format`, which rewrites any unformatted files
 4. `credo --strict`
-5. `test`
+5. `docs --warnings-as-errors`, which fails on any documentation warning,
+   such as a public type that refers to a hidden module
+6. `test`
 
 Run the whole alias rather than picking individual steps, so none is missed.
 Because `deps.unlock` and `format` rewrite files, review the working tree
