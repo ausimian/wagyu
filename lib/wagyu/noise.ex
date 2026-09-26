@@ -169,14 +169,15 @@ defmodule Wagyu.Noise do
   message to `receiver_index`. Its counter is the session's next outbound
   nonce.
 
-  Returns `:error`, with nothing encrypted, once that counter reaches
-  REJECT_AFTER_MESSAGES (2^64 - 2^13 - 1).
+  Returns `:error`, with nothing to send, once that counter reaches
+  REJECT_AFTER_MESSAGES (2^64 - 2^13 - 1). The counter is still consumed,
+  so every later call returns `:error` too.
   """
   @spec seal(Decibel.session(), IndexTable.index(), iodata()) :: {:ok, binary()} | :error
   def seal(session, receiver_index, plaintext) do
-    case Decibel.nonce(session, :out) do
-      counter when counter < @reject_after_messages ->
-        packet = session |> Decibel.encrypt(plaintext, "") |> IO.iodata_to_binary()
+    case Decibel.encrypt_with_nonce(session, plaintext, "") do
+      {counter, packet} when counter < @reject_after_messages ->
+        packet = IO.iodata_to_binary(packet)
         {:ok, Packet.encode(%Transport{receiver_index: receiver_index, counter: counter, encrypted_packet: packet})}
 
       _exhausted ->
@@ -194,8 +195,7 @@ defmodule Wagyu.Noise do
   """
   @spec open(Decibel.session(), Transport.t()) :: {:ok, binary()} | :error
   def open(session, %Transport{counter: counter, encrypted_packet: packet}) when counter < @reject_after_messages do
-    :ok = Decibel.set_nonce(session, :in, counter)
-    {:ok, session |> Decibel.decrypt(packet, "") |> IO.iodata_to_binary()}
+    {:ok, session |> Decibel.decrypt(packet, "", nonce: counter) |> IO.iodata_to_binary()}
   rescue
     Decibel.DecryptionError -> :error
   end
