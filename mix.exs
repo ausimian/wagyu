@@ -37,7 +37,7 @@ defmodule Wagyu.MixProject do
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:decibel, ">= 1.1.1 and < 2.0.0"},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
+      {:ex_doc, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:excoveralls, "~> 0.18", only: :test},
       {:publisho, "~> 1.0", only: :dev, runtime: false},
       {:smolnet, "~> 0.5.0"}
@@ -49,7 +49,14 @@ defmodule Wagyu.MixProject do
 
   defp aliases do
     [
-      precommit: ["compile --warnings-as-errors", "deps.unlock --unused", "format", "credo --strict", "test"],
+      precommit: [
+        "compile --warnings-as-errors",
+        "deps.unlock --unused",
+        "format",
+        "credo --strict",
+        "docs --warnings-as-errors",
+        "test"
+      ],
       release: ["deps.get", "compile", "release"]
     ]
   end
