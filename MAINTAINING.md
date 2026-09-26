@@ -84,6 +84,9 @@ runs `mix precommit` on Linux and macOS for each of these Elixir/OTP pairs:
 `test/interop/go.mod` and sets `WAGYU_INTEROP=1`, so every job runs the interop
 tests.
 
+`.github/workflows/release.yml` runs when a release tag is pushed and
+publishes to Hex.pm; see [Releasing](#releasing).
+
 ## Design and roadmap
 
 The architecture, protocol decisions and implementation order are in the
@@ -93,7 +96,8 @@ its own issue linked from there, and its body is the spec for that work.
 ## Making changes
 
 - Work on a branch and merge through a pull request. Don't commit directly to
-  `main`.
+  `main`. The one exception is the version commit Publisho makes when
+  releasing; see [Releasing](#releasing).
 - Write commit messages as [Conventional Commits](https://www.conventionalcommits.org/).
 - Add user-visible changes to `RELEASE.md` under Keep a Changelog headings
   (`### Added`, `### Changed`, `### Fixed`, and so on). These notes become the
@@ -101,12 +105,32 @@ its own issue linked from there, and its body is the spec for that work.
 
 ## Releasing
 
-Wagyu has not been released, and there is no release workflow yet.
+Wagyu has not been released yet.
 
 `@version` in `mix.exs` is the single source of truth for the version.
-Releases use [Publisho](https://hex.pm/packages/publisho):
-`mix publisho <level>` updates `@version`, moves the `RELEASE.md` notes into
-`CHANGELOG.md` at its `<!-- %% CHANGELOG_ENTRIES %% -->` placeholder, and
-creates a version commit and an annotated tag. Tags are bare semver, with no
-`v` prefix. Publisho doesn't push the commit or the tag, and publishing to
-Hex.pm isn't automated yet.
+Releases use [Publisho](https://hex.pm/packages/publisho) and the release
+workflow:
+
+1. On an up-to-date `main` with the release notes in `RELEASE.md`, run
+   `mix publisho <level>`. It updates `@version`, moves the `RELEASE.md` notes
+   into `CHANGELOG.md` at its `<!-- %% CHANGELOG_ENTRIES %% -->` placeholder,
+   and creates a version commit and an annotated tag. Tags are bare semver,
+   with no `v` prefix.
+2. Run `git push --follow-tags` to push the version commit and its tag
+   together. This goes straight to `main`, without a pull request: the
+   commit changes only the version and the release notes, and the tag must
+   point at a commit already on `main` for the workflow to publish.
+
+Pushing a tag of the form `X.Y.Z` or `X.Y.Z-*` starts
+`.github/workflows/release.yml`, which publishes the package and its docs to
+Hex.pm. Before publishing it checks that:
+
+- the `HEX_API_KEY` repository secret is set;
+- the tag equals `@version` in `mix.exs`;
+- the tagged commit is on `main`, so its code has been through a pull
+  request and the CI matrix;
+- `mix hex.audit` and `mix precommit`, with the interop tests, pass on
+  Elixir 1.19.5 and OTP 28.3, and leave the tree unchanged.
+
+If any check fails, nothing is published. `HEX_API_KEY` must be a Hex API key
+with publish rights for the `wagyu` package.
