@@ -137,13 +137,34 @@ defmodule Wagyu.Packet do
     <<@cookie_reply, 0, 0, 0, receiver::little-32, nonce::binary, cookie::binary>>
   end
 
-  def encode(%Transport{receiver_index: receiver, counter: counter, encrypted_packet: packet})
-      when is_index(receiver) and is_integer(counter) and counter >= 0 and counter < @reject_after_messages and
-             is_binary(packet) and byte_size(packet) >= @tag_size do
-    <<@transport, 0, 0, 0, receiver::little-32, counter::little-64, packet::binary>>
+  def encode(%Transport{receiver_index: receiver, counter: counter, encrypted_packet: packet}) when is_binary(packet) do
+    encode_transport(receiver, counter, packet)
   end
 
   def encode(message), do: raise(ArgumentError, "invalid WireGuard message: " <> inspect(message))
+
+  @doc """
+  Encodes a transport message whose encrypted packet is iodata, copying it
+  once, straight into the frame. `encode/1` would need it flattened into a
+  binary first, and then copy it again behind the header.
+
+  Raises `ArgumentError` if `receiver` is not an index, `counter` is
+  negative or at or above the reject limit, or `packet` is not iodata or is
+  shorter than the AEAD tag.
+  """
+  @spec encode_transport(non_neg_integer(), non_neg_integer(), iodata()) :: binary()
+  def encode_transport(receiver, counter, packet)
+      when is_index(receiver) and is_integer(counter) and counter >= 0 and counter < @reject_after_messages and
+             (is_binary(packet) or is_list(packet)) do
+    case IO.iodata_to_binary([<<@transport, 0, 0, 0, receiver::little-32, counter::little-64>>, packet]) do
+      <<_header::binary-16, packet::binary>> = frame when byte_size(packet) >= @tag_size -> frame
+      _short -> raise ArgumentError, "transport packet is shorter than the #{@tag_size}-byte tag"
+    end
+  end
+
+  def encode_transport(receiver, counter, _packet) do
+    raise ArgumentError, "invalid transport message to #{inspect(receiver)} at counter #{inspect(counter)}"
+  end
 
   @doc """
   Returns the MAC1 key for messages sent to the holder of `public_key`:
