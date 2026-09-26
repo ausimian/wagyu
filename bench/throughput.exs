@@ -53,8 +53,8 @@ defmodule Wagyu.Bench.Throughput do
   @doc """
   Opens `streams` connections from `from` to a listener on `to`, each end
   held by its own process. Runs reuse them: a TCP socket that closes first
-  keeps one of its stack's 64 socket slots through TIME_WAIT, for up to 30
-  seconds, so a connection per run would soon exhaust them.
+  keeps one of its stack's 64 socket slots, the default, through TIME_WAIT,
+  for about 10 seconds, so a connection per run would soon exhaust them.
   """
   def connect(%{from: from, to: to, address: address}, streams) do
     port = 10_000 + rem(System.unique_integer([:positive, :monotonic]), 50_000)

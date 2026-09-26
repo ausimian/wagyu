@@ -1,18 +1,10 @@
 # Wagyu
 
 Wagyu is a user-mode [WireGuard](https://www.wireguard.com/) endpoint for
-[SmolNet](https://github.com/ausimian/smolnet) application sockets, written in
-Elixir. It carries IPv4 and IPv6 packets between a SmolNet network stack and
-WireGuard peers over one UDP socket, with no host TUN device.
-
-> **Status:** Wagyu is under development and not yet on Hex. An interface
-> starts under supervision with its UDP socket and SmolNet stack, completes
-> WireGuard handshakes with its configured peers in both directions, and
-> carries TCP and UDP traffic for sockets on its stack, interoperating with
-> wireguard-go. Handshakes are retried and keys replaced on WireGuard's
-> timers, with optional persistent keepalives, and defended with cookies
-> under load. Progress is tracked in
-> [#2](https://github.com/ausimian/wagyu/issues/2).
+`:gen_tcp` and `:gen_udp` sockets, written in Elixir. It needs no TUN device,
+root or kernel module: the sockets run on a userspace TCP/IP stack,
+[SmolNet](https://github.com/ausimian/smolnet), and Wagyu carries their packets
+to WireGuard peers over one UDP socket.
 
 ## Why
 
@@ -36,14 +28,30 @@ routing or how the rest of the node connects.
 
 ### Installation
 
-Wagyu is not on Hex yet, so add it from GitHub:
+Add `wagyu` to your dependencies in `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:wagyu, github: "ausimian/wagyu"}
+    {:wagyu, "~> 0.2.0"}
   ]
 end
+```
+
+### Keys
+
+Keys are raw 32-byte binaries. `wg genkey`, `wg pubkey` and `wg genpsk`
+print them in base64, so decode those:
+
+```elixir
+local_private_key = Base.decode64!("yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=")
+```
+
+Or generate a key pair in Elixir, and give the public key to the peer as
+`Base.encode64(public_key)`:
+
+```elixir
+{public_key, local_private_key} = :crypto.generate_key(:ecdh, :x25519)
 ```
 
 ### Start an interface
@@ -74,6 +82,8 @@ under its own supervisor:
 
 A peer may also have a `:preshared_key`, the 32-byte key `wg genpsk` makes,
 which both sides must configure alike. `Wagyu.Config` describes every option.
+An interface's configuration is fixed once it starts; to change it, stop the
+interface and start it again.
 
 To run it in your own supervision tree instead, list `{Wagyu, options}` as a
 child.
@@ -112,7 +122,7 @@ queued work.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/ausimian/wagyu/blob/main/LICENSE).
 
 Working on Wagyu itself? See
 [MAINTAINING.md](https://github.com/ausimian/wagyu/blob/main/MAINTAINING.md).

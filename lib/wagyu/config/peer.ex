@@ -1,12 +1,13 @@
 defmodule Wagyu.Config.Peer do
   @moduledoc """
-  A validated peer definition.
+  A peer in a `Wagyu.Config`, built by `Wagyu.Config.new/1` from the
+  `:peers` option.
 
-  `:allowed_ips` holds normalized prefixes (host bits cleared) in configured
-  order. `:endpoint` is `nil` for a responder-only peer. `:preshared_key` is
-  the configured key, or 32 zero bytes for none. The struct's `Inspect`
-  implementation omits it, with the limits described in `Wagyu.Config`.
-  `:persistent_keepalive` is in seconds, `0` for none.
+  The fields hold the validated option values. `:allowed_ips` has host bits
+  cleared and keeps the order given. `:endpoint` is `nil` when none is
+  configured, `:preshared_key` is 32 zero bytes when none is configured, and
+  `:persistent_keepalive` is `0` when it is off. `inspect/2` hides the
+  preshared key, with the same limits as `Wagyu.Config`.
   """
 
   @derive {Inspect, except: [:preshared_key]}

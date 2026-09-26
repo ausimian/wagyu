@@ -72,8 +72,9 @@ scenario's median rate in MiB/s and the packets the interface dropped.
 
 Both ends share one VM, so the rates are a loopback figure for two
 interfaces, not the capacity of one. Each scenario opens its connections
-once and reuses them for every run: a SmolNet stack has 64 socket slots,
-and a closed TCP socket holds one through TIME_WAIT.
+once and reuses them for every run: the stacks have the default 64 socket
+slots, and a closed TCP socket holds one through TIME_WAIT, about 10
+seconds.
 
 ## CI
 

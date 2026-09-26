@@ -1,57 +1,18 @@
 defmodule Wagyu do
   @moduledoc """
-  A user-mode WireGuard endpoint for SmolNet application sockets.
+  A user-mode WireGuard endpoint for `:gen_tcp` and `:gen_udp` sockets.
 
-  A Wagyu interface carries complete IPv4 and IPv6 packets between one SmolNet
-  network stack and its WireGuard peers over a single UDP socket. There is no
-  host TUN device: only sockets opened on the interface's stack use the
-  tunnel.
-
-  > #### Status {: .warning}
-  >
-  > An interface completes WireGuard handshakes with its configured peers,
-  > both ways, and carries the TCP and UDP traffic of sockets opened on its
-  > stack. It retries, rekeys and sends keepalives on WireGuard's timers,
-  > and defends its handshakes with cookies under load. Changing the
-  > configuration while running is not supported yet.
-
-  ## Timers
-
-  Peers follow WireGuard's timers, as wireguard-go does:
-
-    * A packet sent to a peer with no usable key waits while the peer
-      starts a handshake. An initiation that gets no response is sent again
-      every 5 seconds plus up to 333 ms of random jitter, for 90 seconds
-      from the last packet that had to wait; then the waiting packets are
-      dropped. A peer never sends handshake messages less than 5 seconds
-      apart.
-    * The initiator of a handshake replaces its keys once they are 120
-      seconds old or have sent 2^60 messages, when it next sends, or at 165
-      seconds if it is only receiving. A responder replaces its keys only
-      after 2^60 messages; its initiator replaces them on time. No key is
-      used 180 seconds after its handshake or beyond 2^64 - 2^13 - 1
-      messages, whatever the traffic, and it is then discarded.
-    * A peer that has received data and sent nothing for 10 seconds sends
-      an empty keepalive, and one that has sent data and heard nothing for
-      15 seconds starts a new handshake. Otherwise an idle peer is quiet,
-      unless it has a persistent keepalive (see `Wagyu.Config`).
-    * 540 seconds after a peer's last handshake, or after its last attempt
-      ran out, it discards all its keys and, unless it has a persistent
-      keepalive, its process exits. The next packet for it, or initiation
-      from it, starts it again, with the endpoint it last had.
-
-  Timers use the monotonic clock, so changing the system time neither
-  extends a key's life nor delays a timer.
+  Wagyu needs no TUN device. Each interface runs its own userspace TCP/IP
+  stack, provided by SmolNet, and sends that stack's IPv4 and IPv6 packets to
+  its WireGuard peers over a single UDP socket. Only sockets opened on the
+  stack use the tunnel; the rest of the node is unaffected.
 
   ## Starting an interface
 
-  `Wagyu.start_link(options)` validates `options`, described in
-  `Wagyu.Config`, and starts the interface's own supervisor linked to the
-  caller. On success it returns `{:ok, pid}`, where `pid` is that
-  per-interface supervisor, whether or not a `:name` is given. Invalid options
-  fail startup with the error `Wagyu.Config.new/1` returns, such as
-  `{:error, {:invalid_option, [:private_key], :missing}}`. `start_link/1` also accepts a
-  configuration that `Wagyu.Config.new/1` has already validated.
+  `start_link/1` validates the options, described in `Wagyu.Config`, and
+  starts a supervisor for the interface, linked to the caller. It returns
+  `{:ok, pid}` with that supervisor's PID, whether or not you give a
+  `:name`. It also accepts a `Wagyu.Config` from `Wagyu.Config.new/1`.
 
       {:ok, interface} =
         Wagyu.start_link(
@@ -72,14 +33,17 @@ defmodule Wagyu do
           ]
         )
 
-  If the interface cannot open its UDP socket or start its stack, startup
-  fails with the supervisor's usual
-  `{:error, {:shutdown, {:failed_to_start_child, child, reason}}}`, for
-  example with `reason` `:eaddrinuse` when the listen port is taken.
+  The configuration is fixed once the interface starts. To change it, stop
+  the interface and start it again.
 
-  To run an interface in your own supervision tree instead, list
-  `{Wagyu, options}` as a child. `Wagyu.child_spec(options)` returns a spec
-  that starts the same per-interface supervisor through `start_link`:
+  Invalid options return the error from `Wagyu.Config.new/1`, such as
+  `{:error, {:invalid_option, [:private_key], :missing}}`. If the UDP socket
+  or the stack can't start, `start_link/1` returns the usual supervisor
+  error, `{:error, {:shutdown, {:failed_to_start_child, child, reason}}}`;
+  for example, `reason` is `:eaddrinuse` if the listen port is taken.
+
+  To run an interface under your own supervisor, add `{Wagyu, options}` as a
+  child:
 
       children = [
         {Wagyu, name: :wg0, private_key: local_private_key, peers: peers}
@@ -87,107 +51,132 @@ defmodule Wagyu do
 
       Supervisor.start_link(children, strategy: :one_for_one)
 
-  `child_spec/1` validates the options when it builds the spec and raises
-  `ArgumentError` if they are invalid. Its message names the error that
-  `Wagyu.Config.new/1` returns, and like that error it never includes option
-  values. The spec's start argument is the validated `Wagyu.Config`, not the
-  options, so the private key is not stored in the spec in raw form.
+  `child_spec/1` validates the options and raises `ArgumentError` if they
+  are invalid. The message never includes option values. The spec carries
+  the validated `Wagyu.Config` rather than the options, so supervisor
+  reports don't show the private key.
 
   ## Names and handles
 
-  The optional `:name` registers the per-interface supervisor under a standard
-  OTP name: an atom for local registration, `{:global, term}`, or
-  `{:via, module, term}`. A name that is already registered fails startup with
-  the usual `{:error, {:already_started, pid}}`. The name is released when the
-  interface stops or crashes.
+  `:name` registers the interface's supervisor as a local atom,
+  `{:global, term}` or `{:via, module, term}`. If the name is taken, startup
+  fails with `{:error, {:already_started, pid}}`. The name is released when
+  the interface stops or crashes.
 
-  `Wagyu.stack(interface)`, `Wagyu.info(interface)` and
-  `Wagyu.stop(interface)` accept either the PID that `start_link` returned or
-  the registered name. A name is resolved when each call is made, as
-  `GenServer.whereis/1` does, so it always refers to whichever interface
-  currently holds it; a PID refers to one started interface. When a
-  supervisor restarts an interface, the new one has a new PID but the same
-  name, so long-lived callers should hold the name. Each returns
-  `{:error, :not_running}` when no interface is running under that PID or
-  name, and `stack/1` and `info/1` also return it while the interface is
-  restarting.
+  `stack/1`, `info/1` and `stop/1` take either the PID from `start_link/1`
+  or the name. A name is looked up on every call, so it always refers to the
+  interface currently registered under it. A restarted interface has a new
+  PID but keeps its name, so long-lived code should hold on to the name. All
+  three return `{:error, :not_running}` if no interface is running under
+  that PID or name; `stack/1` and `info/1` also return it while the
+  interface restarts.
 
-    * `Wagyu.stack(interface)` returns `{:ok, stack}`, the SmolNet stack
-      reference to open sockets on, for example with
-      `SmolNet.open(:inet, :stream, :tcp, stack: stack)`. The interface is
-      the stack's only packet feeder; use the reference for socket calls,
-      not `SmolNet.ingress/2`.
-    * `Wagyu.info(interface)` returns `{:ok, info}` with counters, peer state
-      and public keys. It never includes private keys, preshared keys or
-      session keys. See `t:info/0`.
-    * `Wagyu.stop(interface)` stops the interface, its UDP socket and its
-      stack, and returns `:ok`. An interface under your own supervisor is a
-      permanent child by default and is restarted; remove it with
+    * `stack/1` returns `{:ok, stack}`, the SmolNet stack to open sockets
+      on, for example with `SmolNet.open(:inet, :stream, :tcp, stack: stack)`.
+      Use it only for sockets: the interface feeds the stack its packets, so
+      don't call `SmolNet.ingress/2` on it.
+    * `info/1` returns `{:ok, info}` with counters, peer state and public
+      keys, and never private, preshared or session keys. See `t:info/0`.
+    * `stop/1` stops the interface, its UDP socket and its stack, and
+      returns `:ok`. An interface under your own supervisor is a permanent
+      child, so that supervisor restarts it; use
       `Supervisor.terminate_child/2` instead.
 
   ## Failure and restart
 
-  The interface's supervisor owns the SmolNet stack and the processes that
-  run the protocol. If the stack, or the process that feeds it packets, fails,
-  the whole interface restarts with a new stack and every socket opened on the
-  old one becomes invalid: fetch the new stack with `Wagyu.stack(interface)`
-  and reopen them. This includes a stack stopped with `SmolNet.stop_stack/1`.
-  A failure elsewhere in the interface restarts the protocol processes and
-  loses their sessions, but keeps the stack and its open sockets; peers then
-  complete fresh handshakes.
+  If the stack fails, or the process that feeds it packets does, the whole
+  interface restarts with a new stack. That includes a stack stopped with
+  `SmolNet.stop_stack/1`. Sockets on the old stack stop working: get the new
+  stack with `stack/1` and reopen them.
+
+  Any other failure inside the interface restarts the protocol processes but
+  keeps the stack and its sockets. Sessions are lost, and peers complete new
+  handshakes.
+
+  ## Timers
+
+  Peers follow WireGuard's timers, the same as wireguard-go:
+
+    * **Handshakes.** A packet for a peer with no usable key waits while the
+      peer starts a handshake. An unanswered initiation is resent every 5
+      seconds, plus up to 333 ms of jitter, for 90 seconds after the last
+      packet that had to wait; then the waiting packets are dropped. A peer
+      never sends handshake messages less than 5 seconds apart.
+    * **Rekeying.** The peer that started a handshake starts a new one when
+      it sends under keys 120 seconds old, or receives under keys 165
+      seconds old. Either side rekeys after 2^60 messages. Keys are never
+      used more than 180 seconds after their handshake or for more than
+      2^64 - 2^13 - 1 messages; they are then discarded.
+    * **Keepalives.** A peer that has received data but sent nothing for 10
+      seconds sends an empty keepalive. One that has sent data but received
+      nothing for 15 seconds starts a new handshake. Otherwise an idle peer
+      sends nothing, unless it has a persistent keepalive (see
+      `Wagyu.Config`).
+    * **Expiry.** 540 seconds after a peer's last handshake, or after its
+      last handshake attempt gives up, the peer discards its keys, and its
+      process exits unless it has a persistent keepalive. The next packet
+      for the peer, or initiation from it, starts it again with its last
+      endpoint.
+
+  Timers use the monotonic clock, so changing the system time doesn't
+  affect them.
 
   ## Bounded work
 
-  Every queue between the interface's own processes has a fixed bound, and
-  anything beyond it is dropped and counted rather than queued: datagrams
-  are read from the socket a bounded batch at a time, at most 8 handshake
-  workers run with at most 64 initiations waiting, and each peer queues at
-  most 128 packets or 256 KiB in each direction, and as many again waiting
-  for a key to send them with. At most 32 packets reach the stack in one
-  ingress call, one call at a time.
+  Every queue inside an interface has a fixed size. Anything that doesn't
+  fit is dropped and counted in `info/1`:
 
-  Handshake cryptography for initiations that arrive runs only in the
-  workers, never in the process that reads the socket, so a flood of
-  initiations cannot hold up other datagrams. An initiation is accepted
-  only from a configured peer, only with a timestamp later than any
-  accepted from that peer before, and at most once every 20 ms per peer, as
-  in wireguard-go and Linux. The interface keeps these timestamps until it
-  restarts, so a replay is refused even after the peer's own process
-  restarts. At most 2 accepted handshakes wait for each peer's process,
-  apart from its other queues; beyond that, new ones are refused until it
-  catches up.
+    * Datagrams are read from the socket in batches of bounded size.
+    * Up to 8 handshake workers run, with up to 64 initiations waiting.
+    * Each peer queues up to 128 packets or 256 KiB in each direction, plus
+      as many again waiting for a key.
+    * Up to 2 accepted handshakes wait for each peer's process.
+    * The stack receives at most 32 packets per call, one call at a time.
 
-  Under load, while 8 or more initiations wait for a worker or a worker
-  cannot be started, and for a second after, as in wireguard-go and Linux,
-  the interface does no handshake cryptography for an initiation or
-  response unless its MAC2 was made with the cookie for the address it
-  came from. One without gets a cookie reply, encrypted with
-  XChaCha20-Poly1305, and its sender must retry with the cookie; one with
-  it goes on at most 20 times a second, in bursts of 5, from each IPv4
-  address or IPv6 /64. A cookie is bound to the source address and port,
-  and expires when the interface replaces its cookie secret, 120 seconds
-  after making it. A handshake message whose MAC1 is not for this
-  interface is never answered. The other way round, a cookie reply from a
-  peer under load keys MAC2 on the handshake messages sent to that peer
-  for 120 seconds.
+  Handshake cryptography runs in the workers, never in the process reading
+  the socket, so a flood of initiations can't hold up other traffic. As in
+  wireguard-go and Linux, an initiation is accepted only if it comes from a
+  configured peer, its timestamp is later than any accepted from that peer,
+  and it arrives at least 20 ms after the peer's last one. The interface
+  remembers timestamps until it restarts, so a replayed initiation is
+  refused even if the peer's process has restarted.
 
-  The stack's own output is bounded before it is sent. The stack holds
-  SmolNet egress credit for at most 128 packets or 256 KiB between it and
-  the peers that encrypt them, and gets credit back only as they are sent,
-  wait for a key, or are dropped. So none of the interface's queues
-  overflows with outbound packets, and what the stack cannot send yet
-  waits in its sockets: TCP keeps the data in its send buffer and slows
-  down as it would for a slow network, and a UDP send waits for room in
-  its socket.
+  ### Under load
+
+  The interface is under load while 8 or more initiations are waiting for a
+  worker, or a worker can't start, and for one second after. As in
+  wireguard-go and Linux, it then does no handshake cryptography for an
+  initiation or response unless its MAC2 was made with a cookie for its
+  source address:
+
+    * A message without one gets a cookie reply, encrypted with
+      XChaCha20-Poly1305, and the sender must retry with the cookie.
+    * Messages with one are limited to 20 a second, in bursts of 5, per
+      IPv4 address or IPv6 /64.
+    * Cookies are bound to the source address and port, and expire within
+      120 seconds, when the interface replaces its cookie secret.
+
+  A handshake message with an invalid MAC1 is never answered, under load or
+  not. In the other direction, when a peer gets a cookie reply from a remote
+  party under load, it adds MAC2 to the handshake messages it sends there
+  for the next 120 seconds.
+
+  ### Outbound flow control
+
+  The stack can have at most 128 packets or 256 KiB in flight to the peers,
+  and gets credit back as each packet is sent, set aside to wait for a key,
+  or dropped. Outbound packets therefore never overflow the interface's
+  queues. Data the stack can't send yet stays in its sockets: TCP holds it
+  in the send buffer and slows down as it would on a slow network, and a UDP
+  send waits until there's room.
 
   ## Keys and logs
 
-  The private key and preshared keys stay out of logs. Supervisors hold the
-  validated `Wagyu.Config` rather than the raw options, and processes that
-  hold keys replace them with `:redacted` in their status and crash reports.
-  Supervisor reports format the configuration through its `Inspect`
-  implementation, which omits keys; see `Wagyu.Config` for what bypasses it,
-  such as a handler configured with Erlang's own formatter.
+  The private key and preshared keys are kept out of logs. Supervisors hold
+  the validated `Wagyu.Config`, whose `Inspect` implementation hides the
+  keys, and processes that hold keys show them as `:redacted` in their
+  status and crash reports. Some log formatting bypasses `Inspect`, such as
+  a handler that uses Erlang's own formatter; see `Wagyu.Config`.
   """
 
   alias Wagyu.Config
@@ -199,108 +188,106 @@ defmodule Wagyu do
   What `info/1` returns.
 
     * `:public_key` - the interface's public key
-    * `:listen` - the UDP socket's local address and bound port, which
-      differs from the configured port when that is `0`
+    * `:listen` - the UDP socket's address and port. If the configured port
+      is `0`, this is the port the OS chose.
     * `:peers` - each configured peer's public key, configured endpoint and
       AllowedIPs, sorted by public key, and whether its process is
-      `:running`. Peer processes start when outbound traffic or an accepted
-      handshake initiation first needs them.
-    * `:counters` - packet counters. The link's (`:egress`, `:egress_dropped`,
-      `:ingress`, `:ingress_dropped`) last as long as the stack; the others
-      reset when the interface restarts.
+      `:running`. A peer's process starts when outbound traffic or an
+      accepted handshake first needs it.
+    * `:counters` - the counters below. The link's counters (`:egress`,
+      `:egress_dropped`, `:ingress` and `:ingress_dropped`) last as long as
+      the stack; the rest reset when the interface restarts.
 
   The counters are:
 
     * `:datagrams` - UDP datagrams received
-    * `:invalid_datagrams` - datagrams that are not well-formed WireGuard
-      messages
-    * `:invalid_mac1` - handshake messages whose MAC1 does not match this
-      interface's public key
-    * `:initiations` - handshake initiations handed to a worker
-    * `:initiations_dropped` - initiations refused because the handshake
+    * `:invalid_datagrams` - datagrams that aren't valid WireGuard messages
+    * `:invalid_mac1` - handshake messages with a MAC1 that doesn't match
+      this interface's public key
+    * `:initiations` - handshake initiations passed to a worker
+    * `:initiations_dropped` - initiations dropped because the handshake
       queue was full
     * `:initiations_failed` - initiations that failed authentication, or
       whose worker failed
     * `:initiations_unknown_peer` - authenticated initiations from a key
-      that is not a configured peer
-    * `:initiations_replayed` - initiations whose timestamp was not later
-      than the last one accepted from their peer
-    * `:initiations_rate_limited` - initiations less than 20 ms after the
-      last one accepted from their peer
-    * `:initiations_unavailable` - initiations whose peer process could not
-      be started or already had as many handshakes waiting as it may
-    * `:initiations_accepted` - initiations authorized and passed to their
+      that isn't a configured peer
+    * `:initiations_replayed` - initiations whose timestamp wasn't later
+      than the last one accepted from the same peer
+    * `:initiations_rate_limited` - initiations that arrived less than 20 ms
+      after the last one accepted from the same peer
+    * `:initiations_unavailable` - initiations whose peer process couldn't
+      start or already had 2 handshakes waiting
+    * `:initiations_accepted` - initiations accepted and passed to their
       peer's process
-    * `:cookie_replies_sent` - cookie replies sent, under load, to
-      initiations and responses with a valid MAC1 but no valid MAC2
+    * `:cookie_replies_sent` - cookie replies sent under load to initiations
+      and responses with a valid MAC1 but no valid MAC2
     * `:handshakes_rate_limited` - initiations and responses with a valid
-      MAC2, under load, refused because their source address had used its
-      budget of 20 a second, in bursts of 5
+      MAC2 refused under load because their source had used up its 20 a
+      second, in bursts of 5
     * `:unknown_index` - responses, cookie replies and transport messages
-      for a receiver index with no live peer, including one retired in the
-      last 180 seconds
+      for a receiver index that no live peer holds, including indices
+      retired in the last 180 seconds
     * `:inbound_routed` - responses, cookie replies and transport messages
       queued for the peer holding their receiver index
-    * `:inbound_peer_dropped` - those dropped because the peer's queue was
-      full or it exited before taking them
-    * `:initiations_sent` - handshake initiations sent to peers
-    * `:initiations_no_endpoint` - handshakes that a peer needed but could
-      not start, because it has no endpoint: none configured, and none
-      learned from an initiation it accepted
-    * `:responses_sent` - handshake responses sent to accepted initiations
-    * `:responses_accepted` - responses that authenticated and completed a
-      handshake this interface initiated
-    * `:responses_invalid` - responses that reached their peer but were not
-      for its handshake in progress or did not authenticate
-    * `:cookie_replies_accepted` - cookie replies from peers that decrypted
-      with the MAC1 of the last handshake message sent to them, whose
-      cookie then keys MAC2
+    * `:inbound_peer_dropped` - the same messages, dropped because the
+      peer's queue was full or the peer exited first
+    * `:initiations_sent` - handshake initiations sent
+    * `:initiations_no_endpoint` - handshakes a peer needed but couldn't
+      start because it has no endpoint, either configured or learned from
+      an initiation
+    * `:responses_sent` - handshake responses sent
+    * `:responses_accepted` - responses that completed a handshake this
+      interface started
+    * `:responses_invalid` - responses that reached their peer but didn't
+      match its current handshake or didn't authenticate
+    * `:cookie_replies_accepted` - cookie replies that answered the last
+      handshake message sent to their peer and decrypted; the peer then uses
+      the cookie for MAC2
     * `:cookie_replies_invalid` - cookie replies that reached their peer but
-      did not decrypt, or came after one for the same message was taken
-    * `:keepalives_sent` - empty transport messages sent to confirm a
-      handshake this interface initiated, to answer data after 10 seconds
-      of silence, or as persistent keepalives
+      didn't decrypt, or arrived after one for the same message had been
+      accepted
+    * `:keepalives_sent` - keepalives sent to confirm a handshake this
+      interface started, to answer data after 10 seconds of silence, or as
+      persistent keepalives
     * `:keys_confirmed` - handshakes this interface responded to whose keys
-      the initiator confirmed with its first transport message, after which
-      the responder sends with them
+      the initiator confirmed with its first transport message; only then
+      does this side send with them
     * `:transport_invalid` - transport messages that reached their peer but
-      did not authenticate under any of its keys
-    * `:transport_replayed` - transport messages refused, before
-      decryption, because their counter was already accepted or is too old
-      for the key's replay window
+      didn't authenticate under any of its keys
+    * `:transport_replayed` - transport messages refused before decryption
+      because their counter had already been seen or was too old for the
+      replay window
     * `:transport_expired` - transport messages refused because their key
-      is 180 seconds old or more
+      was 180 seconds old or more
     * `:transport_sent` - packets encrypted and sent to peers
-    * `:transport_received` - packets that authenticated, came from an
-      address in their peer's AllowedIPs and were queued for the stack; the
-      link counts those it could not queue in `:ingress_dropped`
-    * `:keepalives_received` - authenticated empty transport messages
-    * `:transport_malformed` - authenticated packets that are not valid IP,
-      including those whose IP length exceeds the decrypted data
-    * `:transport_source_denied` - authenticated packets whose source
-      address is not in their peer's AllowedIPs
-    * `:staged_dropped` - packets dropped because their peer had no usable
-      key and already held as many packets waiting for one as it may (128
-      packets or 256 KiB), or because its handshake attempt ran out while
-      they waited. A peer's total outbound loss is this plus
-      `:egress_peer_dropped`.
+    * `:transport_received` - packets that authenticated, came from their
+      peer's AllowedIPs and were queued for the stack. Packets the link
+      couldn't queue are counted in `:ingress_dropped`.
+    * `:keepalives_received` - keepalives received
+    * `:transport_malformed` - authenticated packets that aren't valid IP,
+      including those whose IP length exceeds the data
+    * `:transport_source_denied` - authenticated packets from a source
+      outside their peer's AllowedIPs
+    * `:staged_dropped` - packets dropped while waiting for a key, because
+      the peer already had 128 packets or 256 KiB waiting, or its handshake
+      attempt gave up. Add `:egress_peer_dropped` for a peer's total
+      outbound loss.
     * `:handshakes_abandoned` - handshake attempts that got no response in
-      the 90 seconds they are retried for
-    * `:send_errors` - datagrams that a peer failed to send
+      90 seconds of retries
+    * `:send_errors` - datagrams a peer failed to send
     * `:egress` - packets the stack sent
-    * `:egress_dropped` - packets the stack sent that were dropped because
-      the interface was restarting or exited before taking them
-    * `:egress_unroutable` - packets with a malformed IP header or no
-      matching AllowedIPs prefix
+    * `:egress_dropped` - packets from the stack dropped because the
+      interface was restarting or had exited
+    * `:egress_unroutable` - packets from the stack with a malformed IP
+      header or no matching AllowedIPs prefix
     * `:egress_routed` - packets queued for their peer
-    * `:egress_peer_dropped` - packets dropped on the way to their peer:
-      because the peer's process could not start, or it exited before
-      taking them or while they waited for a key. Packets the peer took but had no room to keep
-      waiting for a key are counted in `:staged_dropped` instead, so the
-      two never count the same packet.
+    * `:egress_peer_dropped` - packets dropped on the way to their peer,
+      because its process couldn't start, or exited before taking them or
+      while they waited for a key. Packets the peer had no room to hold are
+      counted in `:staged_dropped` instead.
     * `:ingress` - packets the stack accepted
-    * `:ingress_dropped` - packets bound for the stack that were dropped,
-      because the link's queue was full or the stack refused them
+    * `:ingress_dropped` - packets for the stack dropped because the link's
+      queue was full or the stack refused them
   """
   @type info :: %{
           public_key: <<_::256>>,

@@ -16,7 +16,7 @@ defmodule Wagyu.MixProject do
       package: package(),
       source_url: @source_url,
       test_coverage: [tool: ExCoveralls],
-      docs: [source_ref: @version, source_url: @source_url]
+      docs: docs()
     ]
   end
 
@@ -61,9 +61,18 @@ defmodule Wagyu.MixProject do
     ]
   end
 
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md", "CHANGELOG.md"],
+      source_ref: @version,
+      source_url: @source_url
+    ]
+  end
+
   defp package do
     [
-      description: "A user-mode WireGuard endpoint for SmolNet application sockets.",
+      description: "A user-mode WireGuard endpoint for :gen_tcp and :gen_udp sockets.",
       files: ~w(.formatter.exs CHANGELOG.md LICENSE README.md lib mix.exs),
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url}

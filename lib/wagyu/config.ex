@@ -2,97 +2,91 @@ defmodule Wagyu.Config do
   @moduledoc """
   Validated configuration for one Wagyu interface.
 
-  `new/1` checks the options accepted by `Wagyu.start_link(options)` and
-  returns a `Wagyu.Config` struct, or an error that names the offending
-  option. Peers are static: the configuration is validated once and never
-  changes while the interface runs.
+  `new/1` validates the options that `Wagyu.start_link/1` takes and returns
+  a `Wagyu.Config` struct, or an error naming the first invalid option.
+  `Wagyu.start_link/1` and `Wagyu.child_spec/1` call it for you, so call it
+  yourself only to check options ahead of time.
 
   ## Options
 
-    * `:private_key` (required) - the interface's 32-byte X25519 private key.
-      The matching public key is derived and stored as `:public_key`.
+    * `:private_key` (required) - the interface's X25519 private key, as a
+      raw 32-byte binary. Decode a key from `wg genkey` with
+      `Base.decode64!/1`. The public key is derived from it.
 
-    * `:name` - registers the interface's root supervisor under a standard OTP
-      name: an atom, `{:global, term}` or `{:via, module, term}`.
+    * `:name` - a name to register the interface under: an atom,
+      `{:global, term}` or `{:via, module, term}`.
 
-    * `:listen` - the UDP socket's local endpoint, `%{address: address, port:
-      port}`, where `port` is in `0..65535` and `0` lets the OS choose.
-      Defaults to `%{address: {0, 0, 0, 0}, port: 0}`. The address family
-      (IPv4 or IPv6) is the family every peer endpoint must use.
+    * `:listen` - the local address and port of the interface's UDP socket,
+      as `%{address: address, port: port}`. Port `0` lets the OS choose.
+      Defaults to `%{address: {0, 0, 0, 0}, port: 0}`. Peer endpoints must
+      use the same address family.
 
-    * `:stack` - a keyword list of SmolNet stack options:
+    * `:stack` - options for the interface's SmolNet stack:
 
-      * `:addresses` - at most 8 interface addresses, as `{address,
-        prefix_length}`. Defaults to `[]`.
-      * `:routes` - at most 4 routes, as `{destination, prefix_length,
-        gateway}`, where the gateway has the destination's family.
-        Destinations are normalized. Defaults to `[]`.
-      * `:mtu` - the stack's MTU, from 1280 to 65,475. Transport plaintext is
-        padded to a multiple of 16 bytes but never beyond the MTU, so a
-        full-size packet plus WireGuard's 32 bytes of framing and tag still
-        fits the largest IPv4 UDP payload (65,507 bytes). Defaults to 1420, as
-        in wg-quick.
-      * `:sockets` - the most sockets the stack holds at once, from 1 to
-        512. Defaults to 64, as in SmolNet. Each TCP or UDP socket takes a
-        slot, as does each member of a TCP listener's accept pool (up to 4)
-        and each interface address that a UDP socket bound to a wildcard
-        address listens on. A TCP socket that closes first keeps its slot
-        until TIME-WAIT ends, about 10 seconds after the close, so an
-        application that opens and closes connections sustains about
-        `sockets / 10` new ones a second. An open beyond the limit returns
-        `{:error, :system_limit}`. A slot holds its socket's buffers until
-        it is freed: 128 KiB for a TCP socket at SmolNet's default buffer
-        sizes and 32 KiB for a UDP socket, so 512 TCP sockets can hold about
-        64 MiB. Whatever the limit, SmolNet caps a stack's socket buffers at
-        128 MiB in total, and an open past that also returns `{:error,
-        :system_limit}`.
+      * `:addresses` - up to 8 `{address, prefix_length}` pairs. Defaults
+        to `[]`.
+      * `:routes` - up to 4 `{destination, prefix_length, gateway}` routes.
+        The gateway must be in the same address family as the destination.
+        Host bits in the destination are cleared. Defaults to `[]`.
+      * `:mtu` - from 1280 to 65,475. Defaults to 1420, the same as
+        wg-quick.
+      * `:sockets` - the maximum number of open sockets, from 1 to 512.
+        Defaults to 64. Opening a socket beyond the limit returns
+        `{:error, :system_limit}`.
+
+        * Each TCP or UDP socket uses one slot. So does each connection in
+          a TCP listener's accept pool (up to 4), and each interface address
+          that a UDP socket bound to a wildcard address listens on.
+        * A TCP socket that closes first holds its slot through TIME-WAIT,
+          about 10 seconds. An application that keeps opening and closing
+          connections can open about `sockets / 10` a second.
+        * Each slot holds its socket's buffers: 128 KiB for TCP and 32 KiB
+          for UDP at SmolNet's default sizes, so 512 TCP sockets use about
+          64 MiB. SmolNet also caps a stack's buffers at 128 MiB in total,
+          and opening a socket past that returns `{:error, :system_limit}`
+          too.
 
       Wagyu sets SmolNet's `:egress`, `:egress_credit`, `:limits` and
-      `:link_down` options itself, so passing them is an error; `:sockets`
-      reaches SmolNet within the `:limits` Wagyu sets. Addresses and routes follow
-      SmolNet's own checks, so a configuration that passes here is one
-      SmolNet accepts: no multicast or IPv4-mapped IPv6 addresses, no IPv4
-      broadcast interface address or gateway, and no unspecified gateway.
+      `:link_down` options itself, and rejects them here. Addresses and
+      routes must also pass SmolNet's own checks: multicast and
+      IPv4-mapped IPv6 addresses are rejected, as is `255.255.255.255` as
+      an address or gateway, and `0.0.0.0` or `::` as a gateway.
 
-    * `:peers` - at most 1024 peer maps, each with:
+    * `:peers` - up to 1024 peers, each a map with:
 
-      * `:public_key` (required) - the peer's 32-byte X25519 public key,
-        distinct from every other peer's and from the interface's own. A
-        low-order point, such as 32 zero bytes, is not a key any handshake
-        can use, so it is `:invalid`.
-      * `:endpoint` - `%{address: address, port: port}` with `port` in
-        `1..65535`, a specified address, and the listen address's family.
-        Omit it (or pass `nil`) when the peer always initiates, so that this
-        interface only responds to it.
-      * `:allowed_ips` - the `{address, prefix_length}` prefixes the peer may
-        send from and that route to it. Host bits are cleared. Nested prefixes
-        are allowed and the longest match wins, but an exact prefix may appear
-        only once across all peers. Defaults to `[]`.
-      * `:preshared_key` - a 32-byte symmetric key shared with the peer,
-        as `wg genpsk` makes, mixed into every handshake with it. Both
-        sides must configure the same key: a handshake with a peer whose
-        key differs, or that has none, never completes and yields no key
-        either side sends with. Omit it for no preshared key, which the
-        protocol treats as 32 zero bytes, so an explicit 32 zero bytes also
-        means none, as in WireGuard. A configured key is always used, never
-        replaced by zeros. `nil` is rejected as `:invalid` rather than
-        treated as omitted, so an unset variable cannot quietly disable a
-        key.
-      * `:persistent_keepalive` - seconds, from 1 to 65,535, after which the
-        interface sends the peer a keepalive if nothing else has passed
-        between them, to keep a NAT or firewall mapping open. `0`, the
-        default, sends none. A peer with one starts with the interface and
-        sends its first keepalive then. As in WireGuard, 25 seconds suits
-        most NATs.
+      * `:public_key` (required) - the peer's X25519 public key, as a raw
+        32-byte binary. Each peer's key must be unique and must differ from
+        the interface's own. Keys that can never complete a handshake, such
+        as 32 zero bytes, are rejected.
+      * `:endpoint` - the peer's address and port, as
+        `%{address: address, port: port}`. The port must be from 1 to
+        65535, and the address must be in the listen address's family and
+        not `0.0.0.0` or `::`. Leave it out, or set it to `nil`, for a peer
+        that always connects to this interface; the interface then replies
+        to wherever the peer's handshakes come from.
+      * `:allowed_ips` - the `{address, prefix_length}` prefixes the peer
+        may send from. Packets to these addresses go to the peer. When
+        prefixes overlap, the most specific one wins, but two peers cannot
+        have the same prefix. Host bits are cleared. Defaults to `[]`.
+      * `:preshared_key` - a 32-byte key from `wg genpsk`, added to every
+        handshake with the peer. Both sides must configure the same key, or
+        their handshakes fail. Leave it out, or pass 32 zero bytes, for
+        none. `nil` is rejected, so an unset variable can't silently turn
+        the key off.
+      * `:persistent_keepalive` - sends the peer a keepalive after this many
+        seconds without traffic, to keep NAT and firewall mappings open.
+        From 1 to 65,535; 25 works for most NATs. Defaults to `0`, which
+        turns it off. A peer with a keepalive starts when the interface
+        does.
 
-  Unknown or repeated options fail validation at every level.
+  Unknown and repeated options are rejected at every level.
 
   ## Errors
 
-  `new/1` returns `{:error, {:invalid_option, path, reason}}`.
-  `path` locates the option, with list positions as zero-based indices, for
-  example `[:peers, 1, :allowed_ips, 0]`. Errors never contain option values,
-  so they are safe to log. `reason` is one of:
+  `new/1` returns `{:error, {:invalid_option, path, reason}}`. `path` is
+  where the option is, with zero-based indices for list positions, for
+  example `[:peers, 1, :allowed_ips, 0]`. Errors never include option
+  values, so they are safe to log. `reason` is one of:
 
     * `:missing` - a required option is absent
     * `:unknown` - an unrecognized option
@@ -108,13 +102,10 @@ defmodule Wagyu.Config do
 
   ## Secrets
 
-  The struct's `Inspect` implementation omits the private key and preshared
-  keys, so `inspect/2` with its default options, and anything else that
-  formats the struct through `Inspect`, does not show them. The redaction
-  lives only in that implementation: `inspect(config, structs: false)`,
-  Erlang's own term formatting (`~p`) and direct field access all bypass it
-  and expose the keys. Don't rely on it when logging a configuration any
-  other way.
+  The struct's `Inspect` implementation hides the private key and preshared
+  keys. Other ways of printing the struct don't: `inspect(config,
+  structs: false)`, Erlang's `~p` formatting and reading the fields
+  directly all show the keys, so don't log a configuration that way.
   """
 
   import Bitwise
@@ -175,6 +166,7 @@ defmodule Wagyu.Config do
   @typedoc "The location of an invalid option."
   @type path :: [atom() | non_neg_integer()]
 
+  @typedoc "Why an option is invalid. See the Errors section above."
   @type reason ::
           :missing
           | :unknown
@@ -187,6 +179,7 @@ defmodule Wagyu.Config do
           | :duplicate
           | :local_key
 
+  @typedoc "The error `new/1` returns, safe to log."
   @type error :: {:invalid_option, path(), reason()}
 
   @doc """
@@ -225,12 +218,9 @@ defmodule Wagyu.Config do
     end
   end
 
-  @doc """
-  Looks up a configured peer by public key.
-
-  Only configured keys may create peer state, so an unknown key returns
-  `{:error, :unknown_peer}`.
-  """
+  # Looks up a configured peer by public key. Only configured keys may
+  # create peer state, so an unknown key returns `{:error, :unknown_peer}`.
+  @doc false
   @spec fetch_peer(t(), term()) :: {:ok, Peer.t()} | {:error, :unknown_peer}
   def fetch_peer(%__MODULE__{peers: peers}, public_key) do
     case Map.fetch(peers, public_key) do
