@@ -177,8 +177,7 @@ defmodule Wagyu.Noise do
   def seal(session, receiver_index, plaintext) do
     case Decibel.encrypt_with_nonce(session, plaintext, "") do
       {counter, packet} when counter < @reject_after_messages ->
-        packet = IO.iodata_to_binary(packet)
-        {:ok, Packet.encode(%Transport{receiver_index: receiver_index, counter: counter, encrypted_packet: packet})}
+        {:ok, Packet.encode_transport(receiver_index, counter, packet)}
 
       _exhausted ->
         :error
