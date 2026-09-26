@@ -153,6 +153,9 @@ defmodule Wagyu.Config do
     allowed_ips: %AllowedIPs{}
   ]
 
+  # The AllowedIPs routing table built from the peers, which is internal.
+  @typep allowed_ips :: AllowedIPs.t()
+
   @typedoc "A validated interface configuration. `:peers` maps each public key to its peer."
   @type t :: %__MODULE__{
           name: atom() | {:global, term()} | {:via, module(), term()} | nil,
@@ -166,7 +169,7 @@ defmodule Wagyu.Config do
             sockets: pos_integer()
           ],
           peers: %{optional(<<_::256>>) => Peer.t()},
-          allowed_ips: AllowedIPs.t()
+          allowed_ips: allowed_ips()
         }
 
   @typedoc "The location of an invalid option."
