@@ -142,15 +142,18 @@ options = [
 :ok = :ssl.close(socket)
 ```
 
-Connect to an address: the stack does not resolve names, so `:ssl.connect/4`
-with a host name returns `{:error, :einval}`. `server_name_indication` gives
-`:ssl` the name to send in the handshake and to check the certificate against.
-For a server with a certificate from a private CA, pass that CA with
-`cacertfile` instead of `cacerts`. In an application, list `:ssl` in
-`extra_applications` rather than starting it by hand. For IPv6, use
-`SmolNet.Inet6.Tcp` with `:inet6`. SmolNet's
-[`:ssl` guide](https://hexdocs.pm/smolnet/ssl.html) covers servers, upgrading
-a connected socket, and how errors and timeouts appear.
+- The stack does not resolve names, so connect to an address;
+  `:ssl.connect/4` with a host name returns `{:error, :einval}`.
+  `server_name_indication` gives `:ssl` the name to send in the handshake and
+  to check the certificate against.
+- For a server with a certificate from a private CA, pass that CA with
+  `cacertfile` instead of `cacerts`.
+- In an application, list `:ssl` in `extra_applications` rather than starting
+  it by hand.
+- For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`.
+
+SmolNet's [`:ssl` guide](https://hexdocs.pm/smolnet/ssl.html) covers servers,
+upgrading a connected socket, and how errors and timeouts appear.
 
 ### Inspect and stop an interface
 
