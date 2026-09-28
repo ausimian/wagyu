@@ -40,11 +40,11 @@ defmodule Wagyu.Config do
         * A TCP socket that closes first holds its slot through TIME-WAIT,
           about 10 seconds. An application that keeps opening and closing
           connections can open about `sockets / 10` a second.
-        * Each slot holds its socket's buffers: 128 KiB for TCP and 32 KiB
-          for UDP at SmolNet's default sizes, so 512 TCP sockets use about
-          64 MiB. SmolNet also caps a stack's buffers at 128 MiB in total,
-          and opening a socket past that returns `{:error, :system_limit}`
-          too.
+        * Each slot holds its socket's buffers: 512 KiB for TCP and 32 KiB
+          for UDP at SmolNet's default sizes. SmolNet also caps a stack's
+          buffers at 128 MiB in total, which fits 256 TCP sockets at those
+          sizes, and opening a socket past that returns
+          `{:error, :system_limit}` too.
 
       Wagyu sets SmolNet's `:egress`, `:egress_credit`, `:limits` and
       `:link_down` options itself, and rejects them here. Addresses and
