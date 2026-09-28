@@ -10,7 +10,8 @@ how the rest of the node connects.
   the stack to open sockets on, `Wagyu.info/1` reports counters and peer
   state, and `Wagyu.stop/1` stops the interface.
 - TCP and UDP sockets opened on the stack reach peers through the tunnel, over
-  IPv4 and IPv6, with each packet routed to a peer by its AllowedIPs.
+  IPv4 and IPv6, with each packet routed to a peer by its AllowedIPs. `:ssl`
+  connections run over the same TCP sockets, and the README shows a client.
 - WireGuard handshakes in both directions, preshared keys and roaming
   endpoints, with rekeying, retries and keepalives on WireGuard's timers,
   interoperating with wireguard-go.

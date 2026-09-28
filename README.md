@@ -115,6 +115,48 @@ The options apply to that socket only; the node's other TCP connections are
 unaffected. For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`. The destination
 must be reachable through the stack's routes and a peer's `allowed_ips`.
 
+### Connect with `:ssl`
+
+`:ssl` runs over the same sockets. Give it SmolNet's TCP module as its
+transport, in the `cb_info` option, and the stack as for `:gen_tcp`; the TLS
+options go in the same list:
+
+```elixir
+{:ok, _apps} = Application.ensure_all_started(:ssl)
+{:ok, stack} = Wagyu.stack(:wg0)
+
+options = [
+  {:cb_info, {SmolNet.Inet.Tcp, :tcp, :tcp_closed, :tcp_error}},
+  {:smolnet_stack, stack},
+  :inet,
+  :binary,
+  {:active, false},
+  {:verify, :verify_peer},
+  {:cacerts, :public_key.cacerts_get()},
+  {:server_name_indication, ~c"service.example.com"}
+]
+
+{:ok, socket} = :ssl.connect({10, 13, 0, 1}, 443, options, 5_000)
+:ok = :ssl.send(socket, "hello")
+{:ok, reply} = :ssl.recv(socket, 0, 5_000)
+:ok = :ssl.close(socket)
+```
+
+- The stack does not resolve names, so connect to an address;
+  `:ssl.connect/4` with a host name returns `{:error, :einval}`.
+  `server_name_indication` gives `:ssl` the name to send in the handshake and
+  to check the certificate against.
+- For a server with a certificate from a private CA, pass that CA with
+  `cacertfile` instead of `cacerts`.
+- In an application, list `:ssl` in `extra_applications` rather than starting
+  it by hand.
+- For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`.
+
+SmolNet's [`:ssl` guide](https://hexdocs.pm/smolnet/ssl.html) covers servers,
+upgrading a connected socket, and how errors and timeouts appear.
+
+### Inspect and stop an interface
+
 `Wagyu.info/1` reports counters and peer state, and `Wagyu.stop/1` stops the
 interface. The `Wagyu` and `Wagyu.Config` module documentation covers every
 option, names and handles, failure and restart behaviour, and the limits on
