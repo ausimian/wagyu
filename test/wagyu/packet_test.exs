@@ -169,6 +169,36 @@ defmodule Wagyu.PacketTest do
     end
   end
 
+  describe "encode_transport/3" do
+    test "frames an iodata packet as encode/1 frames it flattened" do
+      packet = bytes(1240)
+      <<a::binary-7, b::binary-600, c::binary>> = packet
+
+      for iodata <- [packet, [a, b, c], [[a], ?x | [binary_part(b, 1, 599), c]]] do
+        flat = IO.iodata_to_binary(iodata)
+        message = %Transport{receiver_index: 9, counter: 5, encrypted_packet: flat}
+        assert Packet.encode_transport(9, 5, iodata) == Packet.encode(message)
+      end
+    end
+
+    test "rejects fields of the wrong size or range" do
+      invalid = [
+        {-1, 1, bytes(16)},
+        {0x100000000, 1, bytes(16)},
+        {9, -1, bytes(16)},
+        {9, @reject_after_messages, bytes(16)},
+        {9, 1, bytes(15)},
+        {9, 1, [bytes(8), bytes(7)]},
+        {9, 1, [:not_iodata, bytes(16)]},
+        {9, 1, nil}
+      ]
+
+      for {receiver, counter, packet} <- invalid do
+        assert_raise ArgumentError, fn -> Packet.encode_transport(receiver, counter, packet) end
+      end
+    end
+  end
+
   describe "MAC1" do
     test "keys are BLAKE2s-256 of the label and public key" do
       assert Packet.mac1_key(@responder_public) == :crypto.hash(:blake2s, "mac1----" <> @responder_public)
