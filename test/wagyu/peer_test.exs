@@ -586,11 +586,15 @@ defmodule Wagyu.PeerTest do
 
     # Killing the peer logs its exit.
     test "an unanswered initiation is retried with jitter for 90 seconds, then its packet is dropped", context do
+      # The attempt starts on the peer's real clock, after the demand and
+      # before its first initiation arrives, and runs for 90 seconds.
+      demanded = System.monotonic_time(:millisecond)
       demand(context)
       first = receive_datagram(context)
+      arrived = System.monotonic_time(:millisecond)
       {peer, clock} = started_peer(context)
-      %{timers: %{give_up: give_up}, handshake_sent_at: started} = :sys.get_state(peer)
-      assert (give_up - started) in 89_900..90_000
+      %{timers: %{give_up: give_up}} = :sys.get_state(peer)
+      assert give_up in (demanded + 90_000)..(arrived + 90_000)
 
       # A new initiation every 5 to 5.333 seconds, each from a new index,
       # all from the same process.
