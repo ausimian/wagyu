@@ -23,7 +23,5 @@ how the rest of the node connects.
 - Bounded queues throughout, with drops counted in `Wagyu.info/1`. TCP slows
   down, rather than losing segments inside the interface, when peers cannot
   keep up.
-- Private and preshared keys stay out of logs, crash reports and
-  `Wagyu.info/1`.
 - Runs on Elixir 1.18 or later with SmolNet 0.7, on macOS on Apple silicon or
   Linux (glibc) on x86_64 or ARM64.
