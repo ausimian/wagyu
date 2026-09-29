@@ -115,6 +115,30 @@ The options apply to that socket only; the node's other TCP connections are
 unaffected. For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`. The destination
 must be reachable through the stack's routes and a peer's `allowed_ips`.
 
+### Send datagrams with `:gen_udp`
+
+UDP works the same way, with SmolNet's UDP module in the `udp_module`
+option:
+
+```elixir
+options = [
+  {:udp_module, SmolNet.Inet.Udp},
+  {:smolnet_stack, stack},
+  :inet,
+  :binary,
+  {:active, false}
+]
+
+{:ok, socket} = :gen_udp.open(0, options)
+:ok = :gen_udp.send(socket, {10, 13, 0, 1}, 53, "query")
+{:ok, {_address, _port, reply}} = :gen_udp.recv(socket, 0, 5_000)
+:ok = :gen_udp.close(socket)
+```
+
+For IPv6, use `SmolNet.Inet6.Udp` with `:inet6`. SmolNet's
+[`:gen_udp` guide](https://hexdocs.pm/smolnet/gen_udp.html) covers active
+mode, connected sockets and the limits on datagram size.
+
 ### Connect with `:ssl`
 
 `:ssl` runs over the same sockets. Give it SmolNet's TCP module as its
