@@ -52,9 +52,7 @@ defmodule Wagyu do
       Supervisor.start_link(children, strategy: :one_for_one)
 
   `child_spec/1` validates the options and raises `ArgumentError` if they
-  are invalid. The message never includes option values. The spec carries
-  the validated `Wagyu.Config` rather than the options, so supervisor
-  reports don't show the private key.
+  are invalid. The message never includes option values.
 
   ## Names and handles
 
@@ -76,7 +74,7 @@ defmodule Wagyu do
       Use it only for sockets: the interface feeds the stack its packets, so
       don't call `SmolNet.ingress/2` on it.
     * `info/1` returns `{:ok, info}` with counters, peer state and public
-      keys, and never private, preshared or session keys. See `t:info/0`.
+      keys. See `t:info/0`.
     * `stop/1` stops the interface, its UDP socket and its stack, and
       returns `:ok`. An interface under your own supervisor is a permanent
       child, so that supervisor restarts it; use
@@ -169,14 +167,6 @@ defmodule Wagyu do
   queues. Data the stack can't send yet stays in its sockets: TCP holds it
   in the send buffer and slows down as it would on a slow network, and a UDP
   send waits until there's room.
-
-  ## Keys and logs
-
-  The private key and preshared keys are kept out of logs. Supervisors hold
-  the validated `Wagyu.Config`, whose `Inspect` implementation hides the
-  keys, and processes that hold keys show them as `:redacted` in their
-  status and crash reports. Some log formatting bypasses `Inspect`, such as
-  a handler that uses Erlang's own formatter; see `Wagyu.Config`.
   """
 
   alias Wagyu.Config
