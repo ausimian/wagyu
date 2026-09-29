@@ -56,8 +56,7 @@ defmodule Wagyu.MixProject do
         "credo --strict",
         "docs --warnings-as-errors",
         "test"
-      ],
-      release: ["deps.get", "compile", "release"]
+      ]
     ]
   end
 
