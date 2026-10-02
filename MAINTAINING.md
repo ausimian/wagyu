@@ -105,7 +105,8 @@ its own issue linked from there, and its body is the spec for that work.
 
 ## Releasing
 
-Wagyu has not been released yet.
+Releases are published to [Hex.pm](https://hex.pm/packages/wagyu), and
+`CHANGELOG.md` lists them.
 
 `@version` in `mix.exs` is the single source of truth for the version.
 Releases use [Publisho](https://hex.pm/packages/publisho) and the release
@@ -134,3 +135,10 @@ Hex.pm. Before publishing it checks that:
 
 If any check fails, nothing is published. `HEX_API_KEY` must be a Hex API key
 with publish rights for the `wagyu` package.
+
+The workflow doesn't create a GitHub release. Once it has published, create
+one from the tag, which carries the release notes:
+
+```sh
+gh release create X.Y.Z --verify-tag --notes-from-tag --title X.Y.Z
+```
