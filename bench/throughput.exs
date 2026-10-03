@@ -15,8 +15,8 @@
 #
 # Both ends run in this VM and share its schedulers, so one interface talking
 # to a remote peer does about half this work. After Benchee's report the
-# script prints each scenario's rate in MiB/s and, for the tunnel, the packets
-# the interface dropped: drops are what make many streams collapse.
+# script prints each scenario's median rate in MiB/s and, for the tunnel, the
+# packets the interface dropped: drops are what make many streams collapse.
 
 defmodule Wagyu.Bench.Throughput do
   @moduledoc false
@@ -52,9 +52,9 @@ defmodule Wagyu.Bench.Throughput do
 
   @doc """
   Opens `streams` connections from `from` to a listener on `to`, each end
-  held by its own process. Runs reuse them: a TCP socket that closes first
-  keeps one of its stack's 64 socket slots, the default, through TIME_WAIT,
-  for about 10 seconds, so a connection per run would soon exhaust them.
+  held by its own process. Runs reuse them: the socket that closes first
+  holds its slot through TIME_WAIT, about 10 seconds, and a stack has 64
+  slots by default, so a connection per run would soon exhaust them.
   """
   def connect(%{from: from, to: to, address: address}, streams) do
     port = 10_000 + rem(System.unique_integer([:positive, :monotonic]), 50_000)

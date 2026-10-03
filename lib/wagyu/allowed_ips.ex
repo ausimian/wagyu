@@ -31,8 +31,8 @@ defmodule Wagyu.AllowedIPs do
   Builds a table from `{prefix, peer}` pairs.
 
   Returns `{:error, {:invalid_prefix, prefix}}` for a malformed prefix and
-  `{:error, {:duplicate_prefix, prefix}}` (normalized) when two entries have
-  the same exact prefix after normalization.
+  `{:error, {:duplicate_prefix, prefix}}`, with the normalized prefix, when
+  two entries normalize to the same prefix.
   """
   @spec new([{prefix(), peer()}]) ::
           {:ok, t()} | {:error, {:invalid_prefix, term()} | {:duplicate_prefix, prefix()}}

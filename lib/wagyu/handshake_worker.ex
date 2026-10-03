@@ -54,8 +54,8 @@ defmodule Wagyu.HandshakeWorker do
   alias Wagyu.Packet.Initiation
 
   @typedoc """
-  Asks the interface for the peer process, and the peer's configuration,
-  of an authenticated key and timestamp.
+  Asks the interface for the peer process and peer configuration that
+  match an authenticated key and timestamp.
   """
   @type claim :: (<<_::256>>, <<_::96>> -> {:ok, pid(), Config.Peer.t()} | {:error, term()})
 

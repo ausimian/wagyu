@@ -207,7 +207,7 @@ func aead(key []byte, counter uint64, plaintext, additional []byte) []byte {
 
 func header(messageType byte) []byte { return []byte{messageType, 0, 0, 0} }
 
-// MAC1 is keyed BLAKE2s-128 over everything before it, keyed with
+// MAC1 is BLAKE2s-128 over everything before it, keyed with
 // HASH("mac1----" || the receiver's public key). MAC2 is zero without a cookie.
 func appendMACs(message, receiverPublic []byte) []byte {
 	mac, _ := blake2s.New128(hashOf([]byte(labelMAC1), receiverPublic))

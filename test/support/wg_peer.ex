@@ -20,7 +20,7 @@ defmodule Wagyu.WgPeer do
     end
   end
 
-  @doc "Prints `wgpeer vectors`: the golden handshake transcript, as `[{name, hex}]`."
+  @doc "Runs `wgpeer vectors` and returns the golden handshake transcript as `[{name, hex}]`."
   def vectors!(binary) do
     {output, 0} = System.cmd(binary, ["vectors"])
 
@@ -33,7 +33,7 @@ defmodule Wagyu.WgPeer do
   @doc """
   Starts a device whose netstack has `address`, configures it with `uapi`
   (a keyword list of UAPI keys and values, in order), brings it up, and
-  returns the port and the device's UDP port.
+  returns the Erlang port and the device's UDP port.
 
   Options are `:mtu` (default 1280) and `:delay`, milliseconds by which the
   device holds back every datagram it sends (default 0).

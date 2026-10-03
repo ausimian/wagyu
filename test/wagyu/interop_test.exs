@@ -258,10 +258,10 @@ defmodule Wagyu.InteropTest do
       :ok = :gen_tcp.close(socket)
     end
 
-    # SmolNet 0.4.1 advertises its whole receive buffer as its TCP window,
-    # so one stream is no longer limited to a segment per round trip (about
-    # 47 KB/s over 50 ms before). The floor here is loose, to be safe on
-    # slow CI runners; WAGYU_THROUGHPUT=1 prints the rate measured.
+    # SmolNet advertises its whole receive buffer as its TCP window, so one
+    # stream is not limited to a segment per round trip, as it was before
+    # SmolNet 0.4.1 (about 47 KB/s over 50 ms). The floor is loose, to be
+    # safe on slow CI runners; WAGYU_THROUGHPUT=1 prints the rate measured.
     test "one TCP stream sustains throughput over a simulated 50 ms round trip", context do
       {device, go_port} = start_go(context, [], delay: 50)
       :ok = WgPeer.sink(device, 9)

@@ -23,9 +23,9 @@ defmodule Wagyu.Link do
   # what the stack cannot send stays in its sockets, where TCP slows down
   # as it would for a slow network instead of losing segments.
   #
-  # A new interface registers a new count. When the one the link delivers
-  # to exits, it took its peers and whatever they held with it, so the link
-  # stops reading its count and grants that credit again.
+  # A new interface registers a new count. When the interface the link
+  # delivers to exits, its peers and whatever they held go with it, so the
+  # link stops reading its count and grants that credit again.
   #
   # Ingress. Peers admit decrypted packets against the link's own bound with
   # `deliver/2`, or `deliver_to/2` with the target a peer looked up once

@@ -7,15 +7,15 @@ defmodule Wagyu.Noise do
   # the prologue. The first message's payload is the initiator's 12-byte
   # TAI64N timestamp and the second's is empty. A peer without a preshared
   # key uses 32 zero bytes. The psk2 modifier mixes the key in only at the
-  # end of the second message, so reading an initiation depends on whether
-  # a key is present but not on its value. A responder therefore reads an
-  # initiation with the zero key to learn who sent it, and reads it again
-  # with that peer's key when it has one (see `Wagyu.HandshakeWorker`).
+  # end of the second message, so reading an initiation does not depend on
+  # the key's value. A responder therefore reads an initiation with the zero
+  # key to learn who sent it, and reads it again with that peer's key when
+  # it has one (see `Wagyu.HandshakeWorker`).
   #
-  # Noise's Split gives the initiator the first key to send with, as in
-  # WireGuard, which is Decibel's default. Transport messages have empty
-  # associated data, and the ChaChaPoly nonce is four zero bytes and the
-  # 64-bit little-endian counter, as in WireGuard, so a transport header's
+  # Noise's Split gives the initiator the first key to send with, which is
+  # WireGuard's convention and Decibel's default. Transport messages have
+  # empty associated data, and the ChaChaPoly nonce is four zero bytes
+  # followed by the 64-bit little-endian counter, so a transport header's
   # counter is the session's nonce. WireGuard rotates keys by completing a
   # new handshake, never with Noise's rekey.
   #

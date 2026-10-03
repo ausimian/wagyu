@@ -190,5 +190,5 @@ queued work.
 
 MIT. See [LICENSE](https://github.com/ausimian/wagyu/blob/main/LICENSE).
 
-Working on Wagyu itself? See
+To work on Wagyu itself, see
 [MAINTAINING.md](https://github.com/ausimian/wagyu/blob/main/MAINTAINING.md).

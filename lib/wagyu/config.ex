@@ -91,7 +91,8 @@ defmodule Wagyu.Config do
     * `:missing` - a required option is absent
     * `:unknown` - an unrecognized option
     * `:reserved` - a stack option that Wagyu sets itself
-    * `:invalid` - the wrong type or shape, or an unusable peer public key
+    * `:invalid` - the wrong type or shape, or a value that is not allowed,
+      such as a multicast address or an unusable peer public key
     * `:invalid_length` - a key that is not exactly 32 bytes
     * `:out_of_range` - a port, MTU, socket limit or persistent keepalive
       outside its range

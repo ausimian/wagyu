@@ -9,8 +9,8 @@ defmodule Wagyu.Peer do
   #
   # A peer owns its handshakes, its transport sessions and their key slots,
   # its endpoint and its timers, and it sends its own datagrams on the
-  # interface's UDP socket with `:gen_udp.send/4`. Every message sent here
-  # was admitted against one of its bounds first: `{:wg_outbound,
+  # interface's UDP socket with `:gen_udp.send/4`. Every message sent to a
+  # peer is admitted against one of its bounds first: `{:wg_outbound,
   # ip_packets}`, a batch admitted packet by packet, against `:outbound`,
   # `{:wg_frame, local_index, frame, source}` against `:inbound`, and the
   # handoff against `:handoffs`, which counts messages only. The peer
@@ -25,18 +25,18 @@ defmodule Wagyu.Peer do
   # the handshake worker hands its responder session, which has this peer's
   # preshared key, over with `{:wg_handoff, ticket, metadata}`, where
   # `metadata` holds the initiator's sender index, the initiation's
-  # timestamp and its source. The peer
-  # accepts the ticket, registers a local index with the interface, and
-  # writes the response straight away: its sender index is the new local
-  # index and its receiver index the initiator's sender index. The source
-  # becomes the endpoint. An initiation no newer than the last one the peer
-  # took, which a slow worker can deliver late, is closed instead, and a
-  # ticket that cannot be accepted is dropped. A worker that claimed this
-  # peer but has no session to hand over sends `:wg_handoff_abandoned`
-  # instead, which releases its handoff. Unlike wireguard-go, which
-  # has room for one handshake per peer, responding does not abandon an
-  # initiation of the peer's own in flight, so when both sides initiate at
-  # once both handshakes complete and neither waits for a retry.
+  # timestamp and its source. The peer accepts the ticket, registers a local
+  # index with the interface, and writes the response straight away: its
+  # sender index is the new local index and its receiver index the
+  # initiator's sender index. The source becomes the endpoint. An initiation
+  # no newer than the last one the peer took, which a slow worker can
+  # deliver late, is closed instead, and a ticket that cannot be accepted is
+  # dropped. A worker that claimed this peer but has no session to hand over
+  # sends `:wg_handoff_abandoned` instead, which releases its handoff.
+  # Unlike wireguard-go, which has room for one handshake per peer,
+  # responding does not abandon an initiation of the peer's own in flight,
+  # so when both sides initiate at once both handshakes complete and neither
+  # waits for a retry.
   #
   # Initiating. A peer initiates when an outbound packet finds no usable
   # current key, and when one of the timers below calls for a rekey. The
@@ -114,15 +114,16 @@ defmodule Wagyu.Peer do
   # when its key is past REJECT_AFTER_TIME or its counter is a duplicate or
   # older than the key's 8128-counter replay window. Only once it
   # authenticates does its counter enter the window. An empty plaintext is a
-  # keepalive. Otherwise the plaintext must hold an IP packet no longer than
-  # itself, which is trimmed to its IP length, from a source whose longest
-  # AllowedIPs match is this peer. (The interface gives each peer only the
-  # part of the table that decides that: `Wagyu.AllowedIPs.source_filter/2`.)
-  # Such a packet goes to the link, admitted
-  # against the link's own bound (`Wagyu.Link.deliver_to/2`); anything else is
-  # counted and dropped. The source of a keepalive, or of a data packet that
-  # passes those checks, becomes the endpoint, as the source of an
-  # authenticated handshake message does.
+  # keepalive. Otherwise the plaintext must hold an IP packet from a source
+  # whose longest AllowedIPs match is this peer, and the packet's IP length
+  # must fit within the plaintext, which is trimmed to it to remove the
+  # padding. (The interface gives each peer only the part of the table that
+  # decides the source check: `Wagyu.AllowedIPs.source_filter/2`.) Such a
+  # packet goes to the link, admitted against the link's own bound
+  # (`Wagyu.Link.deliver_to/2`); anything else is counted and dropped. The
+  # source of a keepalive, or of a data packet that passes those checks,
+  # becomes the endpoint, as the source of an authenticated handshake
+  # message does.
   #
   # Batching. The interface sends a peer its share of each egress batch as
   # one message, which goes out under one key as of one moment: the clock is
@@ -132,9 +133,8 @@ defmodule Wagyu.Peer do
   # arrives, or the peer has taken 32 frames since the first of them
   # waited, whether or not those frames carried packets, so a flood of
   # frames that carry none cannot hold one back. The timers are armed then
-  # too. The
-  # link is looked up once and monitored, rather than for every packet. A
-  # waiting packet's frame stays admitted, so if the peer dies the
+  # too. The link is looked up once and monitored, rather than for every
+  # packet. A waiting packet's frame stays admitted, so if the peer dies the
   # interface counts it as dropped.
   #
   # Timers. As in wireguard-go, with times from its constants:

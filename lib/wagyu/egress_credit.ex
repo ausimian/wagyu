@@ -11,8 +11,9 @@ defmodule Wagyu.EgressCredit do
   # the link adds to the count, as it hands packets over; the interface
   # retires them, then tells the link (`Wagyu.Link.retired/1`), which
   # reads the count again and grants the difference. The counts live in
-  # `:counters`, so a count the link reads can only be stale by being too
-  # high, and it never grants credit that is still held.
+  # `:counters` that both processes share, and since only the link adds to
+  # them, a value it reads can be stale only by being too high: it never
+  # grants credit that is still held.
   #
   # The count belongs to one interface incarnation, as `Wagyu.Admission` does
   # to one receiver. When the interface exits, its peers exit with it, and

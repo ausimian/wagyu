@@ -79,10 +79,10 @@ seconds.
 ## CI
 
 `.github/workflows/ci.yml` runs on pushes to `main` and on pull requests. It
-runs `mix precommit` on Linux and macOS for each of these Elixir/OTP pairs:
-1.20/29, 1.20/28, 1.20/27, 1.19/28, 1.19/27 and 1.18/27. It installs Go from
-`test/interop/go.mod` and sets `WAGYU_INTEROP=1`, so every job runs the interop
-tests.
+runs `mix precommit` on Linux for each of these Elixir/OTP pairs: 1.20/29,
+1.20/28, 1.20/27, 1.19/28, 1.19/27 and 1.18/27. macOS runs only the Elixir
+1.20 pairs. It installs Go from `test/interop/go.mod` and sets
+`WAGYU_INTEROP=1`, so every job runs the interop tests.
 
 `.github/workflows/release.yml` runs when a release tag is pushed and
 publishes to Hex.pm; see [Releasing](#releasing).

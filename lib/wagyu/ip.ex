@@ -1,13 +1,15 @@
 defmodule Wagyu.IP do
   @moduledoc false
 
-  # Validation of the IP packet inside decrypted transport plaintext.
+  # Parses the IP header of decrypted transport plaintext, and of egress
+  # packets from the stack when the interface routes them.
   #
   # Senders pad plaintext to a multiple of 16 bytes, so the IP length comes
   # from the header: the IPv4 total length, or the IPv6 payload length plus the
   # 40-byte fixed header. A packet claiming more bytes than the plaintext holds
-  # is dropped; otherwise the caller trims the plaintext to that length. Like
-  # wireguard-go and Linux, the padding bytes themselves are not inspected.
+  # is dropped; otherwise the caller trims the plaintext to that length. As
+  # in wireguard-go and Linux, the padding bytes themselves are not
+  # inspected.
   #
   # The IPv4 header checksum is not verified here; the network stack checks it
   # on ingress.
