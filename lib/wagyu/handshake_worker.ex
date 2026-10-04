@@ -1,49 +1,54 @@
 defmodule Wagyu.HandshakeWorker do
   @moduledoc false
 
-  # Processes one admitted handshake initiation, off the UDP receive path.
+  # Processes one admitted handshake initiation, away from the UDP receive
+  # path.
   #
-  # A worker is the only place an unauthenticated sender's frame meets
-  # Noise. It creates a responder session and reads the initiation, which
-  # authenticates the sender and yields its static public key and
-  # timestamp. It then asks the interface to claim the peer for that key
-  # (`Wagyu.Interface.claim_peer/3`), which authorizes the key and the
-  # timestamp and returns the one peer process for it and the peer's
-  # configuration, with its preshared key.
+  # A worker is the only place where the frame of an unauthenticated sender
+  # meets Noise. The worker creates a responder session and reads the
+  # initiation. This read authenticates the sender and gives its static
+  # public key and timestamp. The worker then asks the interface to claim
+  # the peer for that key (`Wagyu.Interface.claim_peer/3`). The interface
+  # authorizes the key and the timestamp. It returns the one peer process
+  # for the key, and the peer's configuration with its preshared key.
   #
-  # The first read uses no preshared key (32 zero bytes), because the
-  # initiator is not known until it is read, and Decibel takes the key when
-  # a session is created. IKpsk2 mixes the key in only at the end of the
-  # response, so the read is the same whatever the key. A peer without one
-  # keeps that session. For a peer with one, the worker closes it and reads
-  # the same initiation again into a session created with the peer's key.
-  # That costs two more X25519 operations, only once the claim has
-  # authorized an authenticated initiation, so a sender without the
-  # initiator's static private key cannot cause it, and a replay cannot
-  # either. The session made with the zero key is never handed to a peer
-  # that has a preshared key.
+  # The first read uses no preshared key (32 zero bytes). The initiator is
+  # not known before the read, and Decibel takes the key when it creates a
+  # session. IKpsk2 mixes the key in only at the end of the response, so the
+  # read is the same for all keys. A peer without a preshared key keeps that
+  # session. For a peer with a preshared key, the worker closes the session.
+  # It then reads the same initiation again into a session with the peer's
+  # key.
   #
-  # The worker hands its session to that peer with `Decibel.handoff/2`,
-  # sends it the ticket directly as `{:wg_handoff, ticket, metadata}`, and
-  # exits. The peer accepts the ticket in its own process. The second read
-  # cannot fail for an initiation the first read authenticated, but should
-  # it, the worker sends the peer `:wg_handoff_abandoned` instead, which
-  # releases the handoff the claim admitted.
+  # The second read costs two more X25519 operations. It occurs only after
+  # the claim authorizes an authenticated initiation. Thus a sender without
+  # the initiator's static private key cannot cause it, and a replay also
+  # cannot cause it. The worker never hands the session with the zero key to
+  # a peer that has a preshared key.
   #
-  # Nothing waits on the peer's acceptance. The initiator cannot address the
-  # new handshake until the peer responds, so no frame can be waiting on it,
-  # and Decibel discards a ticket that is not accepted within 60 seconds or
-  # whose target exits first. The claim admits the ticket message against
-  # the peer's handoff bound, so a peer that is slow to drain its mailbox
-  # refuses new handshakes rather than queueing them without limit.
+  # The worker hands its session to that peer with `Decibel.handoff/2`. It
+  # sends the ticket directly to the peer as `{:wg_handoff, ticket,
+  # metadata}`, and exits. The peer accepts the ticket in its own process.
+  # The second read cannot fail for an initiation that the first read
+  # authenticated. If it does fail, the worker sends the peer
+  # `:wg_handoff_abandoned` instead. This message releases the handoff that
+  # the claim admitted.
+  #
+  # Nothing waits for the peer to accept the ticket. The initiator cannot
+  # address the new handshake until the peer responds, so no frame can wait
+  # for it. Decibel discards a ticket that is not accepted within 60
+  # seconds, or whose target exits first. The claim admits the ticket
+  # message against the peer's handoff bound. Thus a peer that is slow to
+  # empty its mailbox refuses new handshakes, and does not queue them
+  # without limit.
   #
   # Every failure is silent: the worker closes its session, sends nothing
-  # and exits. A failed authentication exits with
-  # `{:shutdown, :authentication_failed}`, which the interface counts; the
+  # and exits. After a failed authentication, the worker exits with
+  # `{:shutdown, :authentication_failed}`, and the interface counts it. The
   # interface counts rejected claims itself.
   #
-  # The session's state lives in the process dictionary, so the process is
-  # marked sensitive to keep that dictionary out of crash reports, and its
+  # The session's state lives in the process dictionary. Thus the process is
+  # marked sensitive, which keeps that dictionary out of crash reports. Its
   # status hides the local key pair.
 
   use GenServer, restart: :temporary
@@ -54,8 +59,8 @@ defmodule Wagyu.HandshakeWorker do
   alias Wagyu.Packet.Initiation
 
   @typedoc """
-  Asks the interface for the peer process, and the peer's configuration,
-  of an authenticated key and timestamp.
+  Asks the interface for the peer process and peer configuration that
+  match an authenticated key and timestamp.
   """
   @type claim :: (<<_::256>>, <<_::96>> -> {:ok, pid(), Config.Peer.t()} | {:error, term()})
 
@@ -88,18 +93,21 @@ defmodule Wagyu.HandshakeWorker do
   def format_status(status), do: Wagyu.Redact.format_status(status, [:identity])
 
   @doc """
-  Reads an initiation into `session`, which has no preshared key, claims
-  its peer with `claim` and hands the peer a session, all in the calling
-  process. For a peer with a preshared key, that is a session from
-  `responder` with the key, into which the initiation is read again, and
-  `session` is closed.
+  Reads an initiation into `session`, which has no preshared key. Then
+  claims its peer with `claim` and hands the peer a session. All of this
+  occurs in the calling process. For a peer with a preshared key, `session`
+  is closed. The peer gets a session from `responder` with the key, and the
+  initiation is read again into that session.
 
-  Returns `{:ok, peer}` once the ticket has been sent to `peer`; the handoff
-  has closed the session. Otherwise this closes every session it has, sends
-  no ticket, and says why: `{:error, :authentication_failed}`, the claim's
-  own error, `{:error, :handoff_failed}` when the peer exited before the
-  handoff, or `{:error, :preshared_key_failed}` when the second read failed,
-  having told the peer so with `:wg_handoff_abandoned`.
+  Returns `{:ok, peer}` after the ticket goes to `peer`. The handoff closed
+  the session. Otherwise this function closes every session that it has,
+  sends no ticket, and returns one of these errors:
+
+    * `{:error, :authentication_failed}`.
+    * The claim's own error.
+    * `{:error, :handoff_failed}` if the peer exited before the handoff.
+    * `{:error, :preshared_key_failed}` if the second read failed. The
+      function first tells the peer with `:wg_handoff_abandoned`.
   """
   @spec respond(Decibel.session(), binary(), {:inet.ip_address(), :inet.port_number()}, claim(), responder()) ::
           {:ok, pid()} | {:error, term()}

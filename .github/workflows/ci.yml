@@ -31,7 +31,7 @@ jobs:
           - {elixir: "1.19", otp: "28"}
           - {elixir: "1.19", otp: "27"}
           - {elixir: "1.18", otp: "27"}
-        # macOS runs only the newest Elixir; Ubuntu covers the older ones.
+        # macOS runs only the newest Elixir. Ubuntu runs the older ones.
         exclude:
           - {os: macos-latest, pair: {elixir: "1.19", otp: "28"}}
           - {os: macos-latest, pair: {elixir: "1.19", otp: "27"}}

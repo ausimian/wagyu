@@ -3,10 +3,10 @@ defmodule Wagyu.Blake2s do
 
   # BLAKE2s (RFC 7693) with optional key and variable digest size.
   #
-  # OTP's `:crypto` exposes only unkeyed BLAKE2s-256, but WireGuard's MAC1 and
-  # MAC2 are keyed BLAKE2s with a 16-byte digest, so Wagyu carries its own
-  # implementation. It is sequential and allocation-light rather than fast; the
-  # inputs it sees are single handshake messages of at most a few blocks.
+  # OTP's `:crypto` gives only unkeyed BLAKE2s-256. But WireGuard's MAC1 and
+  # MAC2 are keyed BLAKE2s with a 16-byte digest, so Wagyu has its own
+  # implementation. It is sequential and makes few allocations, but it is not
+  # fast. Its inputs are single handshake messages of at most a few blocks.
 
   import Bitwise
 
@@ -31,7 +31,7 @@ defmodule Wagyu.Blake2s do
   @doc """
   Hashes `data` with BLAKE2s.
 
-  `key` may be empty (unkeyed) or up to 32 bytes. `size` is the digest length
+  `key` can be empty (unkeyed) or up to 32 bytes. `size` is the digest length
   in bytes, from 1 to 32. The digest size and key length are part of the
   parameter block, so a 16-byte digest is not a prefix of the 32-byte one.
 
@@ -56,8 +56,9 @@ defmodule Wagyu.Blake2s do
     digest
   end
 
-  # Every block but the last is compressed with the running byte count. The
-  # last block, which may be empty, is zero-padded and carries the final flag.
+  # Each block before the last is compressed with the cumulative byte count.
+  # The last block, which can be empty, is zero-padded and carries the final
+  # flag.
   defp blocks(state, <<block::binary-size(@block_size), rest::binary>>, count) when rest != <<>> do
     count = count + @block_size
     blocks(compress(state, block, count, false), rest, count)

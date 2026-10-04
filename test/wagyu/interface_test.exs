@@ -98,13 +98,14 @@ defmodule Wagyu.InterfaceTest do
       send(sampler.pid, :stop)
       maxima = Task.await(sampler)
 
-      # The socket hands over at most 32 datagrams before it is re-armed, and
-      # the only other messages are the exits of at most 8 workers.
+      # The socket gives a maximum of 32 datagrams before the interface arms
+      # it again. The only other messages are the exits of a maximum of 8
+      # workers.
       assert maxima.mailbox <= 48
       assert maxima.workers <= 8
 
-      # Datagrams may still be arriving, so wait until nothing changes and no
-      # handshake work is left.
+      # More datagrams can arrive. Thus, wait until nothing changes and no
+      # handshake work remains.
       counters =
         eventually(fn ->
           before = counters(context.interface)
@@ -121,22 +122,23 @@ defmodule Wagyu.InterfaceTest do
                counters.invalid_datagrams + counters.initiations + counters.initiations_dropped +
                  counters.unknown_index + counters.cookie_replies_sent
 
-      # Each initiation's Noise fields are arbitrary, so every one fails.
+      # The Noise fields of each initiation are random, so all of them fail.
       assert counters.initiations_failed == counters.initiations
 
       assert eventually(fn -> DynamicSupervisor.count_children(supervisor).active == 0 end)
     end
 
     test "while every worker is busy, 8 initiations wait and the rest get cookie replies", context do
-      # Workers finish quickly, so occupy every worker slot directly.
+      # Workers complete quickly. Thus, fill all worker slots directly.
       interface = child(context.interface, :interface)
       :sys.replace_state(interface, &put_in(&1.handshakes.active, 8))
 
       send_datagrams(context, for(_n <- 1..100, do: initiation(context.public_key)))
 
-      # Once 8 wait, the interface is under load, and an initiation without
-      # a MAC2 gets a cookie reply instead of a place in the queue. UDP may
-      # lose some of the burst, so check against what arrived.
+      # When 8 initiations wait, the interface is under load. Then an
+      # initiation without a MAC2 gets a cookie reply, not a place in the
+      # queue. UDP can lose some of the burst. Thus, compare with the
+      # datagrams that arrived.
       counters = settled(context.interface)
       assert counters.datagrams > 8
       assert counters.initiations == 0
@@ -158,7 +160,8 @@ defmodule Wagyu.InterfaceTest do
       assert {:ok, {{127, 0, 0, 1}, _port, reply}} = :gen_udp.recv(context.client, 0, 1_000)
       cookie = cookie(reply, context.public_key, frame)
 
-      # With the cookie, one more initiation waits and the next is refused.
+      # With the cookie, one more initiation waits, and the interface refuses
+      # the next initiation.
       send_datagrams(
         context,
         for(_n <- 1..2, do: with_mac2(initiation(context.public_key), context.public_key, cookie))
@@ -238,8 +241,9 @@ defmodule Wagyu.InterfaceTest do
       assert eventually(fn -> Admission.usage(outbound) == {0, 0} end)
       assert eventually(fn -> EgressCredit.outstanding(credit) == {0, 0} end)
 
-      # The stack sends only as much as the link's credit, which fits the
-      # peer's queue, and the rest waits in the socket.
+      # The stack sends only the quantity that the credit of the link allows.
+      # That quantity fits in the queue of the peer. The remaining data waits
+      # in the socket.
       :ok = :sys.suspend(peer)
       sender = Task.async(fn -> send_egress(socket, 200) end)
       assert eventually(fn -> match?({128, _bytes}, Admission.usage(outbound)) end)
@@ -247,8 +251,9 @@ defmodule Wagyu.InterfaceTest do
       assert {:ok, %{egress: 129, egress_dropped: 0}} = Wagyu.Link.counters(context.interface)
       assert %{egress_routed: 129, egress_peer_dropped: 0} = counters(context.interface)
 
-      # The peer has no key, so it stages what it takes, within its own
-      # bound, and each packet it takes frees credit for the next.
+      # The peer has no key. Thus it stages the packets that it takes, in the
+      # limit of its own bound. Each packet that it takes releases credit for
+      # the next packet.
       :ok = :sys.resume(peer)
       assert :ok = Task.await(sender)
 
@@ -259,7 +264,7 @@ defmodule Wagyu.InterfaceTest do
       assert eventually(fn -> EgressCredit.outstanding(credit) == {0, 0} end)
     end
 
-    # Killing the peer logs its exit.
+    # When the test kills the peer, the peer logs its exit.
     @tag :capture_log
     test "counts what a peer never took as dropped when it exits", context do
       socket = open_udp(context.stack)
@@ -274,8 +279,9 @@ defmodule Wagyu.InterfaceTest do
 
       Process.exit(peer, :kill)
 
-      # The first packet, which the peer took, was waiting for a key, so it
-      # is lost with the peer too. The ten it never took free their credit.
+      # The peer took the first packet, which waited for a key. Thus the
+      # packet is also lost with the peer. The ten packets that the peer did
+      # not take release their credit.
       assert %{egress_routed: 11, egress_peer_dropped: 11} =
                counters(context.interface, &(&1.egress_peer_dropped == 11))
 
@@ -286,14 +292,15 @@ defmodule Wagyu.InterfaceTest do
       assert %{egress_routed: 12} = counters(context.interface, &(&1.egress_routed == 12))
     end
 
-    # Killing the interface logs its exit.
+    # When the test kills the interface, the interface logs its exit.
     @tag :capture_log
     test "counts egress lost with an interface that dies part-way through routing it", context do
       interface = child(context.interface, :interface)
       %{egress: egress} = :sys.get_state(interface)
 
-      # With the peer supervisor suspended, the interface blocks starting the
-      # peer for the first packet, holding that packet mid-route.
+      # The peer supervisor is suspended. Thus the interface blocks when it
+      # starts the peer for the first packet. It holds that packet before
+      # the route is complete.
       :ok = :sys.suspend(child(context.interface, :peer_supervisor))
       send_egress(open_udp(context.stack), 3)
       assert eventually(fn -> match?({3, _bytes}, Admission.usage(egress)) end)
@@ -326,21 +333,22 @@ defmodule Wagyu.InterfaceTest do
       assert eventually(fn -> EgressCredit.outstanding(credit) == {0, 0} end)
     end
 
-    # Killing the interface logs its exit.
+    # When the test kills the interface, the interface logs its exit.
     @tag :capture_log
     test "the stack gets back the credit of egress lost with an interface", context do
       interface = child(context.interface, :interface)
       socket = open_udp(context.stack)
 
-      # The suspended interface holds all the credit when it is killed.
+      # The suspended interface holds all the credit when the test kills it.
       :ok = :sys.suspend(interface)
       sender = Task.async(fn -> send_egress(socket, 129) end)
       assert eventually(fn -> match?({:ok, %{egress: 128}}, Wagyu.Link.counters(context.interface)) end)
       Process.exit(interface, :kill)
       assert :ok = Task.await(sender)
 
-      # The 129th goes out once the link grants the lost credit again, to
-      # the new interface or, before it registers, to be dropped.
+      # The 129th packet goes out after the link grants the lost credit
+      # again. It goes to the new interface. If the new interface is not yet
+      # registered, the link drops the packet.
       assert eventually(fn ->
                match?(
                  {:ok, %{egress: 129, egress_dropped: dropped}} when dropped >= 128,

@@ -17,8 +17,9 @@ defmodule Wagyu.NoiseTest do
     identity
   end
 
-  # Decibel generates ephemeral keys itself. Its known-answer seam fixes
-  # them, so the transcript is deterministic; nothing else here uses it.
+  # Decibel makes its own ephemeral keys. Its known-answer seam sets fixed
+  # keys, so the transcript is deterministic. No other test here uses the
+  # seam.
   defp with_ephemeral(private_key) do
     ephemeral = :crypto.generate_key(:ecdh, :x25519, private_key)
     fn protocol, role, keys -> Decibel.Unsafe.new(protocol, role, Map.put(keys, :e, ephemeral)) end

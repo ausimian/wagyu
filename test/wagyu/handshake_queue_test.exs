@@ -31,7 +31,8 @@ defmodule Wagyu.HandshakeQueueTest do
     {:start, 9, queue} = HandshakeQueue.release(queue)
     refute HandshakeQueue.loaded?(queue)
 
-    # Busy workers alone, with no room to wait, are not load by this measure.
+    # By this measure, busy workers alone are not load, also when no
+    # initiation can wait.
     {_results, queue} = admit_all(HandshakeQueue.new(max_queued: 0), 1..9)
     refute HandshakeQueue.loaded?(queue)
   end

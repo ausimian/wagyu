@@ -55,10 +55,11 @@ jobs:
 
           echo "Releasing ${version}."
 
-      # Publishing only from main keeps releases to code that has been through
-      # a pull request and the CI matrix. A Publisho version commit changes
-      # only @version and the release notes, so this job runs the checks once,
-      # on the pinned toolchain, rather than repeating the matrix.
+      # The workflow publishes only from main. Thus a release contains only
+      # code that went through a pull request and the CI matrix. A Publisho
+      # version commit changes only @version and the release notes. Thus this
+      # job runs the checks one time, on the pinned toolchain. It does not run
+      # the full matrix again.
       - name: Verify the tagged commit is on main
         shell: bash
         run: |
@@ -94,17 +95,17 @@ jobs:
       - name: Audit dependencies
         run: mix hex.audit
 
-      # mix precommit runs the docs build with --warnings-as-errors, so there
-      # is no separate docs step. WAGYU_INTEROP makes a missing Go fail the
-      # interop tests rather than skip them.
+      # mix precommit runs the docs build with --warnings-as-errors. Thus
+      # there is no separate docs step. If Go is missing, WAGYU_INTEROP makes
+      # the interop tests fail. Without it, they do not run.
       - name: Run precommit checks
         env:
           WAGYU_INTEROP: "1"
         run: mix precommit
 
-      # precommit's format and deps.unlock steps rewrite files rather than
-      # failing. Hex publishes the working tree, so refuse to publish anything
-      # that differs from the tagged commit.
+      # The format and deps.unlock steps of precommit change files and do not
+      # fail. Hex publishes the working tree. Thus, do not publish a tree that
+      # is different from the tagged commit.
       - name: Verify the checks left the tree unchanged
         shell: bash
         run: |

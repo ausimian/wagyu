@@ -1,8 +1,8 @@
 defmodule Wagyu.PresharedKeyTest do
-  # Handshakes through a running interface with peers that have preshared
-  # keys, distinct from each other, and a peer that has none. The test
-  # plays each remote party on its own UDP socket. The interface runs on a
-  # fake clock.
+  # Handshakes through a running interface. Some peers have preshared keys,
+  # which are all different, and one peer does not have a preshared key. The
+  # test simulates each remote party on its own UDP socket. The interface
+  # runs on a fake clock.
   use ExUnit.Case, async: true
 
   import Wagyu.TestHelpers
@@ -67,8 +67,8 @@ defmodule Wagyu.PresharedKeyTest do
     frame
   end
 
-  # The remote party initiates with `psk` and returns the response and its
-  # session, waiting for it.
+  # The remote party initiates with `psk`. Returns the response, and the
+  # session that waits for that response.
   defp initiate(context, remote, psk, n \\ 1) do
     {frame, session} = initiate_to(context.public_key, remote.key_pair, timestamp(n), random_index(), psk)
     send_to_interface(context, remote, frame)
@@ -92,7 +92,7 @@ defmodule Wagyu.PresharedKeyTest do
           {remote, frame, session}
         end
 
-      # Every initiation arrives before any response is read.
+      # All initiations arrive before the test reads a response.
       for {remote, frame, _session} <- initiations, do: send_to_interface(context, remote, frame)
 
       for {remote, _frame, session} <- initiations do
@@ -114,14 +114,14 @@ defmodule Wagyu.PresharedKeyTest do
       for {remote, psk} <- [{a, b.psk}, {b, @zero_psk}, {none, a.psk}] do
         {response, session} = initiate(context, remote, psk)
 
-        # The initiator rejects the response, so it has no key to send
-        # with, and the responder's key waits, unconfirmed, in `:next`.
+        # The initiator rejects the response, so it has no key to send with.
+        # The key of the responder waits in `:next` and is not confirmed.
         assert complete(session, response) == :error
         assert %{next: %{}, current: nil} = peer_state(context, remote)
 
-        # A packet for the peer is not sent under that key. It waits for a
-        # handshake of the peer's own, which is not due within 5 seconds of
-        # its response.
+        # The peer does not send a packet under that key. The packet waits for
+        # a handshake that the peer starts. That handshake is not due less
+        # than 5 seconds after the response of the peer.
         :ok = SmolNet.sendto(context.udp, "hello", %{family: :inet, addr: remote.destination, port: 9})
         assert eventually(fn -> :queue.len(peer_state(context, remote).staged) == 1 end)
         assert {:error, :timeout} = :gen_udp.recv(remote.socket, 0, 50)
@@ -141,8 +141,8 @@ defmodule Wagyu.PresharedKeyTest do
   end
 
   describe "initiating" do
-    # Sends a packet to `remote`'s AllowedIPs and returns the initiation the
-    # interface sends it.
+    # Sends a packet to the AllowedIPs of `remote`. Returns the initiation that
+    # the interface sends to `remote`.
     defp demand(context, remote) do
       :ok = SmolNet.sendto(context.udp, "hello", %{family: :inet, addr: remote.destination, port: 9})
       initiation = recv(remote)
@@ -156,7 +156,7 @@ defmodule Wagyu.PresharedKeyTest do
         {response, session, _read} = respond_to(initiation, remote.key_pair, random_index(), remote.psk)
         send_to_interface(context, remote, response)
 
-        # The packet that waited for the key comes under it.
+        # The packet that waited for the key arrives under that key.
         assert {:ok, packet} = open_transport(session, recv(remote))
         assert byte_size(packet) > 0
       end

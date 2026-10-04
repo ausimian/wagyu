@@ -2,16 +2,17 @@ defmodule Wagyu.RateLimiter do
   @moduledoc false
 
   # Per-source budgets for handshake messages under load, as in wireguard-go
-  # and Linux: a token bucket for each IPv4 address or IPv6 /64, which
-  # allows 20 messages a second in bursts of up to 5. Only messages with a
-  # valid MAC2 reach it, so each source has shown it receives at its
+  # and Linux. Each IPv4 address or IPv6 /64 has a token bucket. The bucket
+  # allows 20 messages a second, in bursts of up to 5. Only messages with a
+  # valid MAC2 reach it. Thus each source showed that it receives at its
   # address.
   #
-  # The table is bounded. A source idle for a second has a full bucket, the
-  # same as one with no entry, so when the table is full such entries are
-  # dropped, at most once a second so that a full table of active sources
-  # costs no scan per message. A new source that still does not fit is
-  # refused, failing closed.
+  # The table is bounded. A source that was idle for a second has a full
+  # bucket, the same as a source with no entry. Thus, when the table is
+  # full, the limiter drops such entries. It does this at most one time a
+  # second, so a full table of active sources does not cause a scan for
+  # each message. If a new source still does not fit, the limiter refuses
+  # it, and fails closed.
   #
   # Tokens are milliseconds of `now`, the caller's monotonic clock.
 
@@ -34,8 +35,9 @@ defmodule Wagyu.RateLimiter do
 
   @doc """
   Takes one message's cost from the bucket for `address` at `now`. Returns
-  `{:ok, limiter}` when it had enough, and `{:limited, limiter}` when it did
-  not or the table has no room for a new source.
+  `{:ok, limiter}` if the bucket had sufficient tokens. Returns
+  `{:limited, limiter}` if it did not, or if the table has no space for a
+  new source.
   """
   @spec allow(t(), :inet.ip_address(), integer()) :: {:ok | :limited, t()}
   def allow(%__MODULE__{entries: entries} = limiter, address, now) do

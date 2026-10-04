@@ -3,16 +3,20 @@ defmodule Wagyu.AllowedIPs do
 
   # Immutable longest-prefix-match routing from IP prefixes to peers.
   #
-  # Outbound, the destination's longest matching prefix selects the peer to
-  # encrypt for. Inbound, a decrypted packet is accepted only if its source's
-  # longest matching prefix belongs to the peer that decrypted it. Both
-  # directions use the same lookup, so they cannot disagree.
+  # For an outbound packet, the longest prefix that matches the destination
+  # selects the peer for encryption. An inbound decrypted packet is accepted
+  # only if the longest prefix that matches its source belongs to the peer
+  # that decrypted it. Both directions use the same lookup. Thus they cannot
+  # disagree.
   #
-  # Prefixes are normalized by clearing host bits. Nested prefixes are allowed
-  # and the most specific wins; the same exact prefix twice is rejected rather
-  # than silently reassigned. Each family is a list of `{length, networks}`
-  # pairs, longest first, where `networks` maps the prefix's network bits to its
-  # peer, so a lookup costs one map probe per distinct prefix length.
+  # Normalization clears the host bits of each prefix. Nested prefixes are
+  # allowed, and the most specific prefix wins. If the same exact prefix
+  # occurs two times, the table does not accept it. It does not silently
+  # give the prefix to a different peer.
+  #
+  # Each family is a list of `{length, networks}` pairs, with the longest
+  # first. `networks` maps the network bits of each prefix to its peer. Thus
+  # a lookup costs one map probe for each different prefix length.
 
   import Bitwise
 
@@ -30,9 +34,9 @@ defmodule Wagyu.AllowedIPs do
   @doc """
   Builds a table from `{prefix, peer}` pairs.
 
-  Returns `{:error, {:invalid_prefix, prefix}}` for a malformed prefix and
-  `{:error, {:duplicate_prefix, prefix}}` (normalized) when two entries have
-  the same exact prefix after normalization.
+  Returns `{:error, {:invalid_prefix, prefix}}` for a malformed prefix. If
+  two entries have the same prefix after normalization, returns
+  `{:error, {:duplicate_prefix, prefix}}` with the normalized prefix.
   """
   @spec new([{prefix(), peer()}]) ::
           {:ok, t()} | {:error, {:invalid_prefix, term()} | {:duplicate_prefix, prefix()}}
@@ -53,8 +57,8 @@ defmodule Wagyu.AllowedIPs do
   @doc """
   Clears the host bits of an `{address, length}` prefix.
 
-  Returns `:error` for an invalid address or a length outside the family's
-  range.
+  Returns `:error` for an invalid address, or for a length outside the
+  range of the family.
   """
   @spec normalize(term()) :: {:ok, prefix()} | :error
   def normalize({address, length}) when is_integer(length) do
@@ -70,8 +74,9 @@ defmodule Wagyu.AllowedIPs do
   def normalize(_prefix), do: :error
 
   @doc """
-  Returns `{:ok, peer}` for the longest prefix containing `address`, or
-  `:error` when none does or `address` is not an address tuple. Never raises.
+  Returns `{:ok, peer}` for the longest prefix that contains `address`.
+  Returns `:error` if no prefix contains it, or if `address` is not an
+  address tuple. Never raises.
   """
   @spec lookup(t(), term()) :: {:ok, peer()} | :error
   def lookup(%__MODULE__{} = table, address) do
@@ -83,19 +88,21 @@ defmodule Wagyu.AllowedIPs do
   end
 
   @doc """
-  Returns `true` when `source`'s longest matching prefix belongs to `peer`:
-  the inbound check on a decrypted packet's source address.
+  Returns `true` when the longest prefix that matches `source` belongs to
+  `peer`. This is the inbound check on the source address of a decrypted
+  packet.
   """
   @spec allowed?(t(), term(), peer()) :: boolean()
   def allowed?(%__MODULE__{} = table, source, peer), do: lookup(table, source) == {:ok, peer}
 
   @doc """
-  Returns the part of the table that decides where `peer` may send from:
-  its own prefixes and every longer prefix nested in one of them. An
-  address's longest match can belong to `peer` only if the address is in
-  one of its prefixes, and every longer prefix holding that address is
-  nested in that prefix, so `allowed?/3` answers the same for `peer` on the
-  result as on the whole table.
+  Returns the part of the table that decides the sources from which `peer`
+  can send. This part contains the prefixes of `peer` and each longer
+  prefix that is nested in one of them. The longest match for an address
+  can belong to `peer` only if the address is in one of the prefixes of
+  `peer`. Each longer prefix that holds that address is nested in that
+  prefix. Thus `allowed?/3` gives the same result for `peer` on this part
+  as on the complete table.
   """
   @spec source_filter(t(), peer()) :: t()
   def source_filter(%__MODULE__{} = table, peer) do
@@ -110,13 +117,14 @@ defmodule Wagyu.AllowedIPs do
     filter
   end
 
-  @doc "Returns the table's `{prefix, peer}` pairs, IPv4 first, longest prefix first."
+  @doc "Returns the `{prefix, peer}` pairs of the table, with IPv4 first and the longest prefix first."
   @spec to_list(t()) :: [{prefix(), peer()}]
   def to_list(%__MODULE__{ipv4: ipv4, ipv6: ipv6}), do: entries(ipv4, 32) ++ entries(ipv6, 128)
 
-  # Whether `prefix` is longer than `outer` and inside it. Prefixes of
-  # different families are never nested: normalizing an address to the
-  # other family's length either fails or yields the wrong family.
+  # Returns true if `prefix` is longer than `outer` and inside it. Prefixes
+  # of different families are never nested. If an address is normalized to
+  # the length of the other family, the normalization fails or gives the
+  # wrong family.
   defp nested?({address, length}, {_network, outer_length} = outer),
     do: length > outer_length and normalize({address, outer_length}) == {:ok, outer}
 

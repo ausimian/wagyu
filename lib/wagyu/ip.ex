@@ -1,16 +1,18 @@
 defmodule Wagyu.IP do
   @moduledoc false
 
-  # Validation of the IP packet inside decrypted transport plaintext.
+  # Parses the IP header of decrypted transport plaintext, and of egress
+  # packets from the stack when the interface routes them.
   #
-  # Senders pad plaintext to a multiple of 16 bytes, so the IP length comes
-  # from the header: the IPv4 total length, or the IPv6 payload length plus the
-  # 40-byte fixed header. A packet claiming more bytes than the plaintext holds
-  # is dropped; otherwise the caller trims the plaintext to that length. Like
-  # wireguard-go and Linux, the padding bytes themselves are not inspected.
+  # Senders pad plaintext to a multiple of 16 bytes. Thus the IP length
+  # comes from the header: the IPv4 total length, or the IPv6 payload length
+  # plus the 40-byte fixed header. If a packet shows more bytes than the
+  # plaintext holds, the caller drops it. If not, the caller trims the
+  # plaintext to that length. As in wireguard-go and Linux, nothing examines
+  # the padding bytes.
   #
-  # The IPv4 header checksum is not verified here; the network stack checks it
-  # on ingress.
+  # This module does not verify the IPv4 header checksum. The network stack
+  # checks it on ingress.
 
   @ipv4_header_size 20
   @ipv6_header_size 40
@@ -30,16 +32,17 @@ defmodule Wagyu.IP do
   @doc """
   Parses the IP header at the start of `plaintext`.
 
-  On success returns the IP version, source and destination addresses, and
-  `length`, the exact number of bytes to keep from `plaintext`.
+  If the parse is successful, returns the IP version, the source and
+  destination addresses, and `length`. `length` is the exact number of
+  bytes to keep from `plaintext`.
 
   Errors:
 
     * `:truncated` - shorter than the fixed IPv4 (20-byte) or IPv6 (40-byte)
       header, including empty plaintext
-    * `:invalid_version` - neither IPv4 nor IPv6
-    * `:invalid_header_length` - an IPv4 header length under 20 bytes or
-      greater than the total length
+    * `:invalid_version` - not IPv4 and not IPv6
+    * `:invalid_header_length` - an IPv4 header length that is less than 20
+      bytes or more than the total length
     * `:length_exceeds_plaintext` - the IP length is greater than the
       plaintext
 
@@ -75,9 +78,9 @@ defmodule Wagyu.IP do
   def parse(_plaintext), do: {:error, :truncated}
 
   @doc """
-  Converts an address tuple to `{:ok, integer, bits}`, where `bits` is 32 for
-  IPv4 and 128 for IPv6. Returns `:error` for anything that is not a valid
-  address tuple.
+  Converts an address tuple to `{:ok, integer, bits}`. `bits` is 32 for IPv4
+  and 128 for IPv6. Returns `:error` for all values that are not valid
+  address tuples.
   """
   @spec to_integer(term()) :: {:ok, non_neg_integer(), 32 | 128} | :error
   def to_integer({a, b, c, d}) when is_octet(a) and is_octet(b) and is_octet(c) and is_octet(d) do

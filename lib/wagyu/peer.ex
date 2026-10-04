@@ -1,195 +1,246 @@
 defmodule Wagyu.Peer do
   @moduledoc false
 
-  # One process per active configured peer, started by the interface when
-  # outbound traffic or an authorized initiation first needs it, or when the
-  # interface starts, for a peer with a persistent keepalive. The same
-  # process carries every handshake with its peer, so neither a rekey nor a
-  # retry ever starts another.
+  # Each active configured peer has one process. The interface starts it
+  # when outbound traffic or an authorized initiation first needs it. For a
+  # peer with a persistent keepalive, the interface starts it when the
+  # interface starts. The same process carries every handshake with its
+  # peer, so a rekey or a retry never starts a second process.
   #
   # A peer owns its handshakes, its transport sessions and their key slots,
-  # its endpoint and its timers, and it sends its own datagrams on the
-  # interface's UDP socket with `:gen_udp.send/4`. Every message sent here
-  # was admitted against one of its bounds first: `{:wg_outbound,
-  # ip_packets}`, a batch admitted packet by packet, against `:outbound`,
-  # `{:wg_frame, local_index, frame, source}` against `:inbound`, and the
-  # handoff against `:handoffs`, which counts messages only. The peer
-  # releases a handoff as it takes it off the mailbox, each outbound packet
-  # just before it sends or stages it, and each frame once it is done with
-  # it, which for a data packet is once the packet has gone to the link.
-  # Once it has taken an outbound batch it tells the interface
-  # (`Wagyu.Interface.outbound_taken/2`), which frees the link's egress
-  # credit for what the queue no longer holds.
+  # its endpoint and its timers. It sends its own datagrams on the
+  # interface's UDP socket with `:gen_udp.send/4`. Each message to a peer is
+  # admitted against one of the peer's bounds first:
+  #
+  #   * `{:wg_outbound, ip_packets}` against `:outbound`. A batch is
+  #     admitted packet by packet.
+  #   * `{:wg_frame, local_index, frame, source}` against `:inbound`.
+  #   * The handoff against `:handoffs`, which counts messages only.
+  #
+  # The peer releases each message from its bound at a specific time:
+  #
+  #   * A handoff, when the peer takes it off the mailbox.
+  #   * An outbound packet, immediately before the peer sends or stages it.
+  #   * A frame, when the peer is done with it. For a data packet, this is
+  #     after the packet goes to the link.
+  #
+  # After the peer takes an outbound batch, it tells the interface
+  # (`Wagyu.Interface.outbound_taken/2`). The interface then frees the
+  # link's egress credit for the packets that the queue no longer holds.
   #
   # Responding. After the interface authorizes an initiation for this peer,
-  # the handshake worker hands its responder session, which has this peer's
-  # preshared key, over with `{:wg_handoff, ticket, metadata}`, where
-  # `metadata` holds the initiator's sender index, the initiation's
-  # timestamp and its source. The peer
-  # accepts the ticket, registers a local index with the interface, and
-  # writes the response straight away: its sender index is the new local
-  # index and its receiver index the initiator's sender index. The source
-  # becomes the endpoint. An initiation no newer than the last one the peer
-  # took, which a slow worker can deliver late, is closed instead, and a
-  # ticket that cannot be accepted is dropped. A worker that claimed this
-  # peer but has no session to hand over sends `:wg_handoff_abandoned`
-  # instead, which releases its handoff. Unlike wireguard-go, which
-  # has room for one handshake per peer, responding does not abandon an
-  # initiation of the peer's own in flight, so when both sides initiate at
-  # once both handshakes complete and neither waits for a retry.
+  # the handshake worker hands over its responder session with
+  # `{:wg_handoff, ticket, metadata}`. The session has this peer's
+  # preshared key. `metadata` holds the initiator's sender index, the
+  # timestamp of the initiation and its source.
+  #
+  # The peer accepts the ticket, registers a local index with the interface
+  # and writes the response immediately. The sender index of the response
+  # is the new local index. Its receiver index is the initiator's sender
+  # index. The source becomes the endpoint.
+  #
+  # The peer does not take every handoff:
+  #
+  #   * A slow worker can deliver an initiation late. If the initiation is
+  #     not newer than the last one that the peer took, the peer closes its
+  #     session instead.
+  #   * The peer drops a ticket that it cannot accept.
+  #   * A worker that claimed this peer but has no session to hand over
+  #     sends `:wg_handoff_abandoned` instead. This message releases the
+  #     worker's handoff.
+  #
+  # Unlike wireguard-go, which has space for one handshake per peer, this
+  # peer keeps its own initiation in flight when it responds. Thus, when
+  # both sides initiate at the same time, both handshakes complete and
+  # neither side waits for a retry.
   #
   # Initiating. A peer initiates when an outbound packet finds no usable
-  # current key, and when one of the timers below calls for a rekey. The
-  # interface allocates the initiation's sender index and timestamp
-  # (`Wagyu.Interface.allocate_initiation/2`) before it is sent. The
-  # timestamp is strictly greater than any the interface gave this peer
-  # before, so it can be a little ahead of the wall clock, and the peer
-  # waits for the clock to reach it before sending (at most two 2^24 ns
-  # rounding steps, which is all that REKEY_TIMEOUT and a restart can add;
-  # only a clock that steps back leads by more). A timestamp is therefore
-  # never sent early, and a later interface's timestamps follow it. A new
-  # initiation replaces any still in flight, whose session is closed and
-  # whose index is retired, but no handshake message goes out within
-  # REKEY_TIMEOUT (5 seconds) of the last one this peer sent, initiation or
-  # response, as in wireguard-go. A peer with neither a configured nor a
-  # learned endpoint cannot initiate, and counts `:initiations_no_endpoint`
-  # instead. A response is taken only for the index of the initiation in
-  # flight, and only once it authenticates; until then neither the key
-  # slots nor the endpoint change. Its source then becomes the endpoint.
+  # current key. It also initiates when one of the timers below calls for a
+  # rekey. Before the peer sends an initiation, the interface allocates its
+  # sender index and timestamp (`Wagyu.Interface.allocate_initiation/2`).
   #
-  # Retrying. An initiation that gets no response is sent again, as a new
-  # initiation, REKEY_TIMEOUT plus up to 333 ms of random jitter after the
-  # last handshake message, for as long as the attempt lasts: REKEY_ATTEMPT_TIME
-  # (90 seconds) from when it began. Only an outbound packet that has to
-  # wait for a key extends the attempt, to 90 seconds from that packet; a
-  # timer that calls for a handshake while one is already being attempted
-  # joins it. An attempt ends when a handshake completes, as initiator or as
-  # the responder whose key is confirmed. If it runs out instead, the
-  # initiation is discarded and the packets waiting for a key are dropped
-  # and counted.
+  # The timestamp is always greater than any timestamp that the interface
+  # gave this peer before. Thus it can be a little ahead of the wall clock.
+  # The peer waits for the clock to reach the timestamp before it sends.
+  # This wait is at most two 2^24 ns rounding steps, which is all that
+  # REKEY_TIMEOUT and a restart can add. Only a clock that steps back can
+  # make the lead larger. Thus the peer never sends a timestamp early, and
+  # the timestamps of a later interface follow it.
   #
-  # Cookies. A remote party under load answers a handshake message without
-  # a valid MAC2 with a cookie reply to the message's sender index, which is
-  # this peer's. The peer takes a reply only if it decrypts with the MAC1
-  # of the last handshake message it sent, initiation or response, and then
-  # only once, as in Linux, and keys MAC2 on its handshake messages with the
-  # cookie for 120 seconds after it arrived. A reply sends nothing sooner:
-  # the next initiation goes out on the retry timer, as in wireguard-go.
+  # A new initiation replaces any initiation that is still in flight. The
+  # peer closes the session of the old initiation and retires its index.
+  # But no handshake message goes out within REKEY_TIMEOUT (5 seconds) of
+  # the last initiation or response that this peer sent, as in wireguard-go.
+  # A peer with no configured or learned endpoint cannot initiate. It
+  # counts the initiation in `:initiations_no_endpoint` instead.
   #
-  # Key slots. As in wireguard-go, a completed handshake is a key pair: its
-  # transport session, its local index and the remote party's index. A peer
-  # holds up to three, `:next`, `:current` and `:previous`, and sends only
-  # with `:current`:
+  # The peer takes a response only for the index of the initiation in
+  # flight, and only after the response authenticates. Until then, the key
+  # slots and the endpoint do not change. After that, the source of the
+  # response becomes the endpoint.
   #
-  #   * A handshake this peer initiated becomes `:current` at once. The old
-  #     `:current` becomes `:previous`, unless an unconfirmed `:next` is
-  #     waiting, which is newer: then `:next` becomes `:previous` and the old
-  #     `:current` goes. The peer then sends the packets it staged while it
-  #     had no key, or, with none staged, a keepalive, an empty transport
-  #     message. Either confirms the key to the responder.
-  #   * A handshake this peer responded to becomes `:next`, replacing any
-  #     earlier `:next`, and `:previous` goes, while `:current` stays the key
-  #     to send with. The responder does not send under the new key until
-  #     the initiator has: the first transport message that authenticates
-  #     under `:next` promotes it to `:current`, and the old `:current`
-  #     becomes `:previous`.
+  # Retrying. If an initiation gets no response, the peer sends a new
+  # initiation. It sends it REKEY_TIMEOUT plus up to 333 ms of random jitter
+  # after the last handshake message. The retries continue for the duration
+  # of the attempt: REKEY_ATTEMPT_TIME (90 seconds) from its start. Only an
+  # outbound packet that must wait for a key extends the attempt, to 90
+  # seconds from that packet. A timer that calls for a handshake during an
+  # attempt joins that attempt.
   #
-  # A transport message authenticates under whichever slot holds its index,
-  # so packets delayed under `:previous` still decrypt. A key pair leaves
-  # its slot when a newer handshake displaces it or when it reaches
-  # REJECT_AFTER_TIME, after which no packet under it can be accepted. It
-  # is then closed and its local index retired, which makes it a tombstone;
-  # the ones in the slots when the peer exits go with the process.
+  # An attempt ends when a handshake completes. This peer can be the
+  # initiator, or the responder after the initiator confirms the key. If the
+  # attempt runs out first, the peer discards the initiation. It drops the
+  # packets that wait for a key, and counts them.
   #
-  # Sending data. An outbound packet is sent under `:current` while that key
-  # is less than REJECT_AFTER_TIME (180 seconds) old and below
-  # REJECT_AFTER_MESSAGES. The plaintext is padded with zeros to a multiple
-  # of 16 bytes, but never beyond the MTU, and its counter is the session's
-  # next nonce, which Decibel never reuses. With no usable key the packet is
-  # staged, within its own bound of 128 packets and 256 KiB, and the peer
-  # initiates; staged packets go out in order under the next key it gets.
-  # What does not fit is dropped and counted.
+  # Cookies. When a remote party is under load, it answers a handshake
+  # message that has no valid MAC2 with a cookie reply. The reply goes to
+  # the sender index of the message, which belongs to this peer. The peer
+  # takes a reply only if it decrypts with the MAC1 of the last initiation
+  # or response that the peer sent. As in Linux, the peer takes only one
+  # reply for that message. For 120 seconds after the reply arrives, the
+  # peer keys MAC2 on its handshake messages with the cookie.
   #
-  # Receiving data. A transport message is refused, before any cryptography,
-  # when its key is past REJECT_AFTER_TIME or its counter is a duplicate or
-  # older than the key's 8128-counter replay window. Only once it
-  # authenticates does its counter enter the window. An empty plaintext is a
-  # keepalive. Otherwise the plaintext must hold an IP packet no longer than
-  # itself, which is trimmed to its IP length, from a source whose longest
-  # AllowedIPs match is this peer. (The interface gives each peer only the
-  # part of the table that decides that: `Wagyu.AllowedIPs.source_filter/2`.)
-  # Such a packet goes to the link, admitted
-  # against the link's own bound (`Wagyu.Link.deliver_to/2`); anything else is
-  # counted and dropped. The source of a keepalive, or of a data packet that
-  # passes those checks, becomes the endpoint, as the source of an
-  # authenticated handshake message does.
+  # A reply does not make the peer send sooner. The next initiation goes
+  # out on the retry timer, as in wireguard-go.
   #
-  # Batching. The interface sends a peer its share of each egress batch as
-  # one message, which goes out under one key as of one moment: the clock is
-  # read, and the timers updated and armed, once for the batch. Decrypted
-  # packets wait in `state.plaintext` while more frames are queued, and go
-  # to the link together once the mailbox is empty, another kind of message
-  # arrives, or the peer has taken 32 frames since the first of them
-  # waited, whether or not those frames carried packets, so a flood of
-  # frames that carry none cannot hold one back. The timers are armed then
-  # too. The
-  # link is looked up once and monitored, rather than for every packet. A
-  # waiting packet's frame stays admitted, so if the peer dies the
-  # interface counts it as dropped.
+  # Key slots. As in wireguard-go, a completed handshake gives a key pair:
+  # its transport session, its local index and the remote party's index. A
+  # peer holds up to three key pairs, in the slots `:next`, `:current` and
+  # `:previous`. It sends only with `:current`.
   #
-  # Timers. As in wireguard-go, with times from its constants:
+  #   * A handshake that this peer initiated becomes `:current` immediately.
+  #     Usually the old `:current` becomes `:previous`. If a newer,
+  #     unconfirmed `:next` waits, `:next` becomes `:previous` and the old
+  #     `:current` leaves the slots. The peer then sends the packets that it
+  #     staged while it had no key. If it staged none, it sends a keepalive,
+  #     which is an empty transport message. Each of these confirms the key
+  #     to the responder.
+  #   * A handshake that this peer responded to becomes `:next`. It replaces
+  #     any earlier `:next`, and `:previous` leaves the slots. `:current`
+  #     stays the key that the peer sends with. The responder does not send
+  #     under the new key until the initiator sends under it. The first
+  #     transport message that authenticates under `:next` promotes it to
+  #     `:current`, and the old `:current` becomes `:previous`.
   #
-  #   * Rekey. A key this peer initiated is replaced once it is
-  #     REKEY_AFTER_TIME (120 seconds) old, when the peer next sends under
-  #     it, and any key once it has sent REKEY_AFTER_MESSAGES (2^60). A
-  #     responder never initiates just because its key is old; its
-  #     initiator does that. An initiator that receives under a key within
-  #     KEEPALIVE_TIMEOUT plus REKEY_TIMEOUT of REJECT_AFTER_TIME (at 165
-  #     seconds) initiates once more, in case it has nothing to send before
-  #     the key expires.
-  #   * Passive keepalive. KEEPALIVE_TIMEOUT (10 seconds) after data is
-  #     received with nothing sent since, not even a handshake message, the
-  #     peer sends a keepalive, so the other side knows its data arrived, or,
-  #     if its key has expired since, initiates. Keepalives received and
-  #     handshakes do not start this timer, so two idle peers stay quiet.
-  #   * New handshake. KEEPALIVE_TIMEOUT plus REKEY_TIMEOUT (15 seconds),
-  #     plus jitter, after data is sent with no authenticated packet
-  #     received since, the peer initiates, since its key may be stale on
-  #     the other side.
-  #   * Persistent keepalive. With one configured, the peer sends a
-  #     keepalive whenever that many seconds pass with no authenticated
-  #     packet sent or received, and once when it starts. Without a usable
-  #     key, it initiates instead.
-  #   * Zeroing. REJECT_AFTER_TIME times three (540 seconds) after its last
-  #     new key pair, or after an attempt that ran out when it has no such
-  #     timer running, the peer discards every key, and, unless it is
-  #     attempting a handshake, its initiation and staged packets too. A
-  #     peer with no persistent keepalive that is not attempting a handshake
-  #     then asks the interface to forget it (`Wagyu.Interface.release_peer/3`)
-  #     and exits; the interface starts a new one when it is next needed,
-  #     with the endpoint this one had.
+  # A transport message authenticates under the slot that holds its index,
+  # so packets that were delayed under `:previous` still decrypt. A key pair
+  # leaves its slot when a newer handshake displaces it, or when it reaches
+  # REJECT_AFTER_TIME. After REJECT_AFTER_TIME, the peer accepts no packet
+  # under it. The peer then closes the key pair and retires its local index,
+  # which makes it a tombstone. The key pairs that are in the slots when the
+  # peer exits go with the process.
   #
-  # Each timer is a deadline on `state.clock` in `state.timers`, and one
-  # process timer is armed for the earliest deadline. When a `{:wg_timer,
-  # tag}` message arrives the peer runs every timer whose deadline has
-  # passed, earliest first, then arms the process timer for the next.
-  # Cancelling a timer deletes its deadline, so a message from a timer that
-  # has since been cancelled or moved, or one that arrives early, finds
-  # nothing due and does nothing. The deadlines live in the process, so
-  # they go with it when it crashes, and the interface's supervisor stops
-  # peers with the interface.
+  # Sending data. The peer sends an outbound packet under `:current` while
+  # that key is less than REJECT_AFTER_TIME (180 seconds) old and below
+  # REJECT_AFTER_MESSAGES. The peer pads the plaintext with zeros to a
+  # multiple of 16 bytes, but never past the MTU. The packet's counter is
+  # the session's next nonce, which Decibel never uses again.
   #
-  # Handshake events are counted in the interface's shared counters. Frames
-  # and packets the peer drops are counted in its own state.
+  # If there is no usable key, the peer stages the packet and initiates.
+  # Staged packets have their own bound of 128 packets and 256 KiB. The peer
+  # sends staged packets in order under the next key that it gets. It drops
+  # and counts the packets that do not fit.
   #
-  # The peer owns Decibel sessions, whose state lives in the process
-  # dictionary, so it is marked sensitive, and its status hides the local
-  # key pair and the peer's preshared key.
+  # Receiving data. The peer refuses a transport message before any
+  # cryptography if one of these conditions is true:
   #
-  # Time comes from `state.clock`, monotonic milliseconds, which tests
-  # replace with a fake clock. Wall-clock time is used only to wait for an
-  # initiation's timestamp, so stepping the wall clock neither extends a
-  # key's life nor delays a timer.
+  #   * Its key is older than REJECT_AFTER_TIME.
+  #   * Its counter is a duplicate.
+  #   * Its counter is older than the key's 8128-counter replay window.
+  #
+  # The counter enters the window only after the message authenticates. An
+  # empty plaintext is a keepalive. Any other plaintext must hold an IP
+  # packet, and these conditions must be true:
+  #
+  #   * The longest AllowedIPs match for the packet's source is this peer.
+  #     The interface gives each peer only the part of the table that
+  #     decides this check (`Wagyu.AllowedIPs.source_filter/2`).
+  #   * The packet's IP length fits in the plaintext. The peer trims the
+  #     plaintext to this length to remove the padding.
+  #
+  # The peer admits such a packet against the link's own bound and sends it
+  # to the link (`Wagyu.Link.deliver_to/2`). It counts and drops all other
+  # plaintext. The source of a keepalive, or of a data packet that passes
+  # these checks, becomes the endpoint. The source of an authenticated
+  # handshake message also becomes the endpoint.
+  #
+  # Batching. The interface sends a peer its part of each egress batch as
+  # one message. The peer sends the batch under one key at one moment. Thus
+  # it reads the clock, and updates and arms the timers, one time for the
+  # batch.
+  #
+  # Decrypted packets wait in `state.plaintext` while more frames are in the
+  # queue. They go to the link together when one of these occurs:
+  #
+  #   * The mailbox is empty.
+  #   * A different kind of message arrives.
+  #   * The peer took 32 frames after the first of these packets started to
+  #     wait, whether or not those frames carried packets.
+  #
+  # Thus a flood of frames that carry no packets cannot hold a packet back.
+  # The peer also arms the timers at that time. The peer looks up the link
+  # one time and monitors it, and does not look it up for each packet. The
+  # frame of a waiting packet stays admitted, so if the peer dies, the
+  # interface counts the packet as dropped.
+  #
+  # Timers. These timers are as in wireguard-go, with times from its
+  # constants:
+  #
+  #   * Rekey. The peer replaces a key that it initiated when the key is
+  #     REKEY_AFTER_TIME (120 seconds) old and the peer next sends under it.
+  #     It replaces any key after the key sends REKEY_AFTER_MESSAGES (2^60).
+  #     A responder never initiates only because its key is old; its
+  #     initiator does that. An initiator that receives under a key 165
+  #     seconds old or older initiates one more time. This is necessary
+  #     because possibly it has nothing to send before the key expires. 165
+  #     seconds is REJECT_AFTER_TIME less KEEPALIVE_TIMEOUT and
+  #     REKEY_TIMEOUT.
+  #   * Passive keepalive. The peer sends a keepalive KEEPALIVE_TIMEOUT (10
+  #     seconds) after it receives data, if it sent nothing after that, not
+  #     even a handshake message. The keepalive tells the other side that
+  #     its data arrived. If the key expired in that time, the peer
+  #     initiates instead. Received keepalives and handshakes do not start
+  #     this timer, so two idle peers stay quiet.
+  #   * New handshake. The peer initiates KEEPALIVE_TIMEOUT plus
+  #     REKEY_TIMEOUT (15 seconds), plus jitter, after it sends data, if it
+  #     received no authenticated packet after that. The cause is that its
+  #     key can be stale on the other side.
+  #   * Persistent keepalive. If one is configured, the peer sends a
+  #     keepalive when that number of seconds passes with no authenticated
+  #     packet sent or received. It also sends one when it starts. If it has
+  #     no usable key, it initiates instead.
+  #   * Zeroing. The peer discards every key REJECT_AFTER_TIME times three
+  #     (540 seconds) after its last new key pair. If no such timer runs
+  #     when an attempt runs out, the peer discards every key 540 seconds
+  #     after that. If the peer does not attempt a handshake at that time,
+  #     it also discards its initiation and staged packets. Then, a peer
+  #     with no persistent keepalive and no handshake attempt asks the
+  #     interface to forget it (`Wagyu.Interface.release_peer/3`) and exits.
+  #     The interface starts a new peer when it next needs one, with the
+  #     endpoint that this peer had.
+  #
+  # Each timer is a deadline on `state.clock` in `state.timers`. The peer
+  # arms one process timer for the earliest deadline. When a `{:wg_timer,
+  # tag}` message arrives, the peer runs every timer whose deadline is in
+  # the past, earliest first. It then arms the process timer for the next
+  # deadline. To cancel a timer, the peer deletes its deadline. Thus a
+  # message from a cancelled or moved timer, or an early message, finds
+  # nothing due and does nothing.
+  #
+  # The deadlines are in the process, so they go with the process when it
+  # crashes. The interface's supervisor stops peers with the interface.
+  #
+  # The peer counts handshake events in the interface's shared counters. It
+  # counts the frames and packets that it drops in its own state.
+  #
+  # The peer owns Decibel sessions, and their state is in the process
+  # dictionary. Thus the process is marked sensitive. Its status hides the
+  # local key pair and the peer's preshared key.
+  #
+  # Time comes from `state.clock`, in monotonic milliseconds. Tests replace
+  # it with a fake clock. The peer uses wall-clock time only to wait for
+  # the timestamp of an initiation. Thus a step in the wall clock does not
+  # extend the life of a key or delay a timer.
 
   use GenServer, restart: :temporary
 
@@ -212,34 +263,39 @@ defmodule Wagyu.Peer do
   @rekey_after_time 120_000
   @rekey_attempt_time 90_000
   @reject_after_time 180_000
-  # When an initiator that is receiving initiates once more.
+  # The key age at which an initiator that receives under the key initiates
+  # one more time.
   @last_minute_rekey @reject_after_time - @keepalive_timeout - @rekey_timeout
   # How long keys are kept after the last new key pair.
   @zero_after @reject_after_time * 3
-  # The most random jitter added to a retry or a new handshake.
+  # The maximum random jitter that the peer adds to a retry or a new
+  # handshake.
   @max_jitter 333
-  # REKEY_AFTER_MESSAGES: a key that has sent this many is replaced.
+  # REKEY_AFTER_MESSAGES: the peer replaces a key that sent this many
+  # messages.
   @rekey_after_messages 0x1000000000000000
-  # Counters a key pair remembers behind the highest it has accepted, as in
-  # wireguard-go and Linux.
+  # The number of counters that a key pair remembers behind the highest
+  # counter that it accepted, as in wireguard-go and Linux.
   @replay_window 8128
-  # The longest a peer waits for the wall clock to reach its initiation's
-  # timestamp: two TAI64N rounding steps, in nanoseconds.
+  # The maximum time that a peer waits for the wall clock to reach the
+  # timestamp of its initiation: two TAI64N rounding steps, in nanoseconds.
   @max_timestamp_wait 2 * 0x1000000
   # How long a cookie keys MAC2 after it arrives (COOKIE_REFRESH_TIME).
   @cookie_lifetime 120_000
-  # The most frames a peer takes while decrypted packets wait for the link,
-  # and so the most packets that go to it together: the link's own ingress
-  # batch.
+  # The maximum number of frames that a peer takes while decrypted packets
+  # wait for the link. Thus it is also the maximum number of packets that go
+  # to the link together: the link's own ingress batch.
   @deliver_frames 32
-  # Decrypted packets waiting for the link, newest first, the bytes of the
-  # frames they came in, which stay admitted until they go, and the frames
-  # taken since the first of them waited.
+  # Decrypted packets that wait for the link, newest first. The map also
+  # holds the bytes of the frames that carried them, which stay admitted
+  # until the packets go. It also counts the frames that the peer took after
+  # the first packet started to wait.
   @no_plaintext %{packets: [], count: 0, frame_bytes: 0, frames: 0}
 
   @slots [:next, :current, :previous]
-  # The order in which timers due at the same moment run: an attempt that
-  # runs out is not retried, and keys are zeroed only after the rest.
+  # The order in which timers that are due at the same moment run. An
+  # attempt that runs out is not retried, and the peer zeroes keys only
+  # after the other timers.
   @timers [:give_up, :retry, :new_handshake, :keepalive, :persistent_keepalive, :zero]
 
   @spec start_link(Config.t(), map()) :: GenServer.on_start()
@@ -286,7 +342,8 @@ defmodule Wagyu.Peer do
       clock: clock
     }
 
-    # A persistent keepalive goes out as soon as the peer starts.
+    # A peer with a persistent keepalive sends one immediately when it
+    # starts.
     state = if state.persistent_keepalive > 0, do: set_timer(state, :persistent_keepalive, clock.()), else: state
     {:ok, arm(state)}
   end
@@ -296,7 +353,8 @@ defmodule Wagyu.Peer do
     waiting = state.plaintext.count
     state = receive_frame(state, index, frame, source)
 
-    # A frame whose packet now waits for the link is released with it.
+    # If the packet of a frame now waits for the link, the peer releases the
+    # frame with the packet.
     state =
       if state.plaintext.count > waiting do
         update_in(state.plaintext.frame_bytes, &(&1 + byte_size(frame)))
@@ -310,10 +368,10 @@ defmodule Wagyu.Peer do
     else
       state = update_in(state.plaintext.frames, &(&1 + 1))
 
-      # Waits for the mailbox to empty (a zero timeout) before delivering,
-      # so that frames queued back to back reach the link together, but
-      # counts every frame, so that frames carrying no packet cannot keep
-      # the mailbox busy and hold back one that waits.
+      # A zero timeout makes the peer wait for an empty mailbox before it
+      # delivers. Thus frames that are queued back to back reach the link
+      # together. The peer also counts every frame, so frames that carry no
+      # packet cannot keep the mailbox busy and hold back a waiting packet.
       if state.plaintext.frames >= @deliver_frames, do: {:noreply, settle(state)}, else: {:noreply, state, 0}
     end
   end
@@ -340,8 +398,9 @@ defmodule Wagyu.Peer do
     {:noreply, arm(state)}
   end
 
-  # The armed process timer, or one that has been replaced since. Either
-  # way only the timers already due run.
+  # The message comes from the armed process timer, or from a timer that
+  # the peer replaced after it armed it. In both cases, only the timers that
+  # are already due run.
   defp handle({:wg_timer, tag}, state) do
     state = if match?({^tag, _ref, _deadline}, state.timer), do: %{state | timer: nil}, else: state
 
@@ -351,11 +410,12 @@ defmodule Wagyu.Peer do
     end
   end
 
-  # A rekey, as the timers start. Tests send it to rekey without waiting.
+  # A rekey of the same kind that the timers start. Tests send this message
+  # to start a rekey without a wait.
   defp handle(:wg_initiate, state), do: {:noreply, state |> initiate(:rekey) |> arm()}
 
-  # The mailbox emptied while packets waited for the link, which `settle/1`
-  # has sent them to.
+  # The mailbox became empty while packets waited for the link. `settle/1`
+  # already sent them to the link.
   defp handle(:timeout, state), do: {:noreply, state}
 
   defp handle({:DOWN, monitor, :process, _link, _reason}, %{link: %{monitor: monitor}} = state),
@@ -416,10 +476,15 @@ defmodule Wagyu.Peer do
 
   # Initiating
 
-  # `trigger` is `:demand` for an outbound packet that has to wait for a
-  # key, which begins or extends the attempt, `:retry` for the retry timer,
-  # and `:rekey` for anything else, which joins an attempt already under
-  # way. While a retry is pending, it sends the next initiation.
+  # `trigger` has one of these values:
+  #
+  #   * `:demand` for an outbound packet that must wait for a key. It starts
+  #     or extends the attempt.
+  #   * `:retry` for the retry timer.
+  #   * `:rekey` for all other causes. It joins an attempt that already
+  #     runs.
+  #
+  # While a retry is pending, only the retry sends the next initiation.
   defp initiate(%{endpoint: nil} = state, _trigger), do: count(state, :initiations_no_endpoint)
 
   defp initiate(state, trigger) do
@@ -511,10 +576,10 @@ defmodule Wagyu.Peer do
   defp response(state, index, response, source) do
     with %{local_index: ^index, session: session, sent_at: sent_at} <- state.initiation,
          :ok <- Noise.read_response(session, response) do
-      # The initiator's key is as old as its initiation, so it is never
-      # younger than the responder's, which dates from the response: a
-      # response that arrives too late yields a key already expired, and
-      # the next packet starts a new handshake.
+      # The initiator's key is as old as its initiation. The responder's key
+      # dates from the response, so the initiator's key is never younger. If
+      # a response arrives too late, it gives a key that already expired,
+      # and the next packet starts a new handshake.
       key_pair = key_pair(session, index, response.sender_index, sent_at, true)
 
       %{state | initiation: nil, endpoint: source}
@@ -529,9 +594,9 @@ defmodule Wagyu.Peer do
     end
   end
 
-  # The replay window is checked before decryption, which is the expensive
-  # part, and moves only once the message authenticates, so a forged counter
-  # cannot close the window on genuine ones.
+  # The peer checks the replay window before decryption, which is the
+  # expensive step. The window moves only after the message authenticates,
+  # so a forged counter cannot close the window on genuine counters.
   defp transport(state, index, %Transport{counter: counter} = transport, source) do
     with {:key, {slot, key_pair}} <- {:key, slot(state, index)},
          {:fresh, true} <- {:fresh, fresh?(state, key_pair)},
@@ -541,8 +606,8 @@ defmodule Wagyu.Peer do
       state = received_authenticated(state)
       state = if slot == :next, do: state |> confirm() |> handshake_complete(), else: state
       state = receive_plaintext(state, plaintext, source)
-      # Staged packets go out only now, to the endpoint this message may
-      # have just moved.
+      # Staged packets go out only now, so they go to the endpoint that this
+      # message can set.
       state = if slot == :next, do: send_staged(state), else: state
       last_minute_rekey(state)
     else
@@ -568,14 +633,14 @@ defmodule Wagyu.Peer do
     end
   end
 
-  # Sends the packets waiting for the link, and arms the timers, which
-  # frames leave unarmed while packets wait.
+  # Sends the packets that wait for the link, and arms the timers. While
+  # packets wait, frames do not arm the timers.
   defp settle(%{plaintext: %{count: 0}} = state), do: state
   defp settle(state), do: state |> deliver() |> arm()
 
-  # The link counts a packet it refuses as an ingress drop. The frames are
-  # released only once their packets have gone, so if the peer dies first
-  # the interface counts them as dropped.
+  # The link counts a packet that it refuses as an ingress drop. The peer
+  # releases the frames only after their packets go, so if the peer dies
+  # first, the interface counts them as dropped.
   defp deliver(state) do
     %{packets: packets, count: waiting, frame_bytes: frame_bytes} = state.plaintext
 
@@ -589,9 +654,9 @@ defmodule Wagyu.Peer do
     count(%{state | plaintext: @no_plaintext}, :transport_received, waiting - refused)
   end
 
-  # The link, looked up when first needed and monitored until it exits. A
-  # link that fails restarts its peers too, but the monitor keeps a peer
-  # from sending to one that has gone in the meantime.
+  # The peer looks up the link when it first needs it, and monitors it
+  # until it exits. A link that fails also restarts its peers. But the
+  # monitor prevents a send to a link that stopped before the restart.
   defp link(%{link: nil} = state) do
     case Link.lookup(state.root) do
       {:ok, link} ->
@@ -605,8 +670,8 @@ defmodule Wagyu.Peer do
 
   defp link(state), do: {:ok, state.link, state}
 
-  # An initiator still receiving under a key close to REJECT_AFTER_TIME
-  # starts one handshake, in case it sends nothing that would.
+  # An initiator that still receives under a key close to REJECT_AFTER_TIME
+  # starts one handshake. Possibly it sends nothing that starts one.
   defp last_minute_rekey(%{last_minute_rekey: false, current: %{initiator: true} = key_pair} = state) do
     if state.clock.() - key_pair.created_at >= @last_minute_rekey,
       do: initiate(%{state | last_minute_rekey: true}, :rekey),
@@ -637,7 +702,7 @@ defmodule Wagyu.Peer do
     }
   end
 
-  # REJECT_AFTER_TIME: no key sends or receives once it is this old.
+  # REJECT_AFTER_TIME: a key that is this old does not send or receive.
   defp fresh?(state, key_pair), do: state.clock.() - key_pair.created_at < @reject_after_time
 
   defp install_next(state, key_pair), do: %{discard(state, [:next, :previous]) | next: key_pair}
@@ -671,7 +736,7 @@ defmodule Wagyu.Peer do
     end)
   end
 
-  # Key pairs past REJECT_AFTER_TIME can accept nothing more.
+  # Key pairs older than REJECT_AFTER_TIME cannot accept more messages.
   defp discard_expired(state), do: discard(state, Enum.filter(@slots, &expired?(state, &1)))
 
   defp expired?(state, slot) do
@@ -683,18 +748,22 @@ defmodule Wagyu.Peer do
 
   # Sending
 
-  # The initiator's first transport message under a new key confirms it:
-  # staged data if there is any, and otherwise a keepalive.
+  # The initiator's first transport message under a new key confirms the
+  # key. This message is staged data if there is any, or a keepalive.
   defp confirm_to_responder(state) do
     if :queue.is_empty(state.staged), do: send_keepalive(state), else: send_staged(state)
   end
 
-  # A batch from the interface goes out under one key as of one moment, so
-  # the clock is read, and the timers updated, once for all of it. Each
-  # packet is released just before it is sent or staged, so if the peer
-  # dies part-way the interface counts the unsent rest, missing at most the
-  # one being sent. Packets that find no usable key go one at a time, as
-  # does the rest of a batch once its key has sent REJECT_AFTER_MESSAGES.
+  # A batch from the interface goes out under one key at one moment. Thus
+  # the peer reads the clock, and updates the timers, one time for the
+  # batch. The peer releases each packet immediately before it sends or
+  # stages it. If the peer dies during the batch, the interface counts the
+  # packets that the peer did not send. The count can miss only the packet
+  # that the peer was about to send.
+  #
+  # Packets that find no usable key go one at a time. After the key of a
+  # batch sends REJECT_AFTER_MESSAGES, the rest of the batch also goes one
+  # at a time.
   defp send_packets(state, packets) do
     case usable(state) do
       nil -> Enum.reduce(packets, state, &send_outbound/2)
@@ -725,8 +794,8 @@ defmodule Wagyu.Peer do
     end
   end
 
-  # What `transmit/3` and `send_packet/3` do after each packet, once for
-  # the batch.
+  # Does the work that `transmit/3` and `send_packet/3` do after each
+  # packet, one time for the batch.
   defp sent_batch(state, _key_pair, 0, 0), do: state
 
   defp sent_batch(state, key_pair, sent, errors) do
@@ -737,16 +806,17 @@ defmodule Wagyu.Peer do
     |> rekey_after_sending(key_pair)
   end
 
-  # `demand` is false for a packet that was already waiting for a key, so
-  # staging it again does not extend the handshake attempt, and neither
-  # does a packet dropped because the staging queue is full.
+  # `demand` is false for a packet that already waited for a key. Thus,
+  # when the peer stages it again, the handshake attempt does not extend. A
+  # packet that the peer drops because the staging queue is full also does
+  # not extend the attempt.
   defp send_packet(state, packet, demand \\ true) do
     with %{} = key_pair <- usable(state),
          {:ok, frame} <- Noise.seal(key_pair.session, key_pair.remote_index, pad(packet, state.identity.stack[:mtu])) do
       state |> transmit(frame, :transport_sent) |> rekey_after_sending(key_pair)
     else
-      # No key, one past REJECT_AFTER_TIME, or one that has sent
-      # REJECT_AFTER_MESSAGES: the packet waits for a new handshake.
+      # There is no key, the key is older than REJECT_AFTER_TIME, or it sent
+      # REJECT_AFTER_MESSAGES. The packet waits for a new handshake.
       _no_usable_key -> stage_and_initiate(state, packet, demand)
     end
   end
@@ -758,7 +828,8 @@ defmodule Wagyu.Peer do
     end
   end
 
-  # A keepalive, an empty transport message, when there is a usable key.
+  # Sends a keepalive, which is an empty transport message, if there is a
+  # usable key.
   defp send_keepalive(state) do
     with %{} = key_pair <- usable(state),
          {:ok, frame} <- Noise.seal(key_pair.session, key_pair.remote_index, "") do
@@ -773,8 +844,8 @@ defmodule Wagyu.Peer do
     if key_pair && fresh?(state, key_pair), do: key_pair
   end
 
-  # REKEY_AFTER_MESSAGES for any key, and REKEY_AFTER_TIME for a key this
-  # peer initiated.
+  # REKEY_AFTER_MESSAGES applies to all keys. REKEY_AFTER_TIME applies only
+  # to a key that this peer initiated.
   defp rekey_after_sending(state, key_pair) do
     if Decibel.nonce(key_pair.session, :out) >= @rekey_after_messages or
          (key_pair.initiator and state.clock.() - key_pair.created_at >= @rekey_after_time),
@@ -782,15 +853,15 @@ defmodule Wagyu.Peer do
        else: state
   end
 
-  # Zero padding to a multiple of 16 bytes, capped at the MTU.
+  # Zero padding to a multiple of 16 bytes, but not more than the MTU.
   defp pad(packet, mtu) do
     size = byte_size(packet)
     padded = min(size + rem(16 - rem(size, 16), 16), mtu)
     if padded > size, do: [packet, <<0::size((padded - size) * 8)>>], else: packet
   end
 
-  # Staged packets are admitted against `state.staging`, which the
-  # interface holds too, so that it counts any still waiting when this
+  # Staged packets are admitted against `state.staging`. The interface also
+  # holds this bound, so it counts packets that still wait when this
   # process exits as dropped.
   defp stage(state, packet) do
     case Admission.admit(state.staging, 1, byte_size(packet)) do
@@ -799,11 +870,12 @@ defmodule Wagyu.Peer do
     end
   end
 
-  # Sends the staged packets in order. If the key stops being usable part
-  # way, the rest are staged again, still in order. Each stays admitted
-  # until just before it is sent, and is released first so that it fits if
-  # it is staged again, so if the peer dies part-way the interface counts
-  # the unsent rest, missing at most the one being sent.
+  # Sends the staged packets in order. If the key becomes unusable during
+  # the sends, the peer stages the remaining packets again, in the same
+  # order. Each packet stays admitted until immediately before the peer
+  # sends it. The peer releases it first, so it fits if the peer stages it
+  # again. If the peer dies during the sends, the interface counts the
+  # packets that it did not send, and misses at most one.
   defp send_staged(state) do
     state.staged
     |> :queue.to_list()
@@ -813,7 +885,7 @@ defmodule Wagyu.Peer do
     end)
   end
 
-  # Drops every staged packet, counting each.
+  # Drops every staged packet, and counts each one.
   defp drop_staged(state) do
     packets = :queue.to_list(state.staged)
     Admission.release(state.staging, length(packets), Admission.bytes(packets))
@@ -823,8 +895,8 @@ defmodule Wagyu.Peer do
     |> Map.update!(:outbound_dropped, &(&1 + length(packets)))
   end
 
-  # A handshake message starts the REKEY_TIMEOUT wait whether or not the
-  # send succeeds, so a failing socket is not retried for every packet.
+  # A handshake message starts the REKEY_TIMEOUT wait, also if the send
+  # fails. Thus the peer does not try a failed socket again for each packet.
   defp transmit(state, frame, event) do
     state = sent_authenticated(state, event)
 
@@ -869,9 +941,10 @@ defmodule Wagyu.Peer do
 
   # Timers
 
-  # Runs the timers that are due, earliest first, until none is. Each is
-  # deleted before it runs, and may set or cancel others. Key pairs past
-  # REJECT_AFTER_TIME go first, so no timer sends under one.
+  # Runs the timers that are due, earliest first, until no timer is due.
+  # The peer deletes each timer before it runs, and a timer can set or
+  # cancel other timers. Key pairs older than REJECT_AFTER_TIME go first, so
+  # no timer sends under one.
   defp run_timers(state) do
     state = discard_expired(state)
     now = state.clock.()
@@ -904,7 +977,7 @@ defmodule Wagyu.Peer do
     |> set_timer_unless_pending(:zero, @zero_after)
   end
 
-  # A key that has expired since the data arrived calls for a handshake.
+  # If the key expired after the data arrived, the peer starts a handshake.
   defp fire(:keepalive, state), do: if(usable(state), do: send_keepalive(state), else: initiate(state, :rekey))
 
   defp fire(:new_handshake, state), do: initiate(state, :rekey)
@@ -924,8 +997,9 @@ defmodule Wagyu.Peer do
     end
   end
 
-  # The interface refuses while it has messages admitted for this process,
-  # which then arrive and are handled first; the peer asks again later.
+  # The interface refuses while it has messages admitted for this process.
+  # These messages then arrive and the peer handles them first. The peer
+  # asks again later.
   defp exit_if_idle(state) do
     case Interface.release_peer(state.root, state.public_key, state.endpoint) do
       :ok -> {:stop, state}
@@ -937,8 +1011,8 @@ defmodule Wagyu.Peer do
 
   defp set_timer(state, name, deadline), do: %{state | timers: Map.put(state.timers, name, deadline)}
 
-  # Sets a timer `delay` from now, reading the clock only if it is not
-  # already pending.
+  # Sets a timer `delay` from now if the timer is not pending. The peer
+  # reads the clock only in that case.
   defp set_timer_unless_pending(state, name, delay),
     do: if(pending?(state, name), do: state, else: set_timer(state, name, state.clock.() + delay))
 
@@ -947,10 +1021,11 @@ defmodule Wagyu.Peer do
   # Up to 333 ms, as in wireguard-go.
   defp jitter, do: :rand.uniform(@max_jitter + 1) - 1
 
-  # Arms the process timer for the earliest deadline, including when each
-  # key pair expires, unless one is already armed for no later. A timer
-  # armed for later is cancelled; one that fires early finds nothing due
-  # and arms the next.
+  # Arms the process timer for the earliest deadline, which includes the
+  # expiry of each key pair. If a process timer is already armed for that
+  # deadline or earlier, the peer keeps it. The peer cancels a timer that is
+  # armed for a later time. A timer that fires early finds nothing due and
+  # arms the next.
   defp arm(state) do
     expiries = for slot <- @slots, key_pair = Map.fetch!(state, slot), do: key_pair.created_at + @reject_after_time
 

@@ -14,14 +14,14 @@ defmodule Wagyu.RegistryTest do
     {:ok, stack} = Wagyu.stack(interface)
     stack_monitor = SmolNet.monitor(stack)
 
-    # The partition owns the registry's tables, so its crash loses every
-    # registration, and the registry restarts it empty.
+    # The partition owns the tables of the registry. Thus a crash of the
+    # partition loses all registrations, and the registry restarts it empty.
     [{_id, partition, :worker, _modules}] = Supervisor.which_children(Wagyu.Registry)
     monitor = Process.monitor(partition)
     Process.exit(partition, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^partition, :killed}
 
-    # The interface keeps its root and name, and everything under it is new.
+    # The interface keeps its root and name. All the processes under it are new.
     assert_receive {:DOWN, ^stack_monitor, :process, _object, _reason}
 
     new =

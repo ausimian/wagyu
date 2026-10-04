@@ -1,13 +1,18 @@
 defmodule Wagyu.Config.Peer do
   @moduledoc """
-  A peer in a `Wagyu.Config`, built by `Wagyu.Config.new/1` from the
+  A peer in a `Wagyu.Config`. `Wagyu.Config.new/1` builds it from the
   `:peers` option.
 
-  The fields hold the validated option values. `:allowed_ips` has host bits
-  cleared and keeps the order given. `:endpoint` is `nil` when none is
-  configured, `:preshared_key` is 32 zero bytes when none is configured, and
-  `:persistent_keepalive` is `0` when it is off. `inspect/2` hides the
-  preshared key, with the same limits as `Wagyu.Config`.
+  The fields hold the validated option values. In `:allowed_ips`, the host
+  bits are clear, and the prefixes keep the sequence that you gave. If you
+  do not configure these fields, they have these values:
+
+    * `:endpoint` is `nil`.
+    * `:preshared_key` is 32 zero bytes.
+    * `:persistent_keepalive` is `0`, which is off.
+
+  `inspect/2` hides the preshared key, with the same limits as
+  `Wagyu.Config`.
   """
 
   @derive {Inspect, except: [:preshared_key]}

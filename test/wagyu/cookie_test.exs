@@ -21,7 +21,8 @@ defmodule Wagyu.CookieTest do
     mac1
   end
 
-  # The cookie in a reply to `frame`, sent to the holder of `public_key`.
+  # Returns the cookie in a reply to `frame`, which goes to the holder of
+  # `public_key`.
   defp opened(reply, public_key, frame), do: Cookie.open(decode(reply), Cookie.key(public_key), mac1(frame))
 
   describe "the golden transcript" do
@@ -65,7 +66,8 @@ defmodule Wagyu.CookieTest do
       %{public_key: public_key, checker: Cookie.checker(public_key), frame: frame}
     end
 
-    # A cookie reply to `frame` from `source` at `now`, and the cookie in it.
+    # Returns a cookie reply to `frame` from `source` at `now`, and the cookie
+    # in that reply.
     defp reply(context, checker, source, now) do
       {reply, checker} = Cookie.reply(checker, context.frame, 7, source, now)
       assert %CookieReply{receiver_index: 7} = decode(reply)
@@ -101,7 +103,7 @@ defmodule Wagyu.CookieTest do
       {cookie, checker} = reply(context, context.checker, @source, 1_000)
       frame = with_mac2(context, cookie)
 
-      # A reply within the secret's lifetime reuses it.
+      # A reply in the lifetime of the secret uses the same secret again.
       {same, checker} = reply(context, checker, @source, 60_000)
       assert same == cookie
 

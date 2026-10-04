@@ -1,6 +1,6 @@
 defmodule Wagyu.LinkTest do
-  # Tests within a module run one at a time, so each can be the fake stack's
-  # controller in turn.
+  # The tests in a module run one at a time. Thus each test can be the
+  # controller of the fake stack in turn.
   use ExUnit.Case, async: true
 
   import Wagyu.TestHelpers
@@ -31,7 +31,8 @@ defmodule Wagyu.LinkTest do
     %{root: root, link: link, options: options, stack: stack}
   end
 
-  # Registers the test process as `root`'s interface, receiving egress.
+  # Registers the test process as the interface of `root`, which receives
+  # egress.
   defp register_interface(root, max_packets \\ 256, max_bytes \\ 512 * 1024) do
     registration = %{egress: Admission.new(max_packets, max_bytes), credit: EgressCredit.new()}
     :ok = Wagyu.Registry.register(root, :interface, registration)
@@ -43,7 +44,7 @@ defmodule Wagyu.LinkTest do
     send(link, {:smol_stack, ref, :egress, packets})
   end
 
-  # Receives the link's next ingress call and answers it.
+  # Receives the next ingress call of the link and answers it.
   defp answer_ingress(link, result_fun) do
     assert_receive {:ingress, ^link, ref, packets}
     send(link, {ref, result_fun.(packets)})
@@ -96,7 +97,8 @@ defmodule Wagyu.LinkTest do
       assert eventually(fn -> match?({:ok, %{egress: 4, egress_dropped: 4}}, Link.counters(root)) end)
       refute_received {:wg_egress, _packets}
 
-      # Nothing holds what was dropped, so the stack gets its credit back.
+      # No process holds the dropped packets, so the stack gets its credit
+      # back.
       assert_receive {:grant_egress, ^link, 4, 80}
     end
 
@@ -111,7 +113,8 @@ defmodule Wagyu.LinkTest do
       assert Admission.usage(queue) == {3, 60}
       assert_receive {:grant_egress, ^link, 2, 40}
 
-      # The interface releases the batch when it takes it; room reopens.
+      # The interface releases the batch when it takes it. Space becomes
+      # available again.
       Admission.release_all(queue, admitted)
       egress(link, options, packets(6..6))
       assert_receive {:wg_egress, [_packet]}
@@ -140,9 +143,9 @@ defmodule Wagyu.LinkTest do
       assert {:ok, %{egress: 3, egress_dropped: 0}} = Link.counters(root)
       refute_received {:grant_egress, ^link, _packets, _bytes}
 
-      # The three it never took are counted as soon as it exits, and once
-      # only: a batch for its replacement adds nothing. Their credit is
-      # the stack's again.
+      # The link counts the three packets that the interface did not take
+      # immediately when it exits, and only one time. A batch for the new
+      # interface adds nothing. Their credit goes back to the stack.
       Process.exit(interface, :kill)
       assert eventually(fn -> match?({:ok, %{egress: 3, egress_dropped: 3}}, Link.counters(root)) end)
       assert_receive {:grant_egress, ^link, 3, 60}
@@ -171,7 +174,7 @@ defmodule Wagyu.LinkTest do
       Link.retired(target)
       assert_receive {:grant_egress, ^link, 2, 40}
 
-      # Credit is granted once: a second notice finds nothing new.
+      # The link grants credit only one time. A second notice finds nothing new.
       Link.retired(target)
       _state = :sys.get_state(link)
       refute_received {:grant_egress, ^link, _packets, _bytes}
@@ -181,8 +184,8 @@ defmodule Wagyu.LinkTest do
       register_interface(root)
       {:ok, target} = Link.lookup(root)
 
-      # Hold the link in an ingress call while plaintext and a notice queue
-      # behind it.
+      # Hold the link in an ingress call while plaintext and a notice wait in
+      # the queue behind it.
       assert Link.deliver(root, packets(0..0)) == 0
       assert_receive {:ingress, ^link, ref, [_first]}
       assert Link.deliver(root, packets(1..2)) == 0
@@ -204,8 +207,8 @@ defmodule Wagyu.LinkTest do
 
   describe "ingress" do
     test "coalesces queued lists into ordered batches of at most 32 packets", %{root: root, link: link} do
-      # The first packet goes in alone and holds the link in its ingress
-      # call while the rest queue up behind it.
+      # The first packet goes in alone. It holds the link in its ingress call
+      # while the other packets wait in the queue behind it.
       assert Link.deliver(root, packets(0..0)) == 0
       assert_receive {:ingress, ^link, ref, [_first]}
 
@@ -250,7 +253,7 @@ defmodule Wagyu.LinkTest do
     end
 
     test "refuses plaintext beyond its queue and counts it", %{root: root, link: link} do
-      # Hold the link in an ingress call so that nothing is dequeued.
+      # Hold the link in an ingress call, so that nothing leaves the queue.
       assert Link.deliver(root, packets(0..0)) == 0
       assert_receive {:ingress, ^link, ref, _packets}
 
@@ -276,9 +279,9 @@ defmodule Wagyu.LinkTest do
 
   test "exits when its stack stops", %{link: link, stack: stack} do
     monitor = Process.monitor(link)
-    # A monitor takes effect when the link handles it, and signals from
-    # different senders are unordered, so make sure it is in place before
-    # the stack's exit can reach the link.
+    # A monitor starts to operate when the link handles it. Signals from
+    # different senders have no fixed sequence. Thus, make sure that the
+    # monitor operates before the exit of the stack can get to the link.
     _state = :sys.get_state(link)
     Process.exit(stack, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^link, {:shutdown, :stack_down}}

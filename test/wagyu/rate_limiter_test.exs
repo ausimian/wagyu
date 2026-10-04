@@ -3,7 +3,7 @@ defmodule Wagyu.RateLimiterTest do
 
   alias Wagyu.RateLimiter
 
-  # Runs `allow/3` for each address at `now`, returning the results in order.
+  # Runs `allow/3` for each address at `now`, and returns the results in sequence.
   defp allow_all(limiter, addresses, now) do
     Enum.map_reduce(addresses, limiter, fn address, limiter ->
       {result, limiter} = RateLimiter.allow(limiter, address, now)
@@ -50,8 +50,8 @@ defmodule Wagyu.RateLimiterTest do
     # Known sources keep their budgets while the table is full.
     assert {:ok, limiter} = RateLimiter.allow(limiter, {10, 0, 0, 1}, 999)
 
-    # A second later the other two are idle and make room. The pruning ran
-    # at 0, when nothing was idle, but a second has passed since.
+    # One second later, the other two sources are idle and make space. The
+    # prune ran at 0, when no source was idle, but one second is now past.
     assert {:ok, limiter} = RateLimiter.allow(limiter, {10, 0, 0, 4}, 1_000)
     assert Map.keys(limiter.entries) |> Enum.sort() == [{10, 0, 0, 1}, {10, 0, 0, 4}]
   end

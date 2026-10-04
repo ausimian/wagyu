@@ -1,11 +1,11 @@
 defmodule Wagyu.PeerSupervisor do
   @moduledoc false
 
-  # Supervises one temporary process per active configured peer. Only the
-  # interface starts peers, on demand, and those with a persistent
-  # keepalive when this supervisor starts, which it tells the interface.
-  # The local key pair reaches peers as an extra argument, as it does for
-  # handshake workers.
+  # Supervises one temporary process for each active configured peer. Only
+  # the interface starts peers. It starts a peer on demand. It also starts
+  # each peer with a persistent keepalive when this supervisor tells the
+  # interface that the supervisor started. The local key pair goes to the
+  # peers as an extra argument, the same as for the handshake workers.
 
   use DynamicSupervisor
 

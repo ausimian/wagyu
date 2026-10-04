@@ -1,7 +1,8 @@
 defmodule Wagyu.HandshakeTest do
-  # Inbound initiations through a running interface: authorization, the
-  # handoff to peers, their responses, and the receiver-index lifecycle. The
-  # interface runs on a fake clock, so every time-based rule is exact.
+  # Inbound initiations through a running interface. The tests cover
+  # authorization, the handoff to peers, the responses of the peers and the
+  # lifecycle of receiver indices. The interface runs on a fake clock. Thus
+  # each rule that uses time is exact.
   use ExUnit.Case, async: true
 
   import Wagyu.TestHelpers
@@ -51,7 +52,7 @@ defmodule Wagyu.HandshakeTest do
 
   defp interface_state(context), do: :sys.get_state(context.children.interface)
 
-  # The running peer's process, or nil.
+  # Returns the process of the running peer, or nil.
   defp peer(%{peer_key: key} = context) do
     case interface_state(context).peers do
       %{^key => %{pid: pid}} -> pid
@@ -61,9 +62,9 @@ defmodule Wagyu.HandshakeTest do
 
   defp peer_children(context), do: DynamicSupervisor.which_children(context.children.peer_supervisor)
 
-  # Waits for the peer to have responded to the initiation carrying
-  # `timestamp`, and returns the key pair it holds for that handshake, which
-  # waits in `:next` for the initiator to confirm it.
+  # Waits until the peer responds to the initiation that contains
+  # `timestamp`. Returns the key pair that the peer holds for that handshake.
+  # The key pair waits in `:next` until the initiator confirms it.
   defp responded(context, timestamp) do
     eventually(fn ->
       with pid when is_pid(pid) <- peer(context),
@@ -77,8 +78,8 @@ defmodule Wagyu.HandshakeTest do
 
   defp lookup(context, index), do: IndexTable.lookup(interface_state(context).indices, index)
 
-  # Waits until every initiation has been settled and the counters have
-  # stopped changing, and returns them.
+  # Waits until all initiations are settled and the counters stop changing.
+  # Returns the counters.
   defp settled(context) do
     eventually(fn ->
       before = counters(context.interface)
@@ -96,7 +97,7 @@ defmodule Wagyu.HandshakeTest do
   end
 
   # Receives datagrams on `socket` until one is a cookie reply to
-  # `receiver_index`, and returns it.
+  # `receiver_index`. Returns that cookie reply.
   defp cookie_reply_to(socket, receiver_index) do
     assert {:ok, {{127, 0, 0, 1}, _port, datagram}} = :gen_udp.recv(socket, 0, 1_000)
 
@@ -107,18 +108,19 @@ defmodule Wagyu.HandshakeTest do
   end
 
   # Puts the interface under load for the next second of its clock, as a
-  # loaded initiation queue would.
+  # loaded initiation queue does.
   defp under_load(context),
     do: :sys.replace_state(context.children.interface, &%{&1 | under_load_until: &1.clock.() + 1_000})
 
-  # Occupies every worker slot with a stand-in process, as a flood of
-  # initiations would, and puts `queued` forged initiations in the waiting
-  # room. A stand-in frees its slot when it is sent `:stop`.
+  # Fills all worker slots with substitute processes, as a flood of
+  # initiations does. Puts `queued` forged initiations in the waiting room.
+  # A substitute releases its slot when it receives `:stop`.
   defp saturate(context, queued) do
     stand_ins = for _n <- 1..8, do: spawn(fn -> receive do: (:stop -> :ok) end)
     waiting = for _n <- 1..queued//1, do: %{frame: initiation(context.public_key), source: context.source}
 
-    # The function runs in the interface, so the interface monitors them.
+    # The function runs in the interface, so the interface monitors the
+    # substitutes.
     :sys.replace_state(context.children.interface, fn state ->
       monitors = Map.new(stand_ins, &{Process.monitor(&1), :worker})
       handshakes = %{state.handshakes | active: 8, queued: queued, queue: :queue.from_list(waiting)}
@@ -148,14 +150,14 @@ defmodule Wagyu.HandshakeTest do
     assert %{initiations: 1, initiations_accepted: 1, initiations_failed: 0, responses_sent: 1} = settled(context)
     assert [_one] = peer_children(context)
 
-    # The response comes from the new index to the initiator's, with MAC1
-    # keyed for the initiator.
+    # The response comes from the new index to the index of the initiator.
+    # Its MAC1 has the key for the initiator.
     assert {:ok, {{127, 0, 0, 1}, _port, response}} = :gen_udp.recv(context.client, 0, 1_000)
     assert {:ok, %Packet.Response{sender_index: ^index, receiver_index: 77}} = Packet.decode(response)
     assert Packet.valid_mac1?(response, Packet.mac1_key(context.peer_key))
 
-    # Messages for the index reach the peer, which drops this unauthenticated
-    # one; others drop at the interface.
+    # Messages for the index get to the peer, which drops this message
+    # because it does not authenticate. The interface drops the other messages.
     send_datagrams(context, [transport(index), transport(index + 1)])
     assert %{inbound_routed: 1, unknown_index: 1} = counters(context.interface, &(&1.datagrams == 3))
     assert eventually(fn -> :sys.get_state(responded.peer).inbound_dropped == 1 end)
@@ -163,8 +165,8 @@ defmodule Wagyu.HandshakeTest do
   end
 
   test "concurrent initiations for one key start one peer and accept one timestamp", context do
-    # With the clock stopped, whichever claim comes first is accepted and
-    # every other one is a replay or within 20 ms of it.
+    # The clock is stopped. Thus the interface accepts the first claim. Each
+    # other claim is a replay or comes less than 20 ms after the first claim.
     send_datagrams(context, for(n <- 1..8, do: genuine(context, n)))
 
     counters =
@@ -180,7 +182,8 @@ defmodule Wagyu.HandshakeTest do
     %{timestamp: accepted} = Map.fetch!(initiations, context.peer_key)
     assert responded(context, accepted)
 
-    # The same initiation arriving many times is accepted at most once.
+    # If the same initiation arrives many times, the interface accepts it a
+    # maximum of one time.
     advance(context.clock, 1_000)
     duplicate = genuine(context, 100)
     send_datagrams(context, List.duplicate(duplicate, 6))
@@ -204,7 +207,8 @@ defmodule Wagyu.HandshakeTest do
     send_datagrams(context, [genuine(context, 2)])
     assert %{initiations_rate_limited: 1} = counters(context.interface, &(&1.initiations_rate_limited == 1))
 
-    # The window runs from the last accepted initiation, not the dropped one.
+    # The window starts at the last accepted initiation, not at the dropped
+    # initiation.
     advance(context.clock, 1)
     send_datagrams(context, [genuine(context, 3)])
 
@@ -214,7 +218,7 @@ defmodule Wagyu.HandshakeTest do
     assert responded(context, timestamp(3))
   end
 
-  # Killing the peer logs its exit.
+  # When the test kills the peer, the peer logs its exit.
   @tag :capture_log
   test "replayed and stale timestamps are dropped, even after the peer restarts", context do
     frame = genuine(context, 2)
@@ -225,8 +229,8 @@ defmodule Wagyu.HandshakeTest do
     send_datagrams(context, [frame, genuine(context, 1)])
     assert %{initiations_replayed: 2} = counters(context.interface, &(&1.initiations_replayed == 2))
 
-    # The interface keeps the timestamp after the peer exits, and a replay
-    # does not start a new peer.
+    # The interface keeps the timestamp after the peer exits. A replay does
+    # not start a new peer.
     kill(first)
     assert eventually(fn -> peer(context) == nil end)
 
@@ -264,8 +268,8 @@ defmodule Wagyu.HandshakeTest do
     %{peer: peer} = responded(context, timestamp(1))
     :ok = :sys.suspend(peer)
 
-    # The claim and the handoff finish without the peer, which is left with
-    # the ticket unread.
+    # The claim and the handoff complete without the peer. The peer has the
+    # ticket but does not read it.
     advance(context.clock, 20)
     send_datagrams(context, [genuine(context, 2), "not wireguard"])
     assert %{initiations_accepted: 2, invalid_datagrams: 1} = settled(context)
@@ -274,7 +278,7 @@ defmodule Wagyu.HandshakeTest do
     assert Process.alive?(peer)
     assert peer(context) == peer
 
-    # The ticket is still good when the peer gets to it.
+    # The ticket is still valid when the peer reads it.
     :ok = :sys.resume(peer)
     assert %{peer: ^peer} = responded(context, timestamp(2))
   end
@@ -285,12 +289,12 @@ defmodule Wagyu.HandshakeTest do
     %{handoffs: handoffs, inbound: inbound} = Map.fetch!(interface_state(context).peers, context.peer_key)
     :ok = :sys.suspend(peer)
 
-    # A full inbound queue does not hold up handshakes.
+    # A full inbound queue does not stop handshakes.
     send_datagrams(context, List.duplicate(transport(index), 200))
     assert eventually(fn -> match?({128, _bytes}, Admission.usage(inbound)) end)
 
-    # Two handoffs may wait for the peer. The third claim is refused, and
-    # its timestamp is not recorded.
+    # A maximum of two handoffs can wait for the peer. The interface refuses
+    # the third claim and does not record its timestamp.
     for n <- 2..3 do
       advance(context.clock, 20)
       send_datagrams(context, [genuine(context, n)])
@@ -304,7 +308,8 @@ defmodule Wagyu.HandshakeTest do
     send_datagrams(context, [frame])
     assert %{initiations_unavailable: 1, initiations_accepted: 3} = settled(context)
 
-    # Once the peer takes its handoffs, the same initiation is accepted.
+    # After the peer takes its handoffs, the interface accepts the same
+    # initiation.
     :ok = :sys.resume(peer)
     assert %{peer: ^peer} = responded(context, timestamp(3))
     assert Admission.usage(handoffs) == {0, 0}
@@ -312,13 +317,14 @@ defmodule Wagyu.HandshakeTest do
     assert %{peer: ^peer} = responded(context, timestamp(4))
   end
 
-  # Killing the peer logs its exit.
+  # When the test kills the peer, the peer logs its exit.
   @tag :capture_log
   test "retired and dead-peer indices drop at the interface, and tombstones expire after 180 seconds", context do
     send_datagrams(context, [genuine(context, 1)])
     %{local_index: first, peer: peer} = responded(context, timestamp(1))
 
-    # A newer handshake replaces the unconfirmed one and retires its index.
+    # A newer handshake replaces the handshake that is not confirmed, and
+    # retires its index.
     advance(context.clock, 20)
     send_datagrams(context, [genuine(context, 2)])
     %{local_index: second} = responded(context, timestamp(2))
@@ -328,7 +334,8 @@ defmodule Wagyu.HandshakeTest do
     send_datagrams(context, [transport(first), transport(second)])
     assert %{inbound_routed: 1, unknown_index: 1} = counters(context.interface, &(&1.datagrams == 4))
 
-    # Once the interface sees the peer exit, its index drops too.
+    # After the interface sees that the peer exits, it also drops the index
+    # of that peer.
     kill(peer)
     assert eventually(fn -> lookup(context, second) == :retired end)
     assert is_reference(interface_state(context).expiry_timer)
@@ -336,7 +343,7 @@ defmodule Wagyu.HandshakeTest do
     send_datagrams(context, [transport(second)])
     assert %{inbound_routed: 1, unknown_index: 2} = counters(context.interface, &(&1.datagrams == 5))
 
-    # Both were retired at the same moment and stay tombstones for 180 s.
+    # The two indices retired at the same time and stay tombstones for 180 s.
     advance(context.clock, 179_999)
     send(context.children.interface, :expire_indices)
     assert lookup(context, first) == :retired
@@ -352,7 +359,7 @@ defmodule Wagyu.HandshakeTest do
     assert %{inbound_routed: 1, unknown_index: 3} = counters(context.interface, &(&1.datagrams == 6))
   end
 
-  # Killing the peer logs its exit.
+  # When the test kills the peer, the peer logs its exit.
   @tag :capture_log
   test "messages for a live index are bounded by the peer's inbound queue", context do
     send_datagrams(context, [genuine(context, 1)])
@@ -361,13 +368,15 @@ defmodule Wagyu.HandshakeTest do
 
     send_datagrams(context, List.duplicate(transport(index), 200))
 
-    # UDP may lose some of the burst, so check against what arrived.
+    # UDP can lose some of the burst. Thus, compare with the datagrams that
+    # arrived.
     counters = settled(context)
     assert counters.datagrams > 128
     assert counters.inbound_routed == 128
     assert counters.inbound_peer_dropped == counters.datagrams - 1 - 128
 
-    # What the peer never took counts as dropped once it exits.
+    # After the peer exits, the packets that it did not take count as
+    # dropped.
     kill(peer)
     dropped = counters.inbound_peer_dropped + 128
     assert %{inbound_peer_dropped: ^dropped} = counters(context.interface, &(&1.inbound_peer_dropped == dropped))
@@ -393,15 +402,16 @@ defmodule Wagyu.HandshakeTest do
     send(sampler.pid, :stop)
     maxima = Task.await(sampler)
 
-    # Noise runs in at most 8 workers, and the interface keeps draining its
-    # socket meanwhile: 32 datagrams per re-arm and the workers' exits.
+    # Noise runs in a maximum of 8 workers. At the same time, the interface
+    # continues to empty its socket. It takes 32 datagrams each time that it
+    # arms the socket, and the exits of the workers.
     assert maxima.workers <= 8
     assert maxima.mailbox <= 48
 
-    # Every datagram that arrived is accounted for. Once 8 wait, the
-    # interface is under load, and with its clock stopped it stays so: every
-    # initiation after that gets a cookie reply instead. Only one genuine
-    # initiation is accepted.
+    # The counters include each datagram that arrived. When 8 initiations
+    # wait, the interface is under load. Its clock is stopped, so it stays
+    # under load. Each initiation after that gets a cookie reply. The
+    # interface accepts only one real initiation.
     assert counters.cookie_replies_sent > 0
     assert counters.datagrams == counters.initiations + counters.initiations_dropped + counters.cookie_replies_sent
 
@@ -420,7 +430,7 @@ defmodule Wagyu.HandshakeTest do
       {other_key, _private_key} = keypair()
       frame = genuine(context, 1, 77)
 
-      # A MAC1 for another key still gets nothing at all.
+      # A MAC1 for a different key still gets no reply.
       send_datagrams(context, [initiation(other_key), frame])
       reply = cookie_reply_to(context.client, 77)
 
@@ -430,9 +440,9 @@ defmodule Wagyu.HandshakeTest do
       assert :gen_udp.recv(context.client, 0, 100) == {:error, :timeout}
       assert interface_state(context).handshakes.queued == 8
 
-      # The cookie decrypts with the interface's public key and the
-      # initiation's MAC1. Under it the same initiation waits for a worker,
-      # and is accepted once one is free.
+      # The cookie decrypts with the public key of the interface and the MAC1
+      # of the initiation. With the cookie, the same initiation waits for a
+      # worker. The interface accepts it when a worker is free.
       cookie = cookie(reply, context.public_key, frame)
       send_datagrams(context, [with_mac2(frame, context.public_key, cookie)])
       assert eventually(fn -> interface_state(context).handshakes.queued == 9 end)
@@ -449,7 +459,7 @@ defmodule Wagyu.HandshakeTest do
       send_datagrams(context, [genuine(context, 1, 1)])
       cookie_reply_to(context.client, 1)
 
-      # The queue drains, with the interface's clock stopped.
+      # The queue becomes empty while the clock of the interface is stopped.
       for stand_in <- stand_ins, do: send(stand_in, :stop)
       settled(context)
 
@@ -485,7 +495,8 @@ defmodule Wagyu.HandshakeTest do
       send_datagrams(context, [frame])
       cookie = context.client |> cookie_reply_to(1) |> cookie(context.public_key, frame)
 
-      # From another port, the same MAC2 earns only a cookie of its own.
+      # From a different port, the same MAC2 gets only a new cookie for that
+      # port.
       {:ok, other} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}, active: false])
       :ok = :gen_udp.send(other, {127, 0, 0, 1}, context.port, with_mac2(frame, context.public_key, cookie))
       refute other |> cookie_reply_to(1) |> cookie(context.public_key, frame) == cookie
@@ -494,13 +505,13 @@ defmodule Wagyu.HandshakeTest do
       send_datagrams(context, [with_mac2(frame, context.public_key, cookie)])
       assert responded(context, timestamp(1))
 
-      # Its cookies pass while the secret is younger than 120 seconds...
+      # Its cookies pass while the secret is less than 120 seconds old...
       advance(context.clock, 119_980)
       under_load(context)
       send_datagrams(context, [with_mac2(genuine(context, 2, 2), context.public_key, cookie)])
       assert responded(context, timestamp(2))
 
-      # ...and then it is replaced, and the old cookie earns a new one.
+      # ...then a new secret replaces it, and the old cookie gets a new cookie.
       advance(context.clock, 20)
       under_load(context)
       frame = genuine(context, 3, 3)
@@ -522,7 +533,7 @@ defmodule Wagyu.HandshakeTest do
       send_datagrams(context, for(n <- 1..8, do: with_mac2(genuine(context, n, n), context.public_key, cookie)))
       assert %{initiations: 5, handshakes_rate_limited: 3} = settled(context)
 
-      # Every 50 ms earns one more.
+      # Each 50 ms gives one more initiation.
       advance(context.clock, 50)
       send_datagrams(context, for(n <- 9..10, do: with_mac2(genuine(context, n, n), context.public_key, cookie)))
       assert %{initiations: 6, handshakes_rate_limited: 4, cookie_replies_sent: 1} = settled(context)
@@ -537,14 +548,14 @@ defmodule Wagyu.HandshakeTest do
       cookie = context.client |> cookie_reply_to(5) |> cookie(context.public_key, response)
       assert %{cookie_replies_sent: 1, unknown_index: 0} = counters(context.interface, &(&1.cookie_replies_sent == 1))
 
-      # With MAC2 it goes on to its receiver index, which no peer holds.
+      # With MAC2, it goes on to its receiver index, which no peer holds.
       send_datagrams(context, [with_mac2(response, context.public_key, cookie)])
       assert %{unknown_index: 1, cookie_replies_sent: 1} = counters(context.interface, &(&1.unknown_index == 1))
     end
 
     test "transport under existing keys keeps flowing while a flood saturates the workers", context do
-      # The test initiates a session, which the peer responds to, and
-      # confirms it.
+      # The test initiates a session. The peer responds, and the test confirms
+      # the session.
       {frame, session} = initiate_to(context.public_key, context.initiator, timestamp(1), 1)
       send_datagrams(context, [frame])
       assert {:ok, {{127, 0, 0, 1}, _port, response}} = :gen_udp.recv(context.client, 0, 1_000)
@@ -553,7 +564,7 @@ defmodule Wagyu.HandshakeTest do
       send_datagrams(context, [transport_frame(session, index)])
       assert %{keys_confirmed: 1} = counters(context.interface, &(&1.keys_confirmed == 1))
 
-      # Genuine and forged initiations, with a keepalive every 30 datagrams.
+      # Real and forged initiations, with a keepalive after each 30 datagrams.
       stand_ins = saturate(context, 8)
       stranger = keypair()
 
@@ -569,7 +580,8 @@ defmodule Wagyu.HandshakeTest do
       send_datagrams(context, flood)
       assert %{keepalives_received: 11} = counters(context.interface, &(&1.keepalives_received == 11))
 
-      # No initiation in the flood reached a worker; each got a cookie reply.
+      # No initiation in the flood got to a worker. Each initiation got a
+      # cookie reply.
       counters = quiet(context)
       assert counters.initiations == 1
       assert counters.cookie_replies_sent == counters.datagrams - 12

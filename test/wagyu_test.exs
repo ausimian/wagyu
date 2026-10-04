@@ -7,7 +7,7 @@ defmodule WagyuTest do
 
   defp unique_name, do: :"wagyu_test_#{System.unique_integer([:positive])}"
 
-  # Every process an interface is running, and a monitor on its stack.
+  # Returns all the processes of an interface, and a monitor on its stack.
   defp processes(root) do
     children = children(root)
     {:ok, stack} = Wagyu.stack(root)
@@ -126,7 +126,7 @@ defmodule WagyuTest do
       end
     end
 
-    # Killing the interface logs its children's exits.
+    # When the test kills the interface, its children log their exits.
     @tag :capture_log
     test "a crashed interface releases its name" do
       name = unique_name()
