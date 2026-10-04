@@ -4,6 +4,19 @@ This file records all notable changes to this project.
 
 <!-- %% CHANGELOG_ENTRIES %% -->
 
+## 0.2.1 - 2026-10-04
+
+### Changed
+
+- The README and the documentation for `Wagyu`, `Wagyu.Config` and
+  `Wagyu.Config.Peer` are rewritten in Simplified Technical English (ASD-STE100):
+  shorter sentences, and lists for conditions, errors and options.
+
+### Fixed
+
+- The `Wagyu.Config` documentation now says that the `:invalid` reason also
+  covers values that are not allowed, such as a multicast address.
+
 ## 0.2.0 - 2026-09-29
 
 The first release of Wagyu, a user-mode WireGuard endpoint for `:gen_tcp` and
