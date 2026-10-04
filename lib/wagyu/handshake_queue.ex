@@ -3,12 +3,15 @@ defmodule Wagyu.HandshakeQueue do
 
   # Admission for inbound handshake initiations.
   #
-  # Responder Noise work is the only expensive thing an unauthenticated
-  # sender can trigger, so it is bounded twice: at most `max_active` workers
-  # run at once, and at most `max_queued` fixed-size frames wait for a free
-  # worker. Anything beyond that is refused, failing closed under load. The
-  # interface keeps this structure in its state; a worker's slot is released
-  # when the worker exits or fails to start.
+  # Responder Noise work is the only expensive work that an unauthenticated
+  # sender can cause. Thus it has two bounds:
+  #
+  #   * At most `max_active` workers run at the same time.
+  #   * At most `max_queued` fixed-size frames wait for a free worker.
+  #
+  # The queue refuses all other candidates, so under load it fails closed.
+  # The interface keeps this structure in its state. A worker's slot is
+  # released when the worker exits or does not start.
 
   @max_active 8
   @max_queued 64
@@ -27,9 +30,11 @@ defmodule Wagyu.HandshakeQueue do
   def new(options \\ []), do: struct!(__MODULE__, options)
 
   @doc """
-  Admits a candidate. Returns `{:start, candidate, queue}` when a worker slot
-  is free, `{:queued, queue}` when it must wait, and `:full` when it is
-  refused.
+  Admits a candidate. Returns one of these values:
+
+    * `{:start, candidate, queue}` if a worker slot is free.
+    * `{:queued, queue}` if the candidate must wait.
+    * `:full` if the queue refuses the candidate.
   """
   @spec admit(t(), term()) :: {:start, term(), t()} | {:queued, t()} | :full
   def admit(%__MODULE__{active: active, max_active: max} = queue, candidate) when active < max,
@@ -41,8 +46,8 @@ defmodule Wagyu.HandshakeQueue do
   def admit(%__MODULE__{}, _candidate), do: :full
 
   @doc """
-  Whether at least an eighth of the waiting room is taken (8 of 64 by
-  default), the load at which wireguard-go and Linux start to require
+  Returns whether candidates fill at least an eighth of the waiting room (8
+  of 64 by default). At this load, wireguard-go and Linux start to require
   cookies. Candidates wait only while every worker is busy.
   """
   @spec loaded?(t()) :: boolean()
@@ -50,7 +55,8 @@ defmodule Wagyu.HandshakeQueue do
 
   @doc """
   Releases a worker slot. The oldest waiting candidate takes it, as
-  `{:start, candidate, queue}`; with none waiting the slot is freed.
+  `{:start, candidate, queue}`. If no candidate waits, the slot becomes
+  free.
   """
   @spec release(t()) :: {:start, term(), t()} | {:idle, t()}
   def release(%__MODULE__{active: active} = queue) when active > 0 do

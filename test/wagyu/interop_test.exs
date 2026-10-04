@@ -1,8 +1,9 @@
 defmodule Wagyu.InteropTest do
-  # Interoperability with wireguard-go, run by `wgpeer` (test/interop) on
-  # gVisor's userspace network stack. Two Wagyu interfaces cannot catch a
-  # mistake both make the same way, such as a wrong MAC1 key or TAI64N base;
-  # wireguard-go can. These tests need Go (see test_helper.exs).
+  # Interoperability with wireguard-go. `wgpeer` (test/interop) runs
+  # wireguard-go on the userspace network stack of gVisor. Two Wagyu
+  # interfaces cannot find an error that both make in the same way. Examples
+  # are a wrong MAC1 key or a wrong TAI64N base. wireguard-go can find these
+  # errors. These tests need Go (see test_helper.exs).
   use ExUnit.Case, async: true
 
   import Wagyu.TestHelpers
@@ -11,7 +12,7 @@ defmodule Wagyu.InteropTest do
 
   @moduletag :interop
 
-  # wireguard-go's netstack address and Wagyu's stack address.
+  # The netstack address of wireguard-go and the stack address of Wagyu.
   @go_address {10, 13, 0, 1}
   @wagyu_address {10, 13, 0, 2}
 
@@ -63,8 +64,8 @@ defmodule Wagyu.InteropTest do
     socket
   end
 
-  # Sends `data` from another process, so that the echo coming back is read
-  # while the rest is still going out.
+  # Sends `data` from a different process. Thus the test can read the echo
+  # while the remaining data still goes out.
   defp send_async(socket, data), do: Task.async(fn -> :ok = SmolNet.send(socket, data, 30_000) end)
 
   defp recv_exactly(socket, size, acc \\ [])
@@ -82,8 +83,8 @@ defmodule Wagyu.InteropTest do
     end
   end
 
-  # Waits for wireguard-go to record a completed handshake with Wagyu, and
-  # returns its view of the peer.
+  # Waits until wireguard-go records a completed handshake with Wagyu.
+  # Returns the view that wireguard-go has of the peer.
   defp go_handshake(device) do
     eventually(fn ->
       %{peers: [peer]} = WgPeer.get(device)
@@ -114,8 +115,8 @@ defmodule Wagyu.InteropTest do
     :ok = SmolNet.bind(socket, %{family: :inet, addr: @wagyu_address, port: 0})
     :ok = SmolNet.sendto(socket, "hello", %{family: :inet, addr: @go_address, port: 9})
 
-    # wireguard-go records the handshake only once a transport message
-    # authenticates under the new key, which here is the packet that
+    # wireguard-go records the handshake only after a transport message
+    # authenticates under the new key. Here, that message is the packet that
     # started the handshake.
     peer = go_handshake(device)
     assert String.to_integer(peer["rx_bytes"]) > 0
@@ -128,13 +129,14 @@ defmodule Wagyu.InteropTest do
   end
 
   test "wireguard-go initiates, Wagyu responds, and wireguard-go's first packet confirms the key", context do
-    # Wagyu has no endpoint for wireguard-go and learns it from the initiation.
+    # Wagyu has no endpoint for wireguard-go. It gets the endpoint from the
+    # initiation.
     wagyu = start_wagyu(context, nil)
     {device, go_port} = start_go(context, endpoint: "127.0.0.1:#{wagyu.port}")
 
-    # A packet from wireguard-go's netstack to Wagyu's address starts the
-    # handshake, and wireguard-go sends it under the new key once Wagyu has
-    # responded.
+    # A packet from the netstack of wireguard-go to the address of Wagyu
+    # starts the handshake. After Wagyu responds, wireguard-go sends the
+    # packet under the new key.
     :ok = WgPeer.send_udp(device, @wagyu_address, 9, "hello")
 
     assert %{responses_sent: 1, keys_confirmed: 1, transport_invalid: 0} =
@@ -148,14 +150,15 @@ defmodule Wagyu.InteropTest do
   test "wireguard-go retries with the cookie from Wagyu's reply while Wagyu is under load", context do
     wagyu = start_wagyu(context, nil)
 
-    # Under load for the next minute, as a loaded initiation queue leaves it.
+    # Put the interface under load for the next minute, as a loaded
+    # initiation queue does.
     :sys.replace_state(wagyu.children.interface, &%{&1 | under_load_until: &1.clock.() + 60_000})
     {device, _go_port} = start_go(context, endpoint: "127.0.0.1:#{wagyu.port}")
     :ok = WgPeer.send_udp(device, @wagyu_address, 9, "hello")
 
     # The first initiation has no MAC2 and gets a cookie reply. wireguard-go
-    # decrypts it and retries after REKEY_TIMEOUT with MAC2 under the
-    # cookie, which Wagyu accepts.
+    # decrypts the reply. After REKEY_TIMEOUT, it tries again with MAC2 under
+    # the cookie, and Wagyu accepts it.
     counters =
       eventually(
         fn ->
@@ -181,10 +184,10 @@ defmodule Wagyu.InteropTest do
     peer = wagyu_peer(wagyu)
     %{current: %{local_index: first}} = :sys.get_state(peer)
 
-    # REKEY_AFTER_TIME passes on Wagyu's clock. The next datagram goes out
-    # under the old key and starts a handshake, and the echo comes back.
-    # wireguard-go takes at most one initiation from a peer every 20 ms of
-    # its own time, which a fake clock does not move.
+    # REKEY_AFTER_TIME goes by on the clock of Wagyu. The next datagram goes
+    # out under the old key and starts a handshake, and the echo comes back.
+    # wireguard-go takes a maximum of one initiation from a peer in each
+    # 20 ms of its own time. A fake clock does not move that time.
     clock = fake_clock(peer, System.monotonic_time(:millisecond))
     advance(clock, 120_000)
     Process.sleep(50)
@@ -192,7 +195,7 @@ defmodule Wagyu.InteropTest do
     assert {:ok, %{data: "ping"}} = SmolNet.recvfrom(socket, 0, 10_000)
     assert %{responses_accepted: 2} = counters(wagyu.interface, &(&1.responses_accepted == 2))
 
-    # Both sides carry on under the new key.
+    # The two sides continue under the new key.
     ping.()
     assert {:ok, %{data: "ping"}} = SmolNet.recvfrom(socket, 0, 10_000)
     assert %{current: %{local_index: second}, previous: %{local_index: ^first}} = :sys.get_state(peer)
@@ -208,14 +211,14 @@ defmodule Wagyu.InteropTest do
       :ok = WgPeer.echo(device, :tcp, 7)
       wagyu = start_wagyu(context, %{address: {127, 0, 0, 1}, port: go_port})
 
-      # The first datagram waits while Wagyu initiates, and then confirms
-      # the key.
+      # The first datagram waits while Wagyu initiates. Then the datagram
+      # confirms the key.
       socket = udp(wagyu)
       :ok = SmolNet.sendto(socket, "ping", %{family: :inet, addr: @go_address, port: 7})
       assert {:ok, %{data: "ping", source: %{addr: @go_address, port: 7}}} = SmolNet.recvfrom(socket, 0, 10_000)
 
-      # More than fits in either side's buffers, so the stream runs through
-      # both TCP windows many times over.
+      # This is more data than the buffers of each side can hold. Thus the
+      # stream goes through the two TCP windows many times.
       data = :crypto.strong_rand_bytes(1_000_000)
       tcp = connect(wagyu, 7)
       sender = send_async(tcp, data)
@@ -239,7 +242,7 @@ defmodule Wagyu.InteropTest do
       :ok = WgPeer.send_udp(device, @wagyu_address, 9_000, "hello")
       assert {:ok, %{data: "hello", source: %{addr: @go_address}}} = SmolNet.recvfrom(socket, 0, 10_000)
 
-      # Wagyu sends under the key wireguard-go's packet confirmed.
+      # Wagyu sends under the key that the packet from wireguard-go confirmed.
       :ok = SmolNet.sendto(socket, "reply", %{family: :inet, addr: @go_address, port: 7})
       assert {:ok, %{data: "reply", source: %{addr: @go_address, port: 7}}} = SmolNet.recvfrom(socket, 0, 10_000)
       assert %{responses_sent: 1, keys_confirmed: 1, initiations_sent: 0} = counters(wagyu.interface)
@@ -258,16 +261,18 @@ defmodule Wagyu.InteropTest do
       :ok = :gen_tcp.close(socket)
     end
 
-    # SmolNet advertises its whole receive buffer as its TCP window, so one
-    # stream is not limited to a segment per round trip, as it was before
-    # SmolNet 0.4.1 (about 47 KB/s over 50 ms). The floor is loose, to be
-    # safe on slow CI runners; WAGYU_THROUGHPUT=1 prints the rate measured.
+    # SmolNet advertises its full receive buffer as its TCP window. Thus one
+    # stream is not limited to one segment for each round trip. Before
+    # SmolNet 0.4.1, that limit applied (about 47 KB/s over 50 ms). The
+    # minimum rate is low, for slow CI runners. WAGYU_THROUGHPUT=1 prints the
+    # measured rate.
     test "one TCP stream sustains throughput over a simulated 50 ms round trip", context do
       {device, go_port} = start_go(context, [], delay: 50)
       :ok = WgPeer.sink(device, 9)
       wagyu = start_wagyu(context, %{address: {127, 0, 0, 1}, port: go_port})
 
-      # The handshake and connection set-up are outside the measurement.
+      # The measurement does not include the handshake or the connection
+      # set-up.
       tcp = connect(wagyu, 9)
       size = 2_000_000
       started = System.monotonic_time(:microsecond)
@@ -286,8 +291,8 @@ defmodule Wagyu.InteropTest do
 
   describe "preshared keys" do
     # Two wireguard-go devices, each with its own preshared key, and one
-    # Wagyu interface with both as peers. Each device's netstack address is
-    # routed to it alone.
+    # Wagyu interface that has the two devices as peers. The netstack address
+    # of each device routes only to that device.
     setup context do
       remotes =
         for {address, fill} <- [{{10, 13, 0, 1}, 7}, {{10, 13, 0, 3}, 8}] do
@@ -329,8 +334,8 @@ defmodule Wagyu.InteropTest do
 
       socket = udp(wagyu, 9_000)
 
-      # Both devices initiate at once, and Wagyu reads each initiation again
-      # with that device's key.
+      # The two devices initiate at the same time. Wagyu reads each initiation
+      # again with the key of that device.
       for {_remote, device} <- devices, do: :ok = WgPeer.send_udp(device, @wagyu_address, 9_000, "hello")
 
       for _device <- devices do
@@ -338,7 +343,7 @@ defmodule Wagyu.InteropTest do
         assert address in Enum.map(context.remotes, & &1.address)
       end
 
-      # Each reply goes under its own device's key.
+      # Each reply goes under the key of its device.
       for {remote, _device} <- devices do
         :ok = SmolNet.sendto(socket, "reply", %{family: :inet, addr: remote.address, port: 7})
         assert {:ok, %{data: "reply", source: %{addr: address}}} = SmolNet.recvfrom(socket, 0, 10_000)

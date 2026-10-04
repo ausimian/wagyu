@@ -1,6 +1,6 @@
 defmodule Wagyu.ExchangeTest do
-  # Two Wagyu interfaces, each the other's configured peer, completing
-  # handshakes over loopback UDP. The interfaces run on fake clocks.
+  # Two Wagyu interfaces complete handshakes over loopback UDP. Each interface
+  # is the configured peer of the other. The interfaces run on fake clocks.
   use ExUnit.Case, async: true
 
   import Wagyu.TestHelpers
@@ -54,7 +54,7 @@ defmodule Wagyu.ExchangeTest do
     }
   end
 
-  # An outbound packet to the other side's tunnel address.
+  # Returns an outbound packet to the tunnel address of the other side.
   defp demand(side), do: :ok = SmolNet.sendto(side.udp, "hello", %{family: :inet, addr: side.gateway, port: 9})
 
   defp peer(%{peer_key: key} = side) do
@@ -64,7 +64,8 @@ defmodule Wagyu.ExchangeTest do
     end
   end
 
-  # The handshake hash and indices of each key pair the side's peer holds.
+  # Returns the handshake hash and indices of each key pair that the peer of
+  # the side holds.
   defp key_pairs(side) do
     in_process(peer(side), fn state ->
       for slot <- [:next, :current, :previous], key_pair = Map.fetch!(state, slot), key_pair != nil, into: %{} do
@@ -75,16 +76,17 @@ defmodule Wagyu.ExchangeTest do
 
   defp established?(side), do: peer(side) != nil and Map.has_key?(key_pairs(side), :current)
 
-  # Whether `a`'s current key pair is the same handshake as one of `b`'s,
-  # seen from the other end.
+  # Returns true if the current key pair of `a` and one key pair of `b` come
+  # from the same handshake. `b` sees that handshake from the other end.
   defp matches?(a, b, slots) do
     {hash, local, remote} = Map.fetch!(key_pairs(a), :current)
     b = key_pairs(b)
     Enum.any?(slots, &(Map.get(b, &1) == {hash, remote, local}))
   end
 
-  # Sends a message under `from`'s current key to `to`, which authenticates
-  # it and then drops it, since it is not an IP packet.
+  # Sends a message under the current key of `from` to `to`. `to`
+  # authenticates the message and then drops it, because it is not an IP
+  # packet.
   defp transport_to(from, to) do
     frame =
       in_process(peer(from), fn %{current: key_pair} ->
@@ -104,13 +106,13 @@ defmodule Wagyu.ExchangeTest do
     demand(a)
     assert eventually(fn -> established?(a) and established?(b) end)
 
-    # A initiated and B responded; the packet that started it confirmed the
-    # key to B.
+    # A initiated and B responded. The packet that started the handshake
+    # confirmed the key to B.
     assert matches?(a, b, [:current])
     assert %{initiations_sent: 1, responses_accepted: 1, transport_sent: 1} = counters(a.interface)
     assert %{responses_sent: 1, keys_confirmed: 1} = counters(b.interface)
 
-    # Each side's sending key is the other's receiving key.
+    # The sending key of each side is the receiving key of the other side.
     transport_to(a, b)
     transport_to(b, a)
     assert %{transport_invalid: 0} = counters(a.interface)
@@ -123,8 +125,9 @@ defmodule Wagyu.ExchangeTest do
     {a_peer, b_peer} = {peer(a), peer(b)}
 
     for {initiator, responder, n} <- [{b, a, 2}, {a, b, 3}] do
-      # REKEY_TIMEOUT has passed since the initiator's last handshake
-      # message, and 20 ms since the responder last accepted an initiation.
+      # REKEY_TIMEOUT is past since the last handshake message of the
+      # initiator. 20 ms is past since the responder last accepted an
+      # initiation.
       advance(fake_clock(peer(initiator), System.monotonic_time(:millisecond)), 5_000)
       advance(responder.clock, 20)
       send(peer(initiator), :wg_initiate)
@@ -134,7 +137,7 @@ defmodule Wagyu.ExchangeTest do
                confirmed == n - 1 and matches?(initiator, responder, [:current])
              end)
 
-      # The old key pair is each side's previous one.
+      # The old key pair is now the previous key pair of each side.
       assert %{previous: _previous} = key_pairs(initiator)
       assert %{previous: _previous} = key_pairs(responder)
     end
@@ -147,8 +150,9 @@ defmodule Wagyu.ExchangeTest do
     demand(a)
     demand(b)
 
-    # Each side completes its own initiation and responds to the other's,
-    # so each sends under its own handshake and receives under both.
+    # Each side completes its own initiation and responds to the initiation of
+    # the other. Thus each side sends under its own handshake and receives
+    # under the two handshakes.
     assert eventually(fn -> established?(a) and established?(b) end)
     assert eventually(fn -> matches?(a, b, [:current, :previous]) and matches?(b, a, [:current, :previous]) end)
 

@@ -1,94 +1,124 @@
 defmodule Wagyu.Interface do
   @moduledoc false
 
-  # The UDP socket owner and shallow demultiplexer.
+  # The owner of the UDP socket, and a shallow demultiplexer.
   #
-  # The interface owns the real UDP socket, the configuration and its
-  # AllowedIPs routes, the table from configured public keys to running
-  # peer processes, the local receiver-index table, and the greatest
-  # initiation timestamp accepted from each peer. It does only fixed-size
-  # work per datagram: decode, MAC1 and MAC2 screening, a cookie reply,
-  # admission and an index lookup. It never runs Noise.
+  # The interface owns these items:
   #
-  # The socket is in bounded active mode: it delivers `@active` datagrams and
-  # then waits for the interface to re-arm it, so datagrams never pile up in
-  # the mailbox faster than they are handled. Valid initiations are admitted
-  # to a bounded pool of handshake workers (`Wagyu.HandshakeQueue`), which
-  # run Noise and then claim their peer here with `claim_peer/3`. As in
-  # wireguard-go and Linux, a claim is authorized only for a configured key
-  # whose timestamp is newer than any accepted from it before, and not
-  # within 20 ms of the last initiation accepted from it. The claim also
-  # admits the worker's handoff against the peer's small handoff bound,
-  # which is separate from its inbound bound, so frames sent to a peer's
-  # index cannot crowd out the handshakes that would replace it. Accepted
-  # timestamps last as long as this interface, outliving any peer process,
-  # so a replay cannot follow a peer's restart.
+  #   * the real UDP socket
+  #   * the configuration and its AllowedIPs routes
+  #   * the table from configured public keys to running peer processes
+  #   * the local receiver-index table
+  #   * the greatest initiation timestamp accepted from each peer
   #
-  # A handshake message (an initiation or a response) whose MAC1 does not
-  # match this interface's key is dropped without a reply. As in
-  # wireguard-go and Linux, the interface is under load while at least an
-  # eighth of the initiation queue is waiting, or once a worker cannot be
-  # started, and for a second after. Under load a handshake message must
-  # also carry a MAC2 made with the cookie for the address it came from
-  # (`Wagyu.Cookie`). One without gets a cookie reply, which costs no Noise
-  # work, and goes no further; one with it goes on only within its source's
-  # budget (`Wagyu.RateLimiter`). The cookie secret and the budgets are
-  # bounded, and neither the reply nor the budget starts a peer.
+  # For each datagram, the interface does only a fixed quantity of work:
+  # decode, MAC1 and MAC2 checks, a cookie reply, admission and an index
+  # lookup. It never runs Noise.
   #
-  # Other messages are addressed by receiver index (`Wagyu.IndexTable`).
-  # Peers allocate and retire their indices here; an index is forwarded only
-  # to the live peer that holds it, and an unknown or retired index drops
-  # here. When a peer exits, every index it held becomes a tombstone.
+  # The socket is in bounded active mode. It delivers `@active` datagrams,
+  # and then it waits until the interface arms it again. Thus datagrams
+  # never collect in the mailbox faster than the interface processes them.
+  # Valid initiations are admitted to a bounded pool of handshake workers
+  # (`Wagyu.HandshakeQueue`). The workers run Noise, and then claim their
+  # peer here with `claim_peer/3`.
   #
-  # A peer that initiates a handshake gets its sender index and timestamp
-  # here together (`allocate_initiation/2`). The interface keeps the last
-  # timestamp it gave each peer, so a peer's initiations are strictly
-  # increasing across restarts of its process, and each is later than the
-  # moment the interface started. A peer never sends an initiation before
-  # the wall-clock time it names, so every timestamp sent before this
-  # interface started is at or before that moment, and this interface's
-  # timestamps follow those of any interface that ran before it. Only a
-  # wall clock that steps back can break that: timestamps then run ahead of
-  # it.
+  # As in wireguard-go and Linux, the interface authorizes a claim only if
+  # all of these conditions are true:
   #
-  # Peers count their handshake events in the interface's counters, which
-  # they share, so `info/1` reports them without calling a peer.
+  #   * The key is a configured key.
+  #   * The timestamp is newer than all timestamps accepted from that key.
+  #   * The initiation is not within 20 ms of the last initiation accepted
+  #     from that key.
   #
-  # Egress packets from the link are routed by destination through
-  # AllowedIPs. Peers are configuration records until traffic or an
-  # authorized initiation needs one, or, for a peer with a persistent
-  # keepalive, until the peer supervisor starts; the interface then starts
-  # its process, monitors it, and forgets it when it exits. A peer with a
-  # persistent keepalive that exits is started again a second later. The
-  # interface is the only process that starts peers, so there is at most
-  # one per key.
-  # Every send to a peer is admitted against that peer's bound first.
-  # Messages that cannot be admitted or acted on are dropped and counted.
-  # Egress also counts against the link's credit (`Wagyu.EgressCredit`)
-  # while the interface or a peer's queue holds it, so that the stack sends
-  # no more than they have room for. The interface records the credit each
-  # peer holds, what it has admitted to the peer's queue and not yet
-  # retired. When the peer has taken a batch (`outbound_taken/2`), the
-  # interface retires whatever the queue no longer holds, and when the peer
-  # goes, all of it. The queue's own count is the only one the peer
-  # changes, so this is exact however the peer exits. Whenever the interface
-  # retires credit it tells the link.
+  # The claim also admits the handoff of the worker against the small
+  # handoff bound of the peer. This bound is separate from the inbound bound
+  # of the peer. Thus frames sent to the index of a peer cannot push out the
+  # handshakes that replace that index. The interface keeps accepted
+  # timestamps for its full life, which is longer than the life of any peer
+  # process. Thus a replay cannot follow the restart of a peer.
   #
-  # A peer that has been idle long enough to discard its keys asks to be
-  # forgotten (`release_peer/3`) and exits once it is. The interface agrees
-  # only when nothing admitted for the peer is still waiting to reach it,
-  # and it stops forwarding to the peer and retires its indices in the same
-  # step, so no message is lost to the exit: whatever comes next starts a
-  # new process. The interface keeps the endpoint the peer had, which may
-  # have been learned from its traffic, and starts the next process with
-  # it.
+  # The interface drops a handshake message (an initiation or a response)
+  # without a reply if its MAC1 does not match the key of this interface.
+  # As in wireguard-go and Linux, the interface is under load in these
+  # conditions, and for one second after them:
   #
-  # Synchronous calls go one way: workers and peers may call the interface,
-  # and the interface calls only the supervisors that start them, never a
-  # peer, a worker or the link.
+  #   * At least one eighth of the initiation queue waits.
+  #   * A worker cannot start.
   #
-  # Time comes from `state.clock`, monotonic milliseconds, which tests
-  # replace with a fake clock.
+  # Under load, a handshake message must also have a MAC2 made with the
+  # cookie for its source address (`Wagyu.Cookie`). A message without this
+  # MAC2 gets a cookie reply, which costs no Noise work, and goes no
+  # further. A message with this MAC2 continues only within the budget of
+  # its source (`Wagyu.RateLimiter`). The cookie secret and the budgets are
+  # bounded. The reply and the budget do not start a peer.
+  #
+  # Other messages have a receiver index (`Wagyu.IndexTable`). Peers
+  # allocate and retire their indices here. The interface forwards a message
+  # only to the live peer that holds its index. It drops a message with an
+  # unknown or retired index. When a peer exits, each index that it held
+  # becomes a tombstone.
+  #
+  # A peer that initiates a handshake gets its sender index and its
+  # timestamp here together (`allocate_initiation/2`). The interface keeps
+  # the last timestamp that it gave to each peer. Thus the initiation
+  # timestamps of a peer increase strictly across restarts of its process.
+  # Each timestamp is also later than the start time of the interface.
+  #
+  # A peer never sends an initiation before the wall-clock time in it. Thus
+  # each timestamp sent before this interface started is at or before its
+  # start time. As a result, the timestamps of this interface come after
+  # the timestamps of all interfaces that ran before it. Only a wall clock
+  # that moves back can break this rule. Then the timestamps are ahead of
+  # the clock.
+  #
+  # Peers count their handshake events in the counters of the interface,
+  # which they share. Thus `info/1` reports these events without a call to a
+  # peer.
+  #
+  # The interface routes egress packets from the link by destination
+  # through AllowedIPs. A peer is only a configuration record until it needs
+  # a process. A peer needs a process for traffic or for an authorized
+  # initiation. A peer with a persistent keepalive also needs one when the
+  # peer supervisor starts. Then the interface starts the process of the
+  # peer, monitors it, and forgets it when it exits.
+  #
+  # If a peer with a persistent keepalive exits, the interface starts it
+  # again one second later. Only the interface starts peers. Thus there is a
+  # maximum of one peer for each key.
+  #
+  # Each send to a peer is admitted against the bound of that peer first.
+  # The interface drops and counts the messages that it cannot admit or
+  # process. While the interface or the queue of a peer holds egress, that
+  # egress counts against the credit of the link (`Wagyu.EgressCredit`).
+  # Thus the stack sends no more than they have space for.
+  #
+  # The interface records the credit that each peer holds: the packets that
+  # it admitted to the queue of the peer and did not retire yet. When the
+  # peer takes a batch (`outbound_taken/2`), the interface retires the
+  # packets that the queue no longer holds. When the peer goes, the
+  # interface retires all of the credit of the peer.
+  #
+  # The peer changes only the count of its queue. Thus the record of the
+  # interface is exact, however the peer exits. Each time the interface
+  # retires credit, it tells the link.
+  #
+  # A peer that is idle for long enough to discard its keys asks the
+  # interface to forget it (`release_peer/3`). After the interface forgets
+  # the peer, the peer exits. The interface agrees only when no admitted
+  # message for the peer still waits to reach it.
+  #
+  # In the same step, the interface no longer forwards messages to the peer,
+  # and it retires the indices of the peer. Thus the exit causes no loss of
+  # messages, and the next message starts a new process. The interface
+  # keeps the endpoint of the peer, which the peer possibly learned from its
+  # traffic. The interface starts the next process with that endpoint.
+  #
+  # Synchronous calls go in one direction only. Workers and peers can call
+  # the interface. The interface calls only the supervisors that start
+  # them, never a peer, a worker or the link.
+  #
+  # Time comes from `state.clock`, in monotonic milliseconds. Tests replace
+  # it with a fake clock.
 
   use GenServer
 
@@ -108,45 +138,53 @@ defmodule Wagyu.Interface do
   alias Wagyu.RateLimiter
   alias Wagyu.TAI64N
 
-  # Datagrams the socket delivers before it must be re-armed.
+  # The number of datagrams that the socket delivers before the interface
+  # must arm it again.
   @active 32
-  # Egress the link may have queued for the interface at once.
+  # The maximum egress that the link can have in the queue for the
+  # interface at one time.
   @egress_packets 256
   @egress_bytes 512 * 1024
-  # Each peer's inbound and outbound queues, bounded separately, and again
-  # the outbound packets it holds while it has no key to send them with.
+  # The bounds of the inbound queue and the outbound queue of each peer.
+  # Each queue has its own bound. The same bound applies again to the
+  # outbound packets that a peer holds while it has no key to send them.
   @peer_packets 128
   @peer_bytes 256 * 1024
-  # Handoffs waiting for a peer: one it is taking and one more. A newer
-  # handshake replaces an older one, so a deeper queue would only hold
-  # handshakes the peer is about to discard.
+  # The handoffs that can wait for a peer: one that the peer takes now, and
+  # one more. A newer handshake replaces an older handshake. Thus a deeper
+  # queue would only hold handshakes that the peer will discard.
   @peer_handoffs 2
-  # A restarted interface rebinds the same port, which its predecessor's
-  # socket may hold for a moment after that process was killed.
+  # A restarted interface binds the same port again. The socket of the
+  # previous interface can hold the port for a short time after that
+  # process was killed.
   @bind_attempts 10
   @bind_retry 10
-  # OTP 27 gives a UDP socket an 8 KiB receive buffer, which a burst of
-  # small datagrams overflows while the interface is busy; OTP 28 leaves the
-  # OS default. Set it explicitly so the interface behaves the same on both.
-  # The kernel may cap it lower. The backend's own buffer must hold the
-  # largest datagram whole: a transport message is up to the MTU plus 32
-  # bytes, and the MTU may be up to 65,475.
+  # OTP 27 gives a UDP socket an 8 KiB receive buffer. A burst of small
+  # datagrams can overflow it while the interface is busy. OTP 28 uses the
+  # OS default. The interface sets the size explicitly, to get the same
+  # behavior on both. The kernel can set a lower limit.
+  #
+  # The buffer of the backend must hold the largest datagram completely. A
+  # transport message is up to the MTU plus 32 bytes, and the MTU can be up
+  # to 65,475.
   @recbuf 1_048_576
   @buffer 65_535
   # The socket backend sends from the calling process through the socket
-  # NIF, about a quarter faster per datagram than the inet driver. Peers
-  # send their own datagrams on this socket, so they get that too. Before
-  # OTP 27.2 (kernel 10.2) the backend sets `ipv6_v6only` only after binding,
-  # which fails, so an IPv6 socket there keeps the inet driver.
+  # NIF. For each datagram, it is about 25% faster than the inet driver.
+  # Peers send their own datagrams on this socket. Thus they also get this
+  # speed. Before OTP 27.2 (kernel 10.2), the backend sets `ipv6_v6only`
+  # only after it binds, and this fails. Thus an IPv6 socket on those
+  # versions uses the inet driver.
   @v6only_before_bind [10, 2]
-  # How long after a peer with a persistent keepalive fails the interface
-  # starts it again, so a peer that fails at once cannot spin.
+  # The time after which the interface starts a failed peer with a
+  # persistent keepalive again. Thus a peer that fails immediately at each
+  # start cannot cause a tight restart loop.
   @peer_restart 1_000
-  # The least time between two accepted initiations from one peer, in
-  # milliseconds (wireguard-go's and Linux's 50 per second).
+  # The minimum time between two accepted initiations from one peer, in
+  # milliseconds (50 each second, as in wireguard-go and Linux).
   @initiation_interval 20
-  # How long the interface stays under load once it is no longer loaded
-  # (wireguard-go's UnderLoadAfterTime).
+  # The time for which the interface stays under load after the load stops
+  # (UnderLoadAfterTime in wireguard-go).
   @under_load_after 1_000
 
   @counters [
@@ -191,7 +229,7 @@ defmodule Wagyu.Interface do
     cookie_replies_invalid: 39
   ]
 
-  # The counters peers update.
+  # The counters that peers update.
   @peer_counters [
     :initiations_sent,
     :initiations_no_endpoint,
@@ -226,11 +264,15 @@ defmodule Wagyu.Interface do
   def start_link({root, %Config{} = config}), do: GenServer.start_link(__MODULE__, {root, config})
 
   @doc """
-  Admits egress packets from the link and sends them to `root`'s interface,
-  in order. Returns how many were refused because its queue was full or no
-  interface is running, and the interface, queue and credit count that took
-  the rest, so that the link can account for them and grant their credit
-  back as they leave or when that interface exits.
+  Admits egress packets from the link and sends them to the interface of
+  `root`, in sequence. Returns two values:
+
+    * the number of packets refused because the queue was full or no
+      interface runs
+    * the interface, queue and credit count that took the other packets
+
+  The link uses these values to account for the packets. It grants their
+  credit back when they leave, or when that interface exits.
   """
   @spec deliver(term(), [binary()]) :: {non_neg_integer(), {pid(), Admission.t(), EgressCredit.t()} | nil}
   def deliver(root, packets) do
@@ -246,7 +288,7 @@ defmodule Wagyu.Interface do
     end
   end
 
-  @doc "Returns the interface's public state, or `:error` if it is not running."
+  @doc "Returns the public state of the interface, or `:error` if the interface does not run."
   @spec info(pid()) :: {:ok, map()} | :error
   def info(interface) do
     GenServer.call(interface, :info)
@@ -255,27 +297,37 @@ defmodule Wagyu.Interface do
   end
 
   @doc """
-  Claims the peer for an initiation that a handshake worker has
-  authenticated, returning the peer's process and its configuration, which
-  holds its preshared key. The reply carries the configuration rather than
-  the bare key so that the `sys` debug log, which records replies as they
-  are, formats the key only through `Wagyu.Config.Peer`'s `Inspect`, which
-  omits it.
+  Claims the peer for an initiation that a handshake worker authenticated.
+  Returns the process of the peer and its configuration, which holds its
+  preshared key. The reply contains the configuration, not the bare key,
+  because the `sys` debug log records replies without changes. Thus the
+  log formats the key only through the `Inspect` implementation of
+  `Wagyu.Config.Peer`, which omits the key.
 
-  The claim is atomic: `root`'s interface authorizes `remote_key` against the
-  configuration and `timestamp` against the greatest one it has accepted for
-  that key, rate-limits the key, gets or starts its one peer process, and
-  admits the handoff the caller must then send against that peer's handoff
-  bound. It records the timestamp only if all of that succeeds. The errors
-  are `:unknown_peer`, `:replayed` for a timestamp that is not strictly
-  greater, `:rate_limited` for an initiation within 20 ms of the last one
-  accepted for the key, and `:unavailable` when the peer cannot start,
-  already has as many handoffs waiting as its bound allows, or no interface
-  is running.
+  The claim is atomic. The interface of `root` does these steps:
 
-  The call has no timeout: a caller that gave up could leave an admitted
-  handoff that is never sent. Waiting without one cannot deadlock, because
-  the interface never calls workers or peers.
+    1. It authorizes `remote_key` against the configuration.
+    2. It authorizes `timestamp` against the greatest timestamp that it
+       accepted for that key.
+    3. It applies the rate limit to the key.
+    4. It gets or starts the one peer process for the key.
+    5. It admits the handoff against the handoff bound of that peer. The
+       caller must then send this handoff.
+
+  The interface records the timestamp only if all of these steps are
+  successful. The errors are:
+
+    * `:unknown_peer`
+    * `:replayed` - the timestamp is not strictly greater
+    * `:rate_limited` - the initiation is within 20 ms of the last one
+      accepted for the key
+    * `:unavailable` - the peer cannot start, or it already has the maximum
+      number of handoffs that can wait, or no interface runs
+
+  The call has no timeout, because a caller that abandoned the call could
+  leave an admitted handoff that is never sent. A wait without a timeout
+  cannot cause a deadlock, because the interface never calls workers or
+  peers.
   """
   @spec claim_peer(term(), <<_::256>>, TAI64N.t()) ::
           {:ok, pid(), Config.Peer.t()} | {:error, :unknown_peer | :replayed | :rate_limited | :unavailable}
@@ -289,12 +341,12 @@ defmodule Wagyu.Interface do
   end
 
   @doc """
-  Allocates a local receiver index for the calling peer, the running peer
-  for `public_key`. Messages addressed to the index are forwarded to that
-  peer until it retires the index or exits. Returns `:error` if the caller
-  is not that peer or no interface is running. Like `claim_peer/3`, the call
-  has no timeout, so an index is never allocated to a caller that stopped
-  waiting for it.
+  Allocates a local receiver index for the calling peer, which is the
+  running peer for `public_key`. The interface forwards messages for the
+  index to that peer until the peer retires the index or exits. Returns
+  `:error` if the caller is not that peer, or if no interface runs. The call
+  has no timeout, the same as `claim_peer/3`. Thus the interface never
+  allocates an index to a caller that no longer waits for it.
   """
   @spec allocate_index(term(), <<_::256>>) :: {:ok, IndexTable.index()} | :error
   def allocate_index(root, public_key) do
@@ -307,15 +359,19 @@ defmodule Wagyu.Interface do
   end
 
   @doc """
-  Allocates a local sender index, as `allocate_index/2` does, and the
-  timestamp for the calling peer's next initiation.
+  Allocates a local sender index, the same as `allocate_index/2`. It also
+  allocates the timestamp for the next initiation of the calling peer.
 
-  The timestamp is the wall clock's when that is later than the last one
-  this interface gave the peer and than the moment the interface started.
-  Otherwise it is the next one after the later of those
-  (`Wagyu.TAI64N.next/2`), which may be slightly ahead of the wall clock.
-  Returns `:error` if the caller is not the running peer for `public_key`
-  or no interface is running.
+  The timestamp is the wall-clock time if that time is later than these
+  two times:
+
+    * the last timestamp that this interface gave to the peer
+    * the start time of the interface
+
+  If not, the timestamp is the next one after the later of these two times
+  (`Wagyu.TAI64N.next/2`). This timestamp can be slightly ahead of the wall
+  clock. Returns `:error` if the caller is not the running peer for
+  `public_key`, or if no interface runs.
   """
   @spec allocate_initiation(term(), <<_::256>>) :: {:ok, IndexTable.index(), TAI64N.t()} | :error
   def allocate_initiation(root, public_key) do
@@ -328,18 +384,18 @@ defmodule Wagyu.Interface do
   end
 
   @doc """
-  Counts a peer's event in its interface's `counters`, which the interface
-  gives each peer it starts. `name` is one of the peer counters in
-  `t:Wagyu.info/0`.
+  Counts an event of a peer in the `counters` of its interface. The
+  interface gives these counters to each peer that it starts. `name` is one
+  of the peer counters in `t:Wagyu.info/0`.
   """
   @spec count_peer_event(:counters.counters_ref(), atom(), non_neg_integer()) :: :ok
   def count_peer_event(counters, name, increment \\ 1) when name in @peer_counters,
     do: :counters.add(counters, Keyword.fetch!(@counters, name), increment)
 
   @doc """
-  Tells `root`'s interface that the calling peer, the running peer for
-  `public_key`, has taken outbound packets off its queue, so that their
-  egress credit is free again.
+  Tells the interface of `root` that the calling peer took outbound packets
+  from its queue. The calling peer is the running peer for `public_key`.
+  The egress credit of these packets is then free again.
   """
   @spec outbound_taken(term(), <<_::256>>) :: :ok
   def outbound_taken(root, public_key) do
@@ -352,13 +408,15 @@ defmodule Wagyu.Interface do
   end
 
   @doc """
-  Forgets the calling peer, the running peer for `public_key`, which then
-  exits. Its indices are retired, and the next traffic for the key starts a
-  new process, with `endpoint` as its endpoint unless that is `nil`.
-  Returns `:busy`, and forgets nothing, while messages admitted for the
-  peer are still waiting for it to take them. Also returns `:ok` if the
-  caller is not that peer or no interface is running, since nothing will
-  be sent to it either way.
+  Forgets the calling peer, which is the running peer for `public_key`.
+  The peer then exits. The interface retires its indices. The next traffic
+  for the key starts a new process, with `endpoint` as its endpoint if
+  `endpoint` is not `nil`.
+
+  Returns `:busy`, and forgets nothing, while admitted messages for the
+  peer still wait for it to take them. Also returns `:ok` if the caller is
+  not that peer, or if no interface runs, because nothing will go to the
+  caller in either case.
   """
   @spec release_peer(term(), <<_::256>>, {:inet.ip_address(), :inet.port_number()} | nil) :: :ok | :busy
   def release_peer(root, public_key, endpoint) do
@@ -401,8 +459,8 @@ defmodule Wagyu.Interface do
            root: root,
            config: config,
            socket: socket,
-           # The backend's socket is not linked to its owner, so a monitor
-           # reports that it closed.
+           # The socket of the backend has no Erlang link to its owner.
+           # Thus a monitor reports that it closed.
            socket_monitor: :inet.monitor(socket),
            port: port,
            mac1_key: Packet.mac1_key(config.public_key),
@@ -521,14 +579,15 @@ defmodule Wagyu.Interface do
     {:noreply, state}
   end
 
-  # The batch is routed first, and each peer's share of it is forwarded as
-  # one message, in order. Each packet stays admitted until it has been
-  # dropped or forwarded, so if the interface dies part-way through a batch
-  # the link counts the rest as dropped. At most the share being forwarded
-  # at that instant may be counted twice.
+  # The interface routes the batch first. Then it forwards the share of each
+  # peer as one message, in sequence. Each packet stays admitted until the
+  # interface drops or forwards it. Thus, if the interface dies during a
+  # batch, the link counts the remaining packets as dropped. Only the share
+  # that the interface forwards at that instant can be counted two times.
   def handle_info({:wg_egress, packets}, state) do
     {state, forwarded} = packets |> route(state) |> Enum.reduce({state, 0}, &forward/2)
-    # The rest were dropped, and the link may grant their credit again.
+    # The interface dropped the other packets, and the link can grant their
+    # credit again.
     if forwarded < length(packets), do: retired(state)
     {:noreply, state}
   end
@@ -543,8 +602,9 @@ defmodule Wagyu.Interface do
   def handle_info({:DOWN, monitor, :process, pid, reason}, state) do
     case Map.pop(state.monitors, monitor) do
       {:worker, monitors} ->
-        # A worker exits normally once its claim is settled, and the claim
-        # was counted then. Anything else means its initiation failed.
+        # A worker exits normally after its claim is complete, and the claim
+        # was counted at that time. All other exits mean that its initiation
+        # failed.
         if reason != :normal, do: count(state, :initiations_failed)
         {:noreply, worker_done(%{state | monitors: monitors})}
 
@@ -556,7 +616,7 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # The peer supervisor has started, or restarted: peers with a persistent
+  # The peer supervisor started or restarted. Peers with a persistent
   # keepalive start with it.
   def handle_info(:peer_supervisor_started, state) do
     {:noreply,
@@ -590,7 +650,8 @@ defmodule Wagyu.Interface do
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
-  # A socket that has just closed may exit before it answers the close.
+  # A socket that closed a short time ago can exit before it answers the
+  # close.
   def terminate(_reason, state) do
     :gen_udp.close(state.socket)
   catch
@@ -600,7 +661,7 @@ defmodule Wagyu.Interface do
   @impl true
   def format_status(status), do: Wagyu.Redact.format_status(status, [:config, :cookies], &redact_reply/1)
 
-  # A claim's reply carries the peer's preshared key.
+  # The reply to a claim contains the preshared key of the peer.
   defp redact_reply({:ok, peer, %Config.Peer{}}), do: {:ok, peer, :redacted}
   defp redact_reply(reply), do: reply
 
@@ -625,8 +686,8 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # MAC1 first, then, under load, MAC2 and the source's budget, before
-  # `accept` takes the message on.
+  # The interface checks MAC1 first. Then, under load, it checks MAC2 and
+  # the budget of the source. After that, `accept` processes the message.
   defp handshake(state, frame, source, sender_index, accept) do
     if Packet.valid_mac1?(frame, state.mac1_key) do
       now = state.clock.()
@@ -669,10 +730,11 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # A message goes only to the live peer holding its index, within that
-  # peer's inbound bound. A retired index is a tombstone and drops like an
-  # unknown one. An index is retired when the interface processes its
-  # peer's exit, so the peer check covers the moment before that.
+  # A message goes only to the live peer that holds its index, within the
+  # inbound bound of that peer. A retired index is a tombstone, and its
+  # messages drop the same as for an unknown index. The interface retires an
+  # index when it processes the exit of its peer. Thus the peer check covers
+  # the time before that.
   defp indexed(state, index, frame, source) do
     with {:active, {key, pid}} <- IndexTable.lookup(state.indices, index),
          %{^key => %{pid: ^pid} = peer} <- state.peers do
@@ -695,15 +757,16 @@ defmodule Wagyu.Interface do
         count(state, :initiations)
         %{state | monitors: Map.put(state.monitors, Process.monitor(worker), :worker)}
 
-      # With no worker to run it, the handshake capacity is exhausted.
+      # If no worker can run it, the handshake capacity is fully used.
       {:error, _reason} ->
         count(state, :initiations_dropped)
         state |> under_load(state.clock.()) |> worker_done()
     end
   end
 
-  # Load lasts a second past its end, which can come here, when a worker's
-  # slot is released and no datagram arrives to notice it.
+  # Load continues for one second after it stops. The load can stop here,
+  # when a worker releases its slot and no datagram arrives to detect the
+  # change.
   defp worker_done(state) do
     state = if HandshakeQueue.loaded?(state.handshakes), do: under_load(state, state.clock.()), else: state
 
@@ -745,10 +808,11 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # A peer that is slow to drain its mailbox refuses new handshakes rather
-  # than queueing them without limit. Handoffs are counted in messages
-  # only. The peer releases each as it takes it; one still queued when the
-  # peer exits is discarded with it, having been counted as accepted.
+  # If a peer empties its mailbox slowly, it refuses new handshakes. It does
+  # not queue them without a limit. Handoffs are counted only in messages.
+  # The peer releases each handoff when it takes it. If a handoff is still
+  # in the queue when the peer exits, the handoff is discarded with the
+  # peer. It was already counted as accepted.
   defp admit_handoff(peer, state) do
     case Admission.admit(peer.handoffs, 1, 0) do
       :ok -> :ok
@@ -763,9 +827,9 @@ defmodule Wagyu.Interface do
 
   # Egress
 
-  # Groups routable packets by peer, keeping each peer's in order and the
-  # peers in the order their first packet came. Unroutable packets are
-  # dropped here.
+  # Groups routable packets by peer. The packets of each peer stay in
+  # sequence, and the peers are in the sequence of their first packets.
+  # Unroutable packets are dropped here.
   defp route(packets, state) do
     {keys, shares} =
       Enum.reduce(packets, {[], %{}}, fn packet, {keys, shares} ->
@@ -792,8 +856,8 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # A peer's packets are admitted in order until one does not fit, as the
-  # link admits egress, and go to it as one message.
+  # The packets of a peer are admitted in sequence until one does not fit,
+  # the same as the link admits egress. They go to the peer as one message.
   defp forward({key, packets}, {state, forwarded}) do
     {admitted, state} =
       case ensure_peer(state, key) do
@@ -820,9 +884,10 @@ defmodule Wagyu.Interface do
     with {:ok, link} <- Link.lookup(state.root), do: Link.retired(link)
   end
 
-  # Retires the credit of what the peer's queue no longer holds. Only the
-  # peer releases from the queue, so its count can only fall between
-  # reads, and what is retired has left it.
+  # Retires the credit for the packets that the queue of the peer no longer
+  # holds. Only the peer releases packets from the queue. Thus its count can
+  # only decrease between reads, and the retired packets are out of the
+  # queue.
   defp settle_peer(state, key) do
     peer = Map.fetch!(state.peers, key)
     {held_packets, held_bytes} = Admission.usage(peer.outbound)
@@ -838,16 +903,16 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # Retires all the credit a peer that is being forgotten still holds.
+  # Retires all of the credit that a forgotten peer still holds.
   defp retire_peer(state, peer) do
     {credited_packets, credited_bytes} = peer.credited
     EgressCredit.retire(state.credit, credited_packets, credited_bytes)
     if peer.credited != {0, 0}, do: retired(state)
   end
 
-  # Returns the peer's process, starting it if it is not running. Egress and
-  # claims both come here, and the interface is the only process that starts
-  # peers, so there is at most one per key.
+  # Returns the process of the peer, and starts it if it does not run.
+  # Egress and claims both come here, and only the interface starts peers.
+  # Thus there is a maximum of one peer for each key.
   defp ensure_peer(%{peers: peers} = state, key) when is_map_key(peers, key), do: {:ok, Map.fetch!(peers, key), state}
 
   defp ensure_peer(state, key) do
@@ -891,14 +956,15 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # Packets admitted to a peer that it never took, or that it staged and
-  # never sent, were lost with it; its queues' counts say how many. All the
-  # credit it held is free again. Its indices become tombstones, so messages
-  # for them drop here and none is reused while the remote party may still
-  # send to it.
+  # Some packets were admitted to a peer that did not take them, or that
+  # staged them and did not send them. These packets are lost with the
+  # peer, and the counts of its queues give their number. All of the credit
+  # that the peer held is free again. Its indices become tombstones. Thus
+  # messages for them drop here, and the interface does not use them again
+  # while the remote party can still send to them.
   #
-  # A peer that was released has been forgotten already, and another
-  # process may hold its key by now.
+  # The interface already forgot a released peer, and a different process
+  # can now hold its key.
   defp peer_down(state, key, pid) do
     case state.peers do
       %{^key => %{pid: ^pid} = peer} ->

@@ -9,8 +9,8 @@ defmodule Wagyu.TestHelpers do
 
   @roles [:link, :interface, :handshake_supervisor, :peer_supervisor]
 
-  # WireGuard's Noise parameters, stated here independently of
-  # `Wagyu.Noise`, for the remote parties that tests play.
+  # The Noise parameters of WireGuard, for the remote parties that the tests
+  # simulate. These values do not come from `Wagyu.Noise`.
   @protocol "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
   @prologue "WireGuard v1 zx2c4 Jason@zx2c4.com"
   @zero_psk <<0::256>>
@@ -18,9 +18,10 @@ defmodule Wagyu.TestHelpers do
   def keypair, do: :crypto.generate_key(:ecdh, :x25519)
 
   @doc """
-  The design's example configuration: a /32 address with a default route via
-  an off-subnet gateway, and one peer that takes every IPv4 destination. It
-  listens on an OS-chosen loopback port.
+  Returns the example configuration from the design. It has a /32 address
+  with a default route through a gateway that is not on the subnet. It also
+  has one peer that takes all IPv4 destinations. It listens on a loopback
+  port that the OS selects.
   """
   def options(overrides \\ []) do
     {_public_key, private_key} = keypair()
@@ -47,7 +48,7 @@ defmodule Wagyu.TestHelpers do
     )
   end
 
-  @doc "A UDP port that was free a moment ago."
+  @doc "Returns a UDP port that was free a short time before."
   def free_port do
     {:ok, socket} = :gen_udp.open(0, ip: {127, 0, 0, 1})
     {:ok, port} = :inet.port(socket)
@@ -70,7 +71,7 @@ defmodule Wagyu.TestHelpers do
     end
   end
 
-  @doc "Returns the live process registered as `root`'s `role`, or nil."
+  @doc "Returns the live process registered as the `role` of `root`, or nil."
   def child(root, role) do
     case Wagyu.Registry.lookup(root, role) do
       {:ok, pid, _value} -> pid
@@ -78,7 +79,7 @@ defmodule Wagyu.TestHelpers do
     end
   end
 
-  @doc "Waits until every child of `root` is running, and returns them by role."
+  @doc "Waits until all children of `root` run, and returns them by role."
   def children(root) do
     eventually(fn ->
       children = Map.new(@roles, &{&1, child(root, &1)})
@@ -86,7 +87,7 @@ defmodule Wagyu.TestHelpers do
     end)
   end
 
-  @doc "Waits for `root`'s counters to satisfy `fun`, and returns them."
+  @doc "Waits until the counters of `root` satisfy `fun`, and returns them."
   def counters(root, fun \\ fn _counters -> true end) do
     eventually(fn ->
       with {:ok, %{counters: counters}} <- Wagyu.info(root), true <- fun.(counters), do: counters
@@ -100,7 +101,7 @@ defmodule Wagyu.TestHelpers do
     socket
   end
 
-  @doc "Sends `count` datagrams from a SmolNet socket to an address beyond the gateway."
+  @doc "Sends `count` datagrams from a SmolNet socket to an address on the far side of the gateway."
   def send_egress(socket, count, destination \\ {192, 0, 2, 9}) do
     for n <- 1..count//1 do
       :ok = SmolNet.sendto(socket, "packet #{n}", %{family: :inet, addr: destination, port: 9})
@@ -109,15 +110,16 @@ defmodule Wagyu.TestHelpers do
     :ok
   end
 
-  @doc "An initiation frame with a valid MAC1 for `public_key` and arbitrary Noise fields."
+  @doc "Returns an initiation frame with a valid MAC1 for `public_key` and random Noise fields."
   def initiation(public_key) do
     frame = <<1, 0, 0, 0, :crypto.strong_rand_bytes(4)::binary, :crypto.strong_rand_bytes(140)::binary>>
     Packet.put_mac1(frame, Packet.mac1_key(public_key))
   end
 
   @doc """
-  A genuine initiation from the holder of `initiator` (a key pair) to the
-  holder of `responder_key`, carrying `timestamp`, with a valid MAC1.
+  Returns a real initiation from the holder of `initiator` (a key pair) to
+  the holder of `responder_key`. The initiation contains `timestamp` and has
+  a valid MAC1.
   """
   def noise_initiation(responder_key, initiator, timestamp, sender_index \\ random_index(), psk \\ @zero_psk) do
     {frame, session} = initiate_to(responder_key, initiator, timestamp, sender_index, psk)
@@ -126,10 +128,10 @@ defmodule Wagyu.TestHelpers do
   end
 
   @doc """
-  Plays the initiator: returns a genuine initiation, as `noise_initiation/4`
-  does, and the Decibel session that wrote it, owned by the caller and
-  waiting for the response (see `complete/2`). `psk` is the preshared key,
-  32 zero bytes for none.
+  Simulates the initiator. Returns a real initiation, as `noise_initiation/4`
+  does, and the Decibel session that wrote it. The caller owns the session,
+  which waits for the response (see `complete/2`). `psk` is the preshared
+  key, or 32 zero bytes if there is no preshared key.
   """
   def initiate_to(responder_key, initiator, timestamp, sender_index \\ random_index(), psk \\ @zero_psk) do
     session = Decibel.new(@protocol, :ini, %{s: initiator, rs: responder_key, psks: [psk], prologue: @prologue})
@@ -151,8 +153,8 @@ defmodule Wagyu.TestHelpers do
   end
 
   @doc """
-  Reads a response frame into an initiator session from `initiate_to/4`,
-  which is then ready for transport. Returns `:ok`, or `:error` if the
+  Reads a response frame into an initiator session from `initiate_to/4`.
+  The session is then ready for transport. Returns `:ok`, or `:error` if the
   response does not authenticate.
   """
   def complete(session, response) do
@@ -164,12 +166,15 @@ defmodule Wagyu.TestHelpers do
   end
 
   @doc """
-  Plays the responder to an initiation frame: checks its MAC1 for
-  `responder` (a key pair), reads it with a Decibel responder and writes a
-  response from `sender_index` with a valid MAC1. Returns the response
-  frame, the responder's transport session, owned by the caller, and what
-  the initiation carried. `psk` is the preshared key, 32 zero bytes for
-  none.
+  Simulates the responder to an initiation frame. It does these steps:
+
+    1. It checks the MAC1 of the frame for `responder` (a key pair).
+    2. It reads the frame with a Decibel responder.
+    3. It writes a response from `sender_index` with a valid MAC1.
+
+  Returns the response frame, the transport session of the responder and the
+  contents of the initiation. The caller owns the session. `psk` is the
+  preshared key, or 32 zero bytes if there is no preshared key.
   """
   def respond_to(initiation, {public_key, _private_key} = responder, sender_index \\ random_index(), psk \\ @zero_psk) do
     assert Packet.valid_mac1?(initiation, Packet.mac1_key(public_key))
@@ -198,8 +203,8 @@ defmodule Wagyu.TestHelpers do
   end
 
   @doc """
-  Returns the cookie in `reply`, a cookie reply to `frame`, a handshake
-  message sent to the holder of `public_key`.
+  Returns the cookie in `reply`. `reply` is a cookie reply to `frame`, and
+  `frame` is a handshake message to the holder of `public_key`.
   """
   def cookie(reply, public_key, frame) do
     {:ok, %Packet.CookieReply{} = message} = Packet.decode(reply)
@@ -208,17 +213,17 @@ defmodule Wagyu.TestHelpers do
     cookie
   end
 
-  @doc "`frame`, a handshake message to the holder of `public_key`, with MAC2 under `cookie`."
+  @doc "Returns `frame`, a handshake message to the holder of `public_key`, with MAC2 under `cookie`."
   def with_mac2(frame, public_key, cookie), do: Packet.put_macs(frame, Packet.mac1_key(public_key), cookie)
 
-  @doc "A transport message to `receiver_index`, encrypted with a transport session the caller owns."
+  @doc "Returns a transport message to `receiver_index`, encrypted with a transport session that the caller owns."
   def transport_frame(session, receiver_index, plaintext \\ "") do
     counter = Decibel.nonce(session, :out)
     packet = session |> Decibel.encrypt(plaintext, "") |> IO.iodata_to_binary()
     Packet.encode(%Transport{receiver_index: receiver_index, counter: counter, encrypted_packet: packet})
   end
 
-  @doc "Decrypts a transport frame with a session the caller owns: `{:ok, plaintext}` or `:error`."
+  @doc "Decrypts a transport frame with a session that the caller owns. Returns `{:ok, plaintext}` or `:error`."
   def open_transport(session, frame) do
     {:ok, %Transport{counter: counter, encrypted_packet: packet}} = Packet.decode(frame)
     :ok = Decibel.set_nonce(session, :in, counter)
@@ -227,7 +232,7 @@ defmodule Wagyu.TestHelpers do
     Decibel.DecryptionError -> :error
   end
 
-  @doc "Whether a session the calling process owned has been closed."
+  @doc "Returns true if a session that the calling process owned is closed."
   def closed?(session) do
     Decibel.handshake_complete?(session)
     false
@@ -236,8 +241,8 @@ defmodule Wagyu.TestHelpers do
   end
 
   @doc """
-  Runs `fun` on a GenServer's state inside that process, which owns its
-  Decibel sessions, and returns the result. The state is left unchanged.
+  Runs `fun` on the state of a GenServer, in that process, and returns the
+  result. The process owns its Decibel sessions. The state does not change.
   """
   def in_process(pid, fun) do
     test = self()
@@ -255,12 +260,12 @@ defmodule Wagyu.TestHelpers do
 
   def random_index, do: :rand.uniform(0x100000000) - 1
 
-  @doc "The `n`th of a series of strictly increasing TAI64N timestamps."
+  @doc "Returns the `n`th timestamp in a series of TAI64N timestamps that always increase."
   def timestamp(n), do: <<0x400000000000000A + 1_700_000_000::64, n * 0x1000000::32>>
 
   @doc """
-  Replaces an interface's clock with a fake one that starts at `start` and
-  moves only when `advance/2` moves it. Returns the clock.
+  Replaces the clock of an interface with a fake clock. The fake clock starts
+  at `start`, and only `advance/2` moves it. Returns the clock.
   """
   def fake_clock(interface, start \\ 1_000_000) do
     clock = :atomics.new(1, signed: true)
@@ -273,15 +278,16 @@ defmodule Wagyu.TestHelpers do
   def advance(clock, milliseconds), do: :atomics.add(clock, 1, milliseconds)
 
   @doc """
-  Makes a peer run the timers due on its clock, as a process timer that
-  fires does, and waits until it has. Returns the peer's state.
+  Makes a peer run the timers that are due on its clock, as a process timer
+  does when it fires. Waits until the peer completes this. Returns the state
+  of the peer.
   """
   def run_timers(peer) do
     send(peer, {:wg_timer, make_ref()})
     :sys.get_state(peer)
   end
 
-  @doc "A complete IPv4 UDP packet with valid header and UDP checksums."
+  @doc "Returns a complete IPv4 UDP packet with a valid header checksum and UDP checksum."
   def ipv4_udp({s1, s2, s3, s4} = _source, {d1, d2, d3, d4} = _destination, source_port, destination_port, payload) do
     source = <<s1, s2, s3, s4>>
     destination = <<d1, d2, d3, d4>>
@@ -303,7 +309,7 @@ defmodule Wagyu.TestHelpers do
     header.(checksum(header.(0))) <> udp
   end
 
-  @doc "A complete IPv6 UDP packet with a valid UDP checksum."
+  @doc "Returns a complete IPv6 UDP packet with a valid UDP checksum."
   def ipv6_udp(source, destination, source_port, destination_port, payload) do
     source = ipv6_binary(source)
     destination = ipv6_binary(destination)

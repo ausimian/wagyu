@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+This file records all notable changes to this project.
 
 <!-- %% CHANGELOG_ENTRIES %% -->
 

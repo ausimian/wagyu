@@ -4,12 +4,13 @@ defmodule Wagyu.XChaCha20Poly1305 do
   # XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha), which encrypts WireGuard's
   # cookie replies.
   #
-  # OTP's `:crypto` has ChaCha20-Poly1305 with a 12-byte nonce but no
-  # XChaCha, so Wagyu derives XChaCha's subkey itself: HChaCha20 of the key
-  # and the first 16 bytes of the 24-byte nonce. The subkey then encrypts
-  # with `:crypto`'s ChaCha20-Poly1305 under four zero bytes and the
-  # nonce's last 8 bytes. HChaCha20 is one ChaCha20 block without the final
-  # addition, so it is a fixed, small amount of work.
+  # OTP's `:crypto` has ChaCha20-Poly1305 with a 12-byte nonce, but it does
+  # not have XChaCha. Thus Wagyu derives XChaCha's subkey itself: HChaCha20
+  # of the key and the first 16 bytes of the 24-byte nonce. The subkey then
+  # encrypts with `:crypto`'s ChaCha20-Poly1305. The nonce for this step is
+  # four zero bytes and the last 8 bytes of the 24-byte nonce. HChaCha20 is
+  # one ChaCha20 block without the final addition, so its work is fixed and
+  # small.
 
   import Bitwise
 
@@ -20,8 +21,8 @@ defmodule Wagyu.XChaCha20Poly1305 do
   @constants {0x61707865, 0x3320646E, 0x79622D32, 0x6B206574}
 
   @doc """
-  Encrypts `plaintext` under `key` and a 24-byte `nonce`, authenticating
-  `aad` too. Returns the ciphertext followed by its 16-byte tag.
+  Encrypts `plaintext` under `key` and a 24-byte `nonce`, and also
+  authenticates `aad`. Returns the ciphertext followed by its 16-byte tag.
   """
   @spec seal(<<_::256>>, <<_::192>>, iodata(), iodata()) :: binary()
   def seal(<<_::binary-32>> = key, <<_::binary-24>> = nonce, plaintext, aad) do
@@ -32,7 +33,7 @@ defmodule Wagyu.XChaCha20Poly1305 do
 
   @doc """
   Decrypts a ciphertext and tag from `seal/4`. Returns `{:ok, plaintext}`, or
-  `:error` when it does not authenticate under `key`, `nonce` and `aad`.
+  `:error` if it does not authenticate under `key`, `nonce` and `aad`.
   Never raises for a ciphertext of any size.
   """
   @spec open(<<_::256>>, <<_::192>>, binary(), iodata()) :: {:ok, binary()} | :error

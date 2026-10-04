@@ -1,15 +1,16 @@
 defmodule Wagyu.WgPeer do
   @moduledoc false
 
-  # Drives `wgpeer` (test/interop): a wireguard-go device on gVisor's
-  # userspace network stack, which needs neither a TUN device nor root, and
-  # sends and receives WireGuard on a real UDP socket. The calling process
-  # owns the port; when it exits, wgpeer's stdin closes and it exits too.
+  # Controls `wgpeer` (test/interop), which is a wireguard-go device on the
+  # userspace network stack of gVisor. That stack does not need a TUN device
+  # or root. The device sends and receives WireGuard on a real UDP socket.
+  # The calling process owns the port. When that process exits, the stdin of
+  # wgpeer closes, and wgpeer also exits.
 
   @source Path.expand("../interop", __DIR__)
   @timeout 10_000
 
-  @doc "Builds wgpeer with the `go` on the PATH and returns the binary's path."
+  @doc "Builds wgpeer with the `go` on the PATH, and returns the path of the binary."
   def build! do
     binary = Path.join([Mix.Project.build_path(), "interop", "wgpeer"])
     go = System.find_executable("go") || raise "the interop tests need go on the PATH"
@@ -31,12 +32,16 @@ defmodule Wagyu.WgPeer do
   end
 
   @doc """
-  Starts a device whose netstack has `address`, configures it with `uapi`
-  (a keyword list of UAPI keys and values, in order), brings it up, and
-  returns the Erlang port and the device's UDP port.
+  Starts a device whose netstack has `address`, and configures it with
+  `uapi`. `uapi` is a keyword list of UAPI keys and values, in sequence. The
+  function then brings up the device. It returns the Erlang port and the UDP
+  port of the device.
 
-  Options are `:mtu` (default 1280) and `:delay`, milliseconds by which the
-  device holds back every datagram it sends (default 0).
+  The options are:
+
+    * `:mtu` - the MTU (default 1280)
+    * `:delay` - the milliseconds that the device holds each datagram before
+      it sends it (default 0)
   """
   def start!(binary, address, uapi, options \\ []) do
     mtu = Keyword.get(options, :mtu, 1280)
@@ -57,8 +62,8 @@ defmodule Wagyu.WgPeer do
   end
 
   @doc """
-  Returns the device's UAPI state as `%{device: fields, peers: [fields]}`,
-  where each peer's fields start at its `public_key`.
+  Returns the UAPI state of the device as `%{device: fields, peers: [fields]}`.
+  The fields of each peer start at its `public_key`.
   """
   def get(port) do
     Port.command(port, "get\n")
@@ -73,18 +78,19 @@ defmodule Wagyu.WgPeer do
     |> Map.update!(:peers, &Enum.reverse/1)
   end
 
-  @doc "Sends one UDP datagram from the device's netstack."
+  @doc "Sends one UDP datagram from the netstack of the device."
   def send_udp(port, address, udp_port, payload) do
     command(port, ["send #{:inet.ntoa(address)} #{udp_port} #{payload}"])
   end
 
-  @doc "Echoes UDP datagrams, or TCP streams, arriving on a netstack port."
+  @doc "Echoes the UDP datagrams or TCP streams that arrive on a netstack port."
   def echo(port, protocol, netstack_port) when protocol in [:udp, :tcp],
     do: command(port, ["echo #{protocol} #{netstack_port}"])
 
   @doc """
   Reads each TCP connection on a netstack port until the client shuts down
-  its side, then replies with the number of bytes read, in decimal.
+  its side. Then it replies with the number of bytes that it read, in
+  decimal.
   """
   def sink(port, netstack_port), do: command(port, ["sink #{netstack_port}"])
 

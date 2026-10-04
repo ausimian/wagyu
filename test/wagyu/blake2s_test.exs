@@ -22,9 +22,9 @@ defmodule Wagyu.Blake2sTest do
                Base.decode16!("508C5E8C327C14E2E1A72BA34EEB452F37458B209ED63A294D999B4C86675982")
     end
 
-    # The RFC's self-test hashes unkeyed and keyed digests of 16, 20, 28 and
-    # 32 bytes over inputs of 0, 3, 64, 65, 255 and 1024 bytes, then checks a
-    # BLAKE2s-256 of all of them.
+    # The self-test of the RFC makes unkeyed and keyed digests of 16, 20, 28
+    # and 32 bytes. The inputs have 0, 3, 64, 65, 255 and 1024 bytes. Then the
+    # test checks a BLAKE2s-256 of all these digests.
     test "Appendix E: self-test grand hash over keyed and unkeyed digests" do
       digests =
         for outlen <- [16, 20, 28, 32], inlen <- [0, 3, 64, 65, 255, 1024] do

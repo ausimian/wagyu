@@ -2,111 +2,124 @@ defmodule Wagyu.Config do
   @moduledoc """
   Validated configuration for one Wagyu interface.
 
-  `new/1` validates the options that `Wagyu.start_link/1` takes and returns
-  a `Wagyu.Config` struct, or an error naming the first invalid option.
-  `Wagyu.start_link/1` and `Wagyu.child_spec/1` call it for you, so call it
-  yourself only to check options ahead of time.
+  `new/1` validates the options of `Wagyu.start_link/1`. It returns a
+  `Wagyu.Config` struct, or an error that identifies the first invalid
+  option. `Wagyu.start_link/1` and `Wagyu.child_spec/1` call `new/1` for
+  you. Call it yourself only to check options before you start an
+  interface.
 
   ## Options
 
-    * `:private_key` (required) - the interface's X25519 private key, as a
-      raw 32-byte binary. Decode a key from `wg genkey` with
-      `Base.decode64!/1`. The public key is derived from it.
+    * `:private_key` (required) - the X25519 private key of the interface,
+      as a raw 32-byte binary. To decode a key from `wg genkey`, use
+      `Base.decode64!/1`. Wagyu derives the public key from this key.
 
-    * `:name` - a name to register the interface under: an atom,
+    * `:name` - a name for the registration of the interface: an atom,
       `{:global, term}` or `{:via, module, term}`.
 
-    * `:listen` - the local address and port of the interface's UDP socket,
-      as `%{address: address, port: port}`. Port `0` lets the OS choose.
-      Defaults to `%{address: {0, 0, 0, 0}, port: 0}`. Peer endpoints must
-      use the same address family.
+    * `:listen` - the local address and port of the UDP socket of the
+      interface, as `%{address: address, port: port}`. If the port is `0`,
+      the OS selects the port. The default is
+      `%{address: {0, 0, 0, 0}, port: 0}`. Peer endpoints must use the same
+      address family.
 
-    * `:stack` - options for the interface's SmolNet stack:
+    * `:stack` - options for the SmolNet stack of the interface:
 
-      * `:addresses` - up to 8 `{address, prefix_length}` pairs. Defaults
-        to `[]`.
+      * `:addresses` - up to 8 `{address, prefix_length}` pairs. The
+        default is `[]`.
       * `:routes` - up to 4 `{destination, prefix_length, gateway}` routes.
         The gateway must be in the same address family as the destination.
-        Host bits in the destination are cleared. Defaults to `[]`.
-      * `:mtu` - from 1280 to 65,475. Defaults to 1420, the same as
+        Wagyu clears the host bits in the destination. The default is `[]`.
+      * `:mtu` - from 1280 to 65,475. The default is 1420, the same as
         wg-quick.
       * `:sockets` - the maximum number of open sockets, from 1 to 512.
-        Defaults to 64. Opening a socket beyond the limit returns
-        `{:error, :system_limit}`.
+        The default is 64. If you open a socket when all slots are in use,
+        the open returns `{:error, :system_limit}`.
 
-        * Each TCP or UDP socket uses one slot. So does each connection in
-          a TCP listener's accept pool (up to 4), and each interface address
-          that a UDP socket bound to a wildcard address listens on.
-        * A TCP socket that closes first holds its slot through TIME-WAIT,
-          about 10 seconds. An application that keeps opening and closing
-          connections can open about `sockets / 10` a second.
-        * Each slot holds its socket's buffers: 512 KiB for TCP and 32 KiB
-          for UDP at SmolNet's default sizes. SmolNet also caps a stack's
-          buffers at 128 MiB in total, which fits 256 TCP sockets at those
-          sizes, and opening a socket past that returns
-          `{:error, :system_limit}` too.
+        * Each TCP or UDP socket uses one slot. Each connection in the
+          accept pool of a TCP listener (up to 4) also uses one slot. A UDP
+          socket that is bound to a wildcard address uses one slot for each
+          interface address on which it listens.
+        * A TCP socket that closes first keeps its slot through TIME-WAIT,
+          for about 10 seconds. Thus an application that opens and closes
+          connections continuously can open about `sockets / 10` each
+          second.
+        * Each slot holds the buffers of its socket. At the default sizes of
+          SmolNet, these are 512 KiB for TCP and 32 KiB for UDP. SmolNet
+          also limits the buffers of a stack to a total of 128 MiB. This
+          total holds 256 TCP sockets at the default sizes. If you open a
+          socket after that limit, the open also returns
+          `{:error, :system_limit}`.
 
-      Wagyu sets SmolNet's `:egress`, `:egress_credit`, `:limits` and
-      `:link_down` options itself, and rejects them here. Addresses and
-      routes must also pass SmolNet's own checks: multicast and
-      IPv4-mapped IPv6 addresses are rejected, as is `255.255.255.255` as
-      an address or gateway, and `0.0.0.0` or `::` as a gateway.
+      Wagyu sets the SmolNet options `:egress`, `:egress_credit`, `:limits`
+      and `:link_down` itself, and does not accept them here. Addresses and
+      routes must also pass the checks of SmolNet. SmolNet does not accept
+      these values:
 
-    * `:peers` - up to 1024 peers, each a map with:
+        * multicast addresses
+        * IPv4-mapped IPv6 addresses
+        * `255.255.255.255` as an address or a gateway
+        * `0.0.0.0` or `::` as a gateway
 
-      * `:public_key` (required) - the peer's X25519 public key, as a raw
-        32-byte binary. Each peer's key must be unique and must differ from
-        the interface's own. Keys that can never complete a handshake, such
-        as 32 zero bytes, are rejected.
-      * `:endpoint` - the peer's address and port, as
+    * `:peers` - up to 1024 peers. Each peer is a map with these keys:
+
+      * `:public_key` (required) - the X25519 public key of the peer, as a
+        raw 32-byte binary. The key of each peer must be unique, and it
+        must be different from the key of the interface. Wagyu does not
+        accept keys that can never complete a handshake, for example 32
+        zero bytes.
+      * `:endpoint` - the address and port of the peer, as
         `%{address: address, port: port}`. The port must be from 1 to
-        65535, and the address must be in the listen address's family and
-        not `0.0.0.0` or `::`. Leave it out, or set it to `nil`, for a peer
-        that always connects to this interface; the interface then replies
-        to wherever the peer's handshakes come from.
-      * `:allowed_ips` - the `{address, prefix_length}` prefixes the peer
-        may send from. Packets to these addresses go to the peer. When
-        prefixes overlap, the most specific one wins, but two peers cannot
-        have the same prefix. Host bits are cleared. Defaults to `[]`.
-      * `:preshared_key` - a 32-byte key from `wg genpsk`, added to every
-        handshake with the peer. Both sides must configure the same key, or
-        their handshakes fail. Leave it out, or pass 32 zero bytes, for
-        none. `nil` is rejected, so an unset variable can't silently turn
-        the key off.
-      * `:persistent_keepalive` - sends the peer a keepalive after this many
-        seconds without traffic, to keep NAT and firewall mappings open.
-        From 1 to 65,535; 25 works for most NATs. Defaults to `0`, which
-        turns it off. A peer with a keepalive starts when the interface
-        does.
+        65535. The address must be in the family of the listen address, and
+        it must not be `0.0.0.0` or `::`. For a peer that always connects
+        to this interface, do not set the endpoint, or set it to `nil`. The
+        interface then replies to the source of the handshakes of the peer.
+      * `:allowed_ips` - the `{address, prefix_length}` prefixes from which
+        the peer can send. Packets to these addresses go to the peer. When
+        prefixes overlap, the most specific prefix wins. But two peers
+        cannot have the same prefix. Wagyu clears the host bits. The default
+        is `[]`.
+      * `:preshared_key` - a 32-byte key from `wg genpsk`. Wagyu adds it to
+        each handshake with the peer. Both sides must configure the same
+        key, or their handshakes fail. For no key, do not set this option,
+        or give 32 zero bytes. Wagyu does not accept `nil`. Thus an unset
+        variable cannot turn off the key without an error.
+      * `:persistent_keepalive` - the number of seconds without traffic
+        after which the interface sends a keepalive to the peer. The
+        keepalive keeps NAT and firewall mappings open. The range is from 1
+        to 65,535, and 25 is correct for most NATs. The default is `0`,
+        which turns off the keepalive. A peer with a keepalive starts when
+        the interface starts.
 
-  Unknown and repeated options are rejected at every level.
+  Wagyu does not accept unknown or repeated options at any level.
 
   ## Errors
 
-  `new/1` returns `{:error, {:invalid_option, path, reason}}`. `path` is
-  where the option is, with zero-based indices for list positions, for
-  example `[:peers, 1, :allowed_ips, 0]`. Errors never include option
-  values, so they are safe to log. `reason` is one of:
+  `new/1` returns `{:error, {:invalid_option, path, reason}}`. `path` shows
+  the location of the option, with zero-based indices for list positions,
+  for example `[:peers, 1, :allowed_ips, 0]`. Errors never include option
+  values. Thus you can safely log them. `reason` is one of these values:
 
-    * `:missing` - a required option is absent
-    * `:unknown` - an unrecognized option
+    * `:missing` - a required option is not there
+    * `:unknown` - an option that Wagyu does not know
     * `:reserved` - a stack option that Wagyu sets itself
     * `:invalid` - the wrong type or shape, or a value that is not allowed,
-      such as a multicast address or an unusable peer public key
+      for example a multicast address or an unusable peer public key
     * `:invalid_length` - a key that is not exactly 32 bytes
     * `:out_of_range` - a port, MTU, socket limit or persistent keepalive
       outside its range
-    * `:too_many` - more addresses, routes or peers than allowed
+    * `:too_many` - more addresses, routes or peers than the limit
     * `:family_mismatch` - an endpoint or gateway in the wrong address family
     * `:duplicate` - a repeated option, public key, address, route or prefix
-    * `:local_key` - a peer public key equal to the interface's own
+    * `:local_key` - a peer public key that is equal to the key of the
+      interface
 
   ## Secrets
 
-  The struct's `Inspect` implementation hides the private key and preshared
-  keys. Other ways of printing the struct don't: `inspect(config,
-  structs: false)`, Erlang's `~p` formatting and reading the fields
-  directly all show the keys, so don't log a configuration that way.
+  The `Inspect` implementation of the struct hides the private key and the
+  preshared keys. Other ways to print the struct show the keys:
+  `inspect(config, structs: false)`, the `~p` format of Erlang, and direct
+  access to the fields. Do not use these ways to log a configuration.
   """
 
   import Bitwise
@@ -123,8 +136,9 @@ defmodule Wagyu.Config do
 
   @default_listen %{address: {0, 0, 0, 0}, port: 0}
   @default_mtu 1420
-  # 65,535 less the IPv4 and UDP headers (28) and the transport header and
-  # tag (32). Padding is capped at the MTU, so it adds nothing at the limit.
+  # 65,535 minus the IPv4 and UDP headers (28) and the transport header and
+  # tag (32). Padding cannot make a packet larger than the MTU. Thus
+  # padding adds nothing at the limit.
   @mtu_range 1280..65_475
   @default_sockets 64
   @sockets_range 1..512
@@ -145,7 +159,7 @@ defmodule Wagyu.Config do
     allowed_ips: %AllowedIPs{}
   ]
 
-  # The AllowedIPs routing table built from the peers, which is internal.
+  # The internal AllowedIPs routing table, which Wagyu builds from the peers.
   @typep allowed_ips :: AllowedIPs.t()
 
   @typedoc "A validated interface configuration. `:peers` maps each public key to its peer."
@@ -167,7 +181,7 @@ defmodule Wagyu.Config do
   @typedoc "The location of an invalid option."
   @type path :: [atom() | non_neg_integer()]
 
-  @typedoc "Why an option is invalid. See the Errors section above."
+  @typedoc "The reason that an option is not valid. See the Errors section."
   @type reason ::
           :missing
           | :unknown
@@ -180,7 +194,7 @@ defmodule Wagyu.Config do
           | :duplicate
           | :local_key
 
-  @typedoc "The error `new/1` returns, safe to log."
+  @typedoc "The error that `new/1` returns. You can safely log it."
   @type error :: {:invalid_option, path(), reason()}
 
   @doc """
@@ -219,8 +233,9 @@ defmodule Wagyu.Config do
     end
   end
 
-  # Looks up a configured peer by public key. Only configured keys may
-  # create peer state, so an unknown key returns `{:error, :unknown_peer}`.
+  # Finds a configured peer by its public key. Only configured keys can
+  # create peer state. Thus an unknown key returns
+  # `{:error, :unknown_peer}`.
   @doc false
   @spec fetch_peer(t(), term()) :: {:ok, Peer.t()} | {:error, :unknown_peer}
   def fetch_peer(%__MODULE__{peers: peers}, public_key) do
@@ -316,11 +331,11 @@ defmodule Wagyu.Config do
 
   defp stack_route(_route, path), do: invalid(path, :invalid)
 
-  # SmolNet rejects IPv4-mapped IPv6 addresses and multicast addresses
-  # anywhere in its address and route configuration. Its multicast test looks
-  # only at the first byte (0xFF, or 224 to 239) in either family, and this
-  # mirrors it exactly so that validation here never passes an address that
-  # SmolNet would refuse.
+  # SmolNet does not accept IPv4-mapped IPv6 addresses or multicast
+  # addresses in its address and route configuration. Its multicast test
+  # examines only the first byte (0xFF, or 224 to 239) in each family. This
+  # function does exactly the same test. Thus this validation never accepts
+  # an address that SmolNet refuses.
   defp smolnet_address?(address, bits) do
     {:ok, value, ^bits} = IP.to_integer(address)
     first_byte = value >>> (bits - 8)
@@ -372,9 +387,9 @@ defmodule Wagyu.Config do
     end
   end
 
-  # X25519 with a low-order point, such as all zeros, yields all zeros for
-  # every private key, which Decibel rejects, so no handshake with such a
-  # peer could ever complete.
+  # X25519 with a low-order point, for example all zeros, gives all zeros
+  # for each private key. Decibel does not accept this result. Thus a
+  # handshake with such a peer can never complete.
   defp usable?(public_key, private_key) do
     _shared = :crypto.compute_key(:ecdh, public_key, private_key, :x25519)
     true
@@ -406,9 +421,9 @@ defmodule Wagyu.Config do
       else: invalid(path, :invalid)
   end
 
-  # An omitted preshared key is the protocol's all-zero key. `nil` is
-  # rejected, because an unset variable that was meant to hold a key would
-  # otherwise silently disable it.
+  # If the preshared key is not set, Wagyu uses the all-zero key of the
+  # protocol. Wagyu does not accept `nil`. If it did, an unset variable that
+  # was to hold a key would turn off the key without an error.
   defp preshared_key(:error, _path), do: {:ok, @zero_key}
   defp preshared_key({:ok, value}, path), do: key(value, path)
 
@@ -416,7 +431,7 @@ defmodule Wagyu.Config do
   defp persistent_keepalive(seconds, path) when is_integer(seconds), do: invalid(path, :out_of_range)
   defp persistent_keepalive(_seconds, path), do: invalid(path, :invalid)
 
-  # Every exact prefix may appear once across all peers.
+  # Each exact prefix can occur only one time across all peers.
   defp allowed_ips(peers) do
     entries =
       for {peer, index} <- Enum.with_index(peers), {prefix, prefix_index} <- Enum.with_index(peer.allowed_ips) do
@@ -469,8 +484,9 @@ defmodule Wagyu.Config do
   defp proper_list?([_head | tail]), do: proper_list?(tail)
   defp proper_list?(_value), do: false
 
-  # Validates each item in order and stops at the first error. A validator
-  # returns `:error` for an item that is simply invalid at its own path.
+  # Validates each item in sequence and stops at the first error. A
+  # validator returns `:error` when the item itself is not valid, at its own
+  # path.
   defp map_indexed(items, path, validate) do
     items
     |> Enum.with_index()
@@ -487,7 +503,8 @@ defmodule Wagyu.Config do
     end
   end
 
-  # Fails at `path_for.(index)` for the first key that repeats an earlier one.
+  # Fails at `path_for.(index)` for the first key that is the same as an
+  # earlier key.
   defp unique(keys, path_for) do
     keys
     |> Enum.with_index()

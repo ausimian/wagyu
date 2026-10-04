@@ -1,10 +1,11 @@
 defmodule Wagyu.FakeSmolNet do
   @moduledoc false
 
-  # Stands in for SmolNet so that link tests can watch and script the link's
-  # calls. Every call is reported to the process registered under this
-  # module's name, the controller, which also chooses each ingress result.
-  # The "stack" is a bare process that tests can kill.
+  # Replaces SmolNet so that link tests can monitor and control the calls of
+  # the link. Each call goes in a message to the controller, which is the
+  # process registered under the name of this module. The controller also
+  # selects the result of each ingress call. The "stack" is a bare process
+  # that tests can kill.
 
   def start_stack(options) do
     controller = Process.whereis(__MODULE__)

@@ -10,8 +10,8 @@ defmodule Wagyu.PacketTest do
   # A real handshake captured from wireguard-go
   # (golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446, Go 1.26.0,
   # tun/netstack over loopback). The initiator's private key is 10 11 .. 2f
-  # and the responder's is 40 41 .. 5f. The initiator sent the first message;
-  # a second wireguard-go device holding the responder key answered it.
+  # and the responder's is 40 41 .. 5f. The initiator sent the first message.
+  # A second wireguard-go device, with the responder key, answered it.
   @initiator_public Base.decode16!("d89e3bad79437dbed9f843418304f460ff05c7fe81fe4a9577a804cb9367ff66", case: :lower)
   @responder_public Base.decode16!("79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a", case: :lower)
   @captured_initiation Base.decode16!(
@@ -208,7 +208,8 @@ defmodule Wagyu.PacketTest do
       assert Packet.valid_mac1?(@captured_initiation, Packet.mac1_key(@responder_public))
       assert Packet.valid_mac1?(@captured_response, Packet.mac1_key(@initiator_public))
 
-      # Each message is keyed with the receiver's public key, not the sender's.
+      # The key for each message comes from the public key of the receiver, not
+      # of the sender.
       refute Packet.valid_mac1?(@captured_initiation, Packet.mac1_key(@initiator_public))
       refute Packet.valid_mac1?(@captured_response, Packet.mac1_key(@responder_public))
     end

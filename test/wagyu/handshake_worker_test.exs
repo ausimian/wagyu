@@ -16,7 +16,8 @@ defmodule Wagyu.HandshakeWorkerTest do
     %{identity: identity, initiator: keypair()}
   end
 
-  # A claim that reports each call to the test process and answers `result`.
+  # Returns a claim that reports each call to the test process and answers
+  # `result`.
   defp claim(result) do
     test = self()
 
@@ -26,8 +27,8 @@ defmodule Wagyu.HandshakeWorkerTest do
     end
   end
 
-  # Responder sessions for `respond/5`'s second read, made for `identity`.
-  # Each one is reported to the test process.
+  # Makes responder sessions for `identity`, for the second read of
+  # `respond/5`. Each session goes in a report to the test process.
   defp responder(identity) do
     test = self()
 
@@ -43,8 +44,9 @@ defmodule Wagyu.HandshakeWorkerTest do
   defp respond(context, session, frame, claim),
     do: HandshakeWorker.respond(session, frame, @source, claim, responder(context.identity))
 
-  # A stand-in peer. It reports every message it receives, accepts a ticket
-  # in its own process when told to, and exits with the test.
+  # A substitute peer. It reports each message that it receives. When the
+  # test tells it to, it accepts a ticket in its own process. It exits with
+  # the test.
   defp target do
     test = self()
 
@@ -71,7 +73,8 @@ defmodule Wagyu.HandshakeWorkerTest do
     error in Decibel.HandoffError -> {:error, error.reason}
   end
 
-  # Accepts a ticket and writes the response to sender index 77 from it.
+  # Accepts a ticket, and from the ticket writes the response to sender
+  # index 77.
   defp write_response(ticket, mac1_key) do
     {:ok, frame} = ticket |> Decibel.accept_handoff() |> Noise.write_response(1, 77, mac1_key)
     frame
@@ -97,7 +100,7 @@ defmodule Wagyu.HandshakeWorkerTest do
     assert_receive {:target_received,
                     {:wg_handoff, ticket, %{sender_index: 77, timestamp: ^expected_timestamp, source: @source}}}
 
-    # The handoff closed the worker's handle, and only the peer can accept.
+    # The handoff closed the handle of the worker. Only the peer can accept.
     assert closed?(session)
     assert accept(ticket) == {:error, :not_target}
 
@@ -117,9 +120,9 @@ defmodule Wagyu.HandshakeWorkerTest do
     frames = [
       # Arbitrary Noise fields.
       initiation(context.identity.public_key),
-      # A genuine initiation for another responder.
+      # A real initiation for a different responder.
       noise_initiation(other_key, context.initiator, timestamp(1)),
-      # A genuine initiation with one bit of its ephemeral key changed.
+      # A real initiation with one changed bit in its ephemeral key.
       <<header::binary, flipped::binary, rest::binary>>,
       # An all-zero ephemeral key, which X25519 rejects.
       <<header::binary, 0::256, rest::binary>>
@@ -134,7 +137,7 @@ defmodule Wagyu.HandshakeWorkerTest do
       assert closed?(session)
     end
 
-    # Nor does it read again with the peer's preshared key.
+    # Also, it does not read again with the preshared key of the peer.
     refute_received {:claim, _key, _timestamp}
     refute_received {:responder, _psk, _session}
     refute_receive {:target_received, _message}, 50
@@ -150,7 +153,7 @@ defmodule Wagyu.HandshakeWorkerTest do
       assert closed?(session)
     end
 
-    # The claim's reports were the only messages.
+    # The reports of the claim were the only messages.
     refute_received _message
   end
 
@@ -163,7 +166,7 @@ defmodule Wagyu.HandshakeWorkerTest do
     assert respond(context, session, frame, claim({:ok, peer, peer_config(@zero_psk)})) == {:error, :handoff_failed}
     assert closed?(session)
 
-    # With a preshared key, the session of the second read is closed too.
+    # With a preshared key, the session of the second read also closes.
     session = Noise.responder(context.identity)
 
     assert respond(context, session, frame, claim({:ok, peer, peer_config(:binary.copy(<<7>>, 32))})) ==
@@ -181,8 +184,8 @@ defmodule Wagyu.HandshakeWorkerTest do
     assert {:ok, ^peer} = respond(context, session, frame, claim({:ok, peer, peer_config(@zero_psk)}))
     assert_receive {:target_received, {:wg_handoff, ticket, _metadata}}
 
-    # Nothing is waiting on the peer: the worker has nothing left, and the
-    # ticket stays claimable only by the peer, which nobody kills.
+    # No process waits for the peer. The worker has nothing left. Only the
+    # peer can claim the ticket, and no process kills the peer.
     assert closed?(session)
     assert accept(ticket) == {:error, :not_target}
     assert Process.alive?(peer)
@@ -196,9 +199,9 @@ defmodule Wagyu.HandshakeWorkerTest do
       Map.merge(context, %{psk: :binary.copy(<<7>>, 32), mac1_key: Packet.mac1_key(elem(context.initiator, 0))})
     end
 
-    # Hands an initiation made with `psk` to a peer whose key is `peer_psk`,
-    # and returns the response the peer writes and the initiator's session,
-    # waiting for it.
+    # Gives an initiation made with `psk` to a peer whose key is `peer_psk`.
+    # Returns the response that the peer writes, and the session of the
+    # initiator, which waits for that response.
     defp exchange(context, psk, peer_psk) do
       {frame, initiator} = initiate_to(context.identity.public_key, context.initiator, timestamp(1), 77, psk)
       session = Noise.responder(context.identity)
@@ -209,8 +212,8 @@ defmodule Wagyu.HandshakeWorkerTest do
       send(peer, {:respond, ticket, context.mac1_key})
       assert_receive {:target_responded, response}
 
-      # The session of the first read, without the key, was closed rather
-      # than handed off.
+      # The session of the first read, without the key, closed. The worker
+      # did not give it to the peer.
       assert_received {:responder, ^peer_psk, _rekeyed}
       assert closed?(session)
       {response, initiator}
@@ -239,7 +242,7 @@ defmodule Wagyu.HandshakeWorkerTest do
       send(peer, {:respond, ticket, context.mac1_key})
       assert_receive {:target_responded, response}
 
-      # A peer without a key reads once.
+      # A peer without a key reads one time.
       refute_received {:responder, _psk, _session}
       assert complete(initiator, response) == :error
     end
@@ -268,8 +271,8 @@ defmodule Wagyu.HandshakeWorkerTest do
   end
 
   describe "a worker process" do
-    # The test process stands in for the interface, answering claims, and
-    # traps exits to see how each worker ends.
+    # The test process is a substitute for the interface and answers claims.
+    # It traps exits to see how each worker stops.
     setup context do
       Process.flag(:trap_exit, true)
       root = make_ref()

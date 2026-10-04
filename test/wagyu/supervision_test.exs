@@ -3,7 +3,7 @@ defmodule Wagyu.SupervisionTest do
 
   import Wagyu.TestHelpers
 
-  # Killing an interface's processes logs their exits.
+  # When a test kills the processes of an interface, they log their exits.
   @moduletag :capture_log
 
   setup do
@@ -89,8 +89,8 @@ defmodule Wagyu.SupervisionTest do
     assert Wagyu.stack(context.interface) == {:ok, context.stack}
     refute Process.alive?(peer)
 
-    # The socket opened before the failure still sends, through the same
-    # link, to the new interface, which starts a new peer.
+    # The socket that opened before the failure still sends through the same
+    # link to the new interface. The new interface starts a new peer.
     assert {:ok, _address} = SmolNet.sockname(socket)
     assert start_peer(context.interface, socket) != peer
     assert_receives_datagrams(context)

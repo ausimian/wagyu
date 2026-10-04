@@ -3,22 +3,26 @@ defmodule Wagyu.Cookie do
 
   # WireGuard's cookies, both sides of them (whitepaper section 5.4.7).
   #
-  # A receiver under load answers a handshake message that has a valid MAC1
-  # but no valid MAC2 with a cookie reply instead of Noise work. The cookie
-  # is keyed BLAKE2s-128 of the message's source, its IP address and
-  # big-endian UDP port as in Linux, under a random secret that the receiver
-  # replaces once it is 120 seconds old. A MAC2 is valid only under the
-  # cookie for the address the message actually came from, and only while
-  # the secret that made that cookie is current. The reply carries the
-  # cookie encrypted with XChaCha20-Poly1305 under HASH("cookie--" || the
-  # receiver's public key), with a random 24-byte nonce and the MAC1 of the
-  # message it answers as associated data.
+  # A receiver under load can get a handshake message that has a valid MAC1
+  # but no valid MAC2. It answers with a cookie reply, and does no Noise
+  # work. The cookie is keyed BLAKE2s-128 of the message's source: its IP
+  # address and big-endian UDP port, as in Linux. The key is a random secret
+  # that the receiver replaces when it is 120 seconds old.
   #
-  # The sender of that message decrypts the reply with the key derived from
-  # the public key it sent to and the MAC1 of the last handshake message it
-  # sent, so it takes only a reply to that message from a party that knows
-  # that public key. It then keys MAC2 on its handshake messages with the
-  # cookie for 120 seconds.
+  # A MAC2 is valid only under the cookie for the address that the message
+  # actually came from. It is also valid only while the secret that made
+  # that cookie is current.
+  #
+  # The reply carries the cookie, encrypted with XChaCha20-Poly1305 under
+  # HASH("cookie--" || the receiver's public key). The encryption uses a
+  # random 24-byte nonce, and the MAC1 of the answered message as associated
+  # data.
+  #
+  # The sender of that message decrypts the reply with the key from the
+  # public key that it sent to. It also uses the MAC1 of its last handshake
+  # message. Thus it takes only a reply to that message, from a party that
+  # knows that public key. It then keys MAC2 on its handshake messages with
+  # the cookie for 120 seconds.
 
   alias Wagyu.Blake2s
   alias Wagyu.Packet
@@ -51,9 +55,9 @@ defmodule Wagyu.Cookie do
 
   @doc """
   Returns whether `frame`, an initiation or response from `source`, has a
-  MAC2 made with that source's cookie under the current secret at `now`,
-  in monotonic milliseconds. With no secret, or one 120 seconds old, no
-  MAC2 is valid.
+  valid MAC2 at `now`, in monotonic milliseconds. A valid MAC2 uses that
+  source's cookie under the current secret. If there is no secret, or the
+  secret is 120 seconds old, no MAC2 is valid.
   """
   @spec valid_mac2?(t(), binary(), source(), integer()) :: boolean()
   def valid_mac2?(%__MODULE__{secret: secret, created_at: created_at}, frame, source, now) do
@@ -62,9 +66,9 @@ defmodule Wagyu.Cookie do
 
   @doc """
   Returns a cookie reply to `frame`, an initiation or response from
-  `source`, addressed to `receiver_index`, the frame's sender index, and the
-  cookie state, whose secret is replaced first if it is 120 seconds old.
-  `nonce` defaults to 24 random bytes.
+  `source`, and the cookie state. The reply goes to `receiver_index`, the
+  frame's sender index. If the secret is 120 seconds old, this function
+  first replaces it. `nonce` defaults to 24 random bytes.
   """
   @spec reply(t(), binary(), non_neg_integer(), source(), integer(), <<_::192>>) :: {binary(), t()}
   def reply(checker, frame, receiver_index, source, now, nonce \\ :crypto.strong_rand_bytes(24)) do
@@ -92,10 +96,11 @@ defmodule Wagyu.Cookie do
   end
 
   @doc """
-  Decrypts a cookie reply with `key`, `key/1` of the public key the answered
-  message was sent to, and that message's `mac1`. Returns `{:ok, cookie}`,
-  or `:error` for a reply that does not authenticate. Every reply is
-  attacker-supplied, so this never raises for one.
+  Decrypts a cookie reply with `key` and the answered message's `mac1`.
+  `key` is `key/1` of the public key that the answered message went to.
+  Returns `{:ok, cookie}`, or `:error` for a reply that does not
+  authenticate. Every reply is attacker-supplied, so this function never
+  raises for one.
   """
   @spec open(CookieReply.t(), <<_::256>>, <<_::128>>) :: {:ok, <<_::128>>} | :error
   def open(%CookieReply{nonce: nonce, encrypted_cookie: encrypted}, key, mac1),

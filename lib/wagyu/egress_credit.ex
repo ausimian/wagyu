@@ -1,24 +1,29 @@
 defmodule Wagyu.EgressCredit do
   @moduledoc false
 
-  # Counts the egress one interface incarnation holds on the stack's behalf:
-  # packets the link has handed it and that have yet to be sent, staged or
-  # dropped, in the interface's mailbox or a peer's.
+  # Counts the egress that one interface incarnation holds for the stack.
+  # These are the packets that the link gave to the interface and that are
+  # not yet sent, staged or dropped. The packets are in the mailbox of the
+  # interface or of a peer.
   #
-  # The link starts the stack with a fixed egress credit and grants back only
-  # what has left the interface, so the stack's credit, its batches on their
-  # way to the link and this count together never exceed that credit. Only
-  # the link adds to the count, as it hands packets over; the interface
-  # retires them, then tells the link (`Wagyu.Link.retired/1`), which
-  # reads the count again and grants the difference. The counts live in
-  # `:counters` that both processes share, and since only the link adds to
-  # them, a value it reads can be stale only by being too high: it never
-  # grants credit that is still held.
+  # The link starts the stack with a fixed egress credit. It grants back
+  # only the credit for packets that left the interface. Thus the credit of
+  # the stack, its batches in transit to the link and this count together
+  # never exceed that credit. Only the link adds to the count, when it gives
+  # packets to the interface. The interface retires the packets and then
+  # tells the link (`Wagyu.Link.retired/1`). The link then reads the count
+  # again and grants the difference.
   #
-  # The count belongs to one interface incarnation, as `Wagyu.Admission` does
-  # to one receiver. When the interface exits, its peers exit with it, and
-  # whatever it held is lost; its replacement starts from zero with a new
-  # count, and the link stops reading the old one.
+  # The counts are in `:counters` that both processes share. Only the link
+  # adds to them. Thus a value that the link reads can be old in only one
+  # way: it can be too high. As a result, the link never grants credit that
+  # is still in use.
+  #
+  # The count belongs to one interface incarnation, the same as a
+  # `Wagyu.Admission` belongs to one receiver. When the interface exits, its
+  # peers also exit, and the interface loses all packets that it held. Its
+  # replacement starts from zero with a new count, and the link no longer
+  # reads the old count.
 
   @packets 1
   @bytes 2
@@ -31,7 +36,7 @@ defmodule Wagyu.EgressCredit do
   @spec new() :: t()
   def new, do: %__MODULE__{counters: :counters.new(2, [:atomics])}
 
-  @doc "Adds packets the link hands the interface."
+  @doc "Adds the packets that the link gives to the interface."
   @spec take(t(), [binary()]) :: :ok
   def take(credit, packets), do: add(credit, length(packets), Wagyu.Admission.bytes(packets))
 
@@ -43,7 +48,7 @@ defmodule Wagyu.EgressCredit do
   @spec retire_all(t(), [binary()]) :: :ok
   def retire_all(credit, packets), do: retire(credit, length(packets), Wagyu.Admission.bytes(packets))
 
-  @doc "Returns the packets and bytes taken and not yet retired."
+  @doc "Returns the packets and bytes that are taken but not retired."
   @spec outstanding(t()) :: {non_neg_integer(), non_neg_integer()}
   def outstanding(%__MODULE__{counters: counters}),
     do: {:counters.get(counters, @packets), :counters.get(counters, @bytes)}

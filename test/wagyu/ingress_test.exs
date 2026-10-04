@@ -1,5 +1,5 @@
 defmodule Wagyu.IngressTest do
-  # Traces calls in every process, so it runs alone.
+  # This test traces calls in all processes. Thus it runs alone.
   use ExUnit.Case, async: false
 
   import Wagyu.TestHelpers
@@ -44,7 +44,7 @@ defmodule Wagyu.IngressTest do
       assert data == "hello #{n}"
     end
 
-    # Exercise the other paths too: egress to a peer and inbound datagrams.
+    # Also test the other paths: egress to a peer and inbound datagrams.
     send_egress(socket, 2)
     {:ok, %{listen: %{port: port}}} = Wagyu.info(interface)
     {:ok, client} = :gen_udp.open(0, ip: {127, 0, 0, 1})

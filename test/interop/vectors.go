@@ -1,9 +1,10 @@
 package main
 
-// A WireGuard handshake transcript from fixed keys, computed step by step as
-// section 5.4 of the WireGuard whitepaper describes it, with the primitives
-// wireguard-go itself uses. It shares no code with Decibel or Wagyu, so it
-// checks Wagyu's framing and Noise parameters independently.
+// A WireGuard handshake transcript from fixed keys. The code calculates it
+// step by step, as section 5.4 of the WireGuard whitepaper describes. It uses
+// the same primitives as wireguard-go. It does not share code with Decibel
+// or Wagyu. Thus it gives an independent check of the framing and the Noise
+// parameters of Wagyu.
 
 import (
 	"crypto/hmac"
@@ -44,8 +45,8 @@ func transcript() []vector {
 	responderPrivate, responderPublic := keypair("responder static")
 	responderEphemeralPrivate, responderEphemeral := keypair("responder ephemeral")
 
-	// TAI64N: the label 2^62 + 10 + Unix seconds, then nanoseconds, which
-	// WireGuard rounds down to a multiple of 2^24.
+	// TAI64N: the label 2^62 + 10 + Unix seconds, then nanoseconds. WireGuard
+	// rounds the nanoseconds down to a multiple of 2^24.
 	timestamp := make([]byte, 12)
 	binary.BigEndian.PutUint64(timestamp, 0x400000000000000a+1_700_000_000)
 	binary.BigEndian.PutUint32(timestamp[8:], 5<<24)
@@ -90,15 +91,17 @@ func transcript() []vector {
 	response = append(response, encryptedNothing...)
 	response = appendMACs(response, initiatorPublic)
 
-	// Transport keys, and the first message each side sends: an empty
-	// keepalive with counter 0, addressed by the other side's index.
+	// Transport keys, and the first message that each side sends. That
+	// message is an empty keepalive with counter 0, to the index of the other
+	// side.
 	keys = kdf(2, chain, nil)
 	initiatorSend, responderSend := keys[0], keys[1]
 
-	// A cookie reply to the initiation, as a responder under load sends it
-	// from a fixed secret and nonce, and the initiation again with MAC2 under
-	// that cookie. The cookie is keyed BLAKE2s-128 of the initiation's
-	// source, 127.0.0.1:51820, as its address and big-endian port.
+	// A cookie reply to the initiation, as a responder under load sends it,
+	// from a fixed secret and nonce. Then the initiation again, with MAC2
+	// under that cookie. The cookie is a keyed BLAKE2s-128 of the source of
+	// the initiation, 127.0.0.1:51820. The input is the address and the
+	// big-endian port.
 	cookieSecret := hashOf([]byte("wagyu golden vector cookie secret"))
 	cookieNonce := hashOf([]byte("wagyu golden vector cookie nonce"))[:24]
 	cookie := macOf(cookieSecret, []byte{127, 0, 0, 1, 0xca, 0x6c})
@@ -146,7 +149,7 @@ func macOf(key, message []byte) []byte {
 	return mac.Sum(nil)
 }
 
-// A clamped X25519 key pair derived from a label.
+// A clamped X25519 key pair that comes from a label.
 func keypair(label string) (private, public []byte) {
 	key := blake2s.Sum256([]byte("wagyu golden vector " + label))
 	key[0] &= 248

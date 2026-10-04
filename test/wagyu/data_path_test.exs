@@ -1,9 +1,9 @@
 defmodule Wagyu.DataPathTest do
-  # The encrypted data path between SmolNet sockets and two remote parties
-  # that the test plays, with their own UDP sockets and Decibel sessions.
-  # Their AllowedIPs overlap in both families: B's prefixes are nested in
-  # A's. The interface runs on a fake clock, and so does a peer once a test
-  # needs it to.
+  # The encrypted data path between SmolNet sockets and two remote parties.
+  # The test simulates the remote parties, with their own UDP sockets and
+  # Decibel sessions. Their AllowedIPs overlap in the two families: the
+  # prefixes of B are in the prefixes of A. The interface runs on a fake
+  # clock. A peer also runs on a fake clock when a test needs it.
   use ExUnit.Case, async: true
 
   import Wagyu.TestHelpers
@@ -13,10 +13,10 @@ defmodule Wagyu.DataPathTest do
 
   @local {10, 13, 0, 2}
   @local6 {0xFD00, 0, 0, 0, 0, 0, 0, 2}
-  # A's addresses, outside B's nested prefixes.
+  # The addresses of A, outside the nested prefixes of B.
   @a_host {10, 13, 6, 1}
   @a_host6 {0xFD00, 0, 0, 0, 0, 0, 0, 6}
-  # B's addresses, inside A's prefixes too.
+  # The addresses of B, which are also in the prefixes of A.
   @b_host {10, 13, 5, 1}
   @b_host6 {0xFD00, 0, 0, 0, 0, 0, 0, 5}
 
@@ -71,8 +71,9 @@ defmodule Wagyu.DataPathTest do
     }
   end
 
-  # OTP 27 gives a UDP socket an 8 KiB receive buffer, which a burst of
-  # staged packets overflows on loopback, so set it as the interface does.
+  # OTP 27 gives a UDP socket an 8 KiB receive buffer. On loopback, a burst
+  # of staged packets overflows this buffer. Thus, set the buffer as the
+  # interface does.
   defp udp_socket do
     {:ok, socket} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}, active: false, recbuf: 1_048_576])
     socket
@@ -85,9 +86,9 @@ defmodule Wagyu.DataPathTest do
     end
   end
 
-  # The remote party initiates and confirms the handshake with a keepalive,
-  # so the peer sends under the new key. Returns the remote party's
-  # transport session and the peer's index.
+  # The remote party initiates and confirms the handshake with a keepalive.
+  # Thus the peer sends under the new key. Returns the transport session of
+  # the remote party and the index of the peer.
   defp handshake(context, remote) do
     {initiation, session} = initiate_to(context.public_key, remote.keypair, timestamp(1), 77)
     to_wagyu(context, initiation, remote.socket)
@@ -105,7 +106,8 @@ defmodule Wagyu.DataPathTest do
   defp send_data(context, remote, key, packet, from \\ nil),
     do: to_wagyu(context, transport_frame(key.session, key.index, packet), from || remote.socket)
 
-  # A frame under `key` with a chosen counter, which only moves forward.
+  # Returns a frame under `key` with a selected counter. The counter can only
+  # increase.
   defp frame_at(key, counter, packet) do
     :ok = Decibel.set_nonce(key.session, :out, counter)
     transport_frame(key.session, key.index, packet)
@@ -119,7 +121,8 @@ defmodule Wagyu.DataPathTest do
 
   defp refute_datagram(socket), do: assert(:gen_udp.recv(socket, 0, 100) == {:error, :timeout})
 
-  # A SmolNet UDP socket bound to the interface's own address in `family`.
+  # Returns a SmolNet UDP socket bound to the address of the interface in
+  # `family`.
   defp smolnet_udp(context, family) do
     {:ok, socket} = SmolNet.open(family, :dgram, :udp, stack: context.stack)
     :ok = SmolNet.bind(socket, %{family: family, addr: if(family == :inet, do: @local, else: @local6), port: 0})
@@ -134,16 +137,18 @@ defmodule Wagyu.DataPathTest do
 
   defp refute_smolnet(socket), do: assert(SmolNet.recvfrom(socket, 0, 100) == {:error, :timeout})
 
-  # A packet for a SmolNet socket from `source`, with some sender padding.
+  # Returns a packet for a SmolNet socket from `source`, with some padding
+  # from the sender.
   defp inbound({_a, _b, _c, _d} = source, port, payload),
     do: ipv4_udp(source, @local, 4_000, port, payload) <> <<0::64>>
 
   defp inbound(source, port, payload), do: ipv6_udp(source, @local6, 4_000, port, payload) <> <<0::64>>
 
-  # An egress packet from a SmolNet socket to `destination`.
+  # Returns an egress packet from a SmolNet socket to `destination`.
   defp outbound(destination, payload), do: ipv4_udp(@local, destination, 4_000, 9, payload)
 
-  # The payload of the next packet `remote` receives under `key`.
+  # Returns the payload of the next packet that `remote` receives under
+  # `key`.
   defp receive_payload(context, remote, key) do
     {:ok, plaintext} = open_transport(key.session, receive_datagram(context, remote))
     {:ok, %{length: length}} = IP.parse(plaintext)
@@ -177,14 +182,14 @@ defmodule Wagyu.DataPathTest do
       a_key = context.a.key
       %{peers: %{^a_key => %{inbound: inbound}}} = :sys.get_state(context.children.interface)
 
-      # Ten frames wait for the peer, and the link waits too.
+      # Ten frames wait for the peer, and the link also waits.
       :ok = :sys.suspend(key.peer)
       :ok = :sys.suspend(link)
       for n <- 1..10, do: send_data(context, context.a, key, inbound(@a_host, port, "packet #{n}"))
       assert eventually(fn -> match?({10, _bytes}, Admission.usage(inbound)) end)
 
-      # The peer takes all ten before its mailbox empties, and then sends
-      # their packets, trimmed, in one message.
+      # The peer takes all ten frames before its mailbox is empty. Then it
+      # sends their trimmed packets in one message.
       :ok = :sys.resume(key.peer)
       {:messages, messages} = eventually(fn -> message_queue_len(link) > 0 and Process.info(link, :messages) end)
       assert [packets] = for({:wg_plaintext, packets} <- messages, do: packets)
@@ -205,14 +210,15 @@ defmodule Wagyu.DataPathTest do
       :ok = :sys.suspend(key.peer)
       :ok = :sys.suspend(link)
 
-      # A packet, 40 replays of it, which the peer refuses, and another.
+      # A packet, 40 replays of that packet, which the peer refuses, and one
+      # more packet.
       first = transport_frame(key.session, key.index, inbound(@a_host, port, "first"))
       for _n <- 0..40, do: to_wagyu(context, first, context.a.socket)
       send_data(context, context.a, key, inbound(@a_host, port, "second"))
       assert eventually(fn -> match?({42, _bytes}, Admission.usage(inbound)) end)
 
-      # The first goes once the peer has taken 32 frames, without waiting for
-      # its mailbox to empty.
+      # The first packet goes after the peer takes 32 frames. It does not wait
+      # until the mailbox of the peer is empty.
       :ok = :sys.resume(key.peer)
 
       deliveries =
@@ -238,7 +244,8 @@ defmodule Wagyu.DataPathTest do
       {udp, port} = smolnet_udp(context, :inet)
       {udp6, port6} = smolnet_udp(context, :inet6)
 
-      # B's nested prefixes, and addresses that no peer's prefixes cover.
+      # The nested prefixes of B, and addresses that the prefixes of no peer
+      # include.
       send_data(context, context.a, key, inbound(@b_host, port, "spoofed"))
       send_data(context, context.a, key, inbound({192, 0, 2, 1}, port, "spoofed"))
       send_data(context, context.a, key, inbound(@b_host6, port6, "spoofed"))
@@ -258,18 +265,20 @@ defmodule Wagyu.DataPathTest do
       {udp, port} = smolnet_udp(context, :inet)
       data = fn counter -> frame_at(key, counter, inbound(@a_host, port, Integer.to_string(counter))) end
 
-      # Counter 0 was the keepalive. Frames can only be made in counter
-      # order, so they are made first and sent out of order.
+      # Counter 0 was the keepalive. The test can make frames only in the
+      # sequence of their counters. Thus it makes them first and then sends them
+      # out of sequence.
       [one, two, three, edge, genuine, highest] = Enum.map([1, 2, 3, 873, 5_000, 9_000], data)
 
-      # A forgery of the frame with counter 5000, which does not
-      # authenticate, so its counter is never committed.
+      # A forgery of the frame with counter 5000. The forgery does not
+      # authenticate, so the peer does not commit its counter.
       <<header::binary-16, first, rest::binary>> = genuine
       forged = <<header::binary, Bitwise.bxor(first, 1), rest::binary>>
 
-      # A counter 8128 or more behind the highest (9000 - 8128 = 872) is
-      # stale. The window refuses it before decryption, so it counts as a
-      # replay although it would not have authenticated either.
+      # A counter that is 8128 or more less than the highest counter
+      # (9000 - 8128 = 872) is stale. The window refuses it before decryption,
+      # so it counts as a replay. If the peer decrypted it, it would also fail
+      # to authenticate.
       stale = <<4, 0, 0, 0, key.index::little-32, 872::little-64, 0::128>>
 
       for frame <- [three, one, two, two, forged, highest, genuine, edge, stale] do
@@ -293,7 +302,8 @@ defmodule Wagyu.DataPathTest do
       to_wagyu(context, replayed, context.a.socket)
       assert smolnet_recv(udp) == {@a_host, "first"}
 
-      # An IP length beyond the plaintext, and a plaintext that is not IP.
+      # An IP length that is more than the plaintext, and a plaintext that is
+      # not IP.
       <<too_short::binary-30, _rest::binary>> = ipv4_udp(@a_host, @local, 4_000, port, String.duplicate("x", 20))
       send_data(context, context.a, key, too_short, attacker)
       send_data(context, context.a, key, "not an IP packet", attacker)
@@ -310,8 +320,8 @@ defmodule Wagyu.DataPathTest do
       assert peer(context, context.a) == key.peer
       refute_smolnet(udp)
 
-      # Data that passes every check moves the endpoint to its source, and
-      # the peer then sends there.
+      # Data that passes all checks moves the endpoint to its source. The peer
+      # then sends to that source.
       send_data(context, context.a, key, inbound(@a_host, port, "roamed"), attacker)
       assert smolnet_recv(udp) == {@a_host, "roamed"}
       {:ok, attacker_port} = :inet.port(attacker)
@@ -320,7 +330,7 @@ defmodule Wagyu.DataPathTest do
       :ok = SmolNet.sendto(udp, "reply", %{family: :inet, addr: @a_host, port: 4_000})
       assert {:ok, {{127, 0, 0, 1}, _port, <<4, _rest::binary>>}} = :gen_udp.recv(attacker, 0, 1_000)
 
-      # So does a keepalive.
+      # A keepalive also moves the endpoint.
       send_data(context, context.a, key, "")
       assert eventually(fn -> :sys.get_state(key.peer).endpoint == context.a.endpoint end)
     end
@@ -339,7 +349,7 @@ defmodule Wagyu.DataPathTest do
         :ok = SmolNet.sendto(udp6, "hello", %{family: :inet6, addr: destination, port: 9})
       end
 
-      # With no keys yet, each peer stages its packets.
+      # The peers do not have keys yet, so each peer stages its packets.
       [a, b] = Enum.map([context.a, context.b], fn remote -> eventually(fn -> peer(context, remote) end) end)
       assert eventually(fn -> length(staged(a)) == 2 and length(staged(b)) == 2 end)
 
@@ -355,14 +365,15 @@ defmodule Wagyu.DataPathTest do
       assert <<2, 0, 0, 0, index::little-32, 77::little-32, _rest::binary>> = response
       assert complete(session, response) == :ok
 
-      # The responder has no key to send with until it is confirmed, and
-      # REKEY_TIMEOUT stops it initiating, so the packet waits.
+      # The responder has no key to send with until its key is confirmed.
+      # REKEY_TIMEOUT prevents an initiation by the responder. Thus the packet
+      # waits.
       {udp, _port} = smolnet_udp(context, :inet)
       :ok = SmolNet.sendto(udp, "staged", %{family: :inet, addr: @a_host, port: 9})
       peer = eventually(fn -> peer(context, context.a) end)
       assert eventually(fn -> length(staged(peer)) == 1 end)
 
-      # The remote party roams and confirms the key from its new address.
+      # The remote party roams, and confirms the key from its new address.
       roamed = udp_socket()
       to_wagyu(context, transport_frame(session, index), roamed)
       assert {:ok, {{127, 0, 0, 1}, _port, frame}} = :gen_udp.recv(roamed, 0, 1_000)
@@ -376,8 +387,8 @@ defmodule Wagyu.DataPathTest do
       key = handshake(context, context.a)
       {udp, _port} = smolnet_udp(context, :inet)
 
-      # IP lengths of 29, 48, 1283 and 1285: 28 bytes of headers and the
-      # payload.
+      # IP lengths of 29, 48, 1283 and 1285. Each length is 28 bytes of headers
+      # and the payload.
       for size <- [1, 20, 1_255, 1_257] do
         :ok = SmolNet.sendto(udp, String.duplicate("p", size), %{family: :inet, addr: @a_host, port: 9})
       end
@@ -398,7 +409,8 @@ defmodule Wagyu.DataPathTest do
     test "packets staged for a key go out in order under it, and at most 128 wait", context do
       {udp, _port} = smolnet_udp(context, :inet)
 
-      # The first packet starts the handshake; the rest wait for its key.
+      # The first packet starts the handshake. The other packets wait for its
+      # key.
       send_egress(udp, 1, @a_host)
       initiation = receive_datagram(context, context.a)
 
@@ -434,8 +446,8 @@ defmodule Wagyu.DataPathTest do
       :ok = :sys.suspend(a.peer)
       :ok = :sys.suspend(b.peer)
 
-      # One batch from the link, with B's packets among A's and more of A's
-      # than its queue holds.
+      # One batch from the link. The packets of B are mixed with the packets of
+      # A. There are more packets for A than its queue can hold.
       as = for n <- 1..130, do: outbound(@a_host, "a #{n}")
       [b1, b2, b3] = for n <- 1..3, do: outbound(@b_host, "b #{n}")
       batch = [b1 | Enum.take(as, 60)] ++ [b2 | Enum.drop(as, 60)] ++ [b3]
@@ -461,8 +473,8 @@ defmodule Wagyu.DataPathTest do
     test "staging is bounded in bytes too", context do
       {udp, _port} = smolnet_udp(context, :inet)
 
-      # 16,028-byte packets: 16 fit in 256 KiB. The first starts the
-      # handshake, and the rest wait with it for its key.
+      # Packets of 16,028 bytes. 16 of them fit in 256 KiB. The first packet
+      # starts the handshake. The other packets wait with it for its key.
       send = fn -> :ok = SmolNet.sendto(udp, :binary.copy("b", 16_000), %{family: :inet, addr: @a_host, port: 9}) end
       send.()
       assert <<1, _rest::binary>> = receive_datagram(context, context.a)
@@ -474,7 +486,7 @@ defmodule Wagyu.DataPathTest do
       assert Admission.usage(:sys.get_state(peer).staging) == {16, 256_448}
     end
 
-    # Killing the peer logs its exit.
+    # When the test kills the peer, the peer logs its exit.
     @tag :capture_log
     test "staged packets never show in the peer's status, and count as dropped if it exits", context do
       {udp, _port} = smolnet_udp(context, :inet)
@@ -503,9 +515,9 @@ defmodule Wagyu.DataPathTest do
       %{initiation: %{sent_at: sent_at}} = :sys.get_state(peer)
       advance(fake_clock(peer, sent_at), 180_000)
 
-      # The response still completes the handshake, but its key is already
-      # as old as the responder's will be, so the staged packet waits for a
-      # new handshake instead of going out under it.
+      # The response still completes the handshake. But its key is already as
+      # old as the key of the responder will be. Thus the staged packet does not
+      # go out under that key. It waits for a new handshake.
       {response, _session, _sent} = respond_to(initiation, context.a.keypair, 7)
       to_wagyu(context, response, context.a.socket)
       assert <<1, _rest::binary>> = receive_datagram(context, context.a)
@@ -532,7 +544,8 @@ defmodule Wagyu.DataPathTest do
       assert %{transport_expired: 1} = counters(context.interface, &(&1.transport_expired == 1))
       refute_smolnet(udp)
 
-      # An outbound packet waits for a new handshake instead.
+      # An outbound packet does not go out under the expired key. It waits for
+      # a new handshake.
       :ok = SmolNet.sendto(udp, "too late", %{family: :inet, addr: @a_host, port: 9})
       assert <<1, _rest::binary>> = receive_datagram(context, context.a)
       assert [_one] = staged(key.peer)
@@ -542,7 +555,7 @@ defmodule Wagyu.DataPathTest do
     test "a key sends nothing at REJECT_AFTER_MESSAGES, and the packet waits for a new handshake", context do
       key = handshake(context, context.a)
       {udp, _port} = smolnet_udp(context, :inet)
-      # REKEY_TIMEOUT has passed since the peer's response, so it may
+      # REKEY_TIMEOUT is past since the response of the peer. Thus the peer can
       # initiate.
       %{handshake_sent_at: sent_at} = :sys.get_state(key.peer)
       advance(fake_clock(key.peer, sent_at), 5_000)

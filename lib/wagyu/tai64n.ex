@@ -5,13 +5,16 @@ defmodule Wagyu.TAI64N do
   #
   # A timestamp is 12 bytes: an 8-byte big-endian TAI64 label (the base
   # 0x400000000000000a plus Unix seconds) followed by a 4-byte big-endian
-  # nanosecond count. Responders keep the greatest timestamp they have
-  # accepted from each peer and compare new ones byte by byte, so the value
-  # must come from the wall clock: a monotonic source restarts lower after a
-  # node restart, and every responder would then reject it as a replay.
+  # nanosecond count.
   #
-  # Like wireguard-go and Linux, nanoseconds are rounded down to a multiple of
-  # 2^24 (about 16.8 ms) so that initiations do not leak fine-grained timing.
+  # Responders keep the greatest timestamp that they accepted from each
+  # peer, and compare new timestamps byte by byte. Thus the value must come
+  # from the wall clock. A monotonic source starts again at a lower value
+  # after a node restart. Every responder then rejects it as a replay.
+  #
+  # As in wireguard-go and Linux, nanoseconds are rounded down to a multiple
+  # of 2^24 (about 16.8 ms). Thus initiations do not leak fine-grained
+  # timing.
 
   import Bitwise
 
@@ -28,8 +31,8 @@ defmodule Wagyu.TAI64N do
   def now, do: from_unix(System.os_time(:nanosecond))
 
   @doc """
-  Encodes nanoseconds since the Unix epoch, rounding down to a multiple of 2^24
-  nanoseconds within the second.
+  Encodes nanoseconds since the Unix epoch. Rounds the nanoseconds within
+  the second down to a multiple of 2^24.
   """
   @spec from_unix(integer()) :: t()
   def from_unix(nanoseconds) when is_integer(nanoseconds) do
@@ -41,9 +44,11 @@ defmodule Wagyu.TAI64N do
   @doc """
   Decodes a timestamp to nanoseconds since the Unix epoch.
 
-  Returns `{:error, :invalid_timestamp}` for anything that is not 12 bytes, has
-  a nanosecond field of a second or more, or uses a reserved TAI64 label
-  (2^63 and above). It never raises.
+  Returns `{:error, :invalid_timestamp}` for these values, and never raises:
+
+    * A value that is not 12 bytes.
+    * A nanosecond field of a second or more.
+    * A reserved TAI64 label (2^63 and above).
   """
   @spec to_unix(term()) :: {:ok, integer()} | {:error, :invalid_timestamp}
   def to_unix(<<label::64, nanos::32>>) when label < @reserved_label and nanos < @nanos_per_second do
@@ -67,10 +72,11 @@ defmodule Wagyu.TAI64N do
   Returns the timestamp for this peer's next initiation, given the one it sent
   last (or `nil` if it has sent none).
 
-  The result is `current`, the wall-clock timestamp by default, when that is
-  later than `previous`. Otherwise, for initiations within one 2^24 ns window
-  or after the wall clock steps backwards, it is the next rounded value after
-  `previous`, so the timestamps a peer sends are strictly increasing.
+  If `current` is later than `previous`, the result is `current`. By
+  default, `current` is the wall-clock timestamp. Otherwise the result is
+  the next rounded value after `previous`. This occurs for initiations
+  within one 2^24 ns window, or after the wall clock steps back. Thus the
+  timestamps that a peer sends increase strictly.
   """
   @spec next(t() | nil, t()) :: t()
   def next(previous, current \\ now())

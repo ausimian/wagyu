@@ -1,22 +1,24 @@
 # Bulk TCP throughput through the tunnel.
 #
-# Two interfaces on 127.0.0.1, each with its own SmolNet stack, peered with
-# each other. Every run sends `WAGYU_BENCH_MB` MiB from sockets on one stack
-# to a listener on the other, split across 1, 4 or 8 streams. SmolNet's own
-# loopback link, which carries the same TCP with no tunnel, is the baseline.
+# The benchmark uses two interfaces on 127.0.0.1. Each interface has its own
+# SmolNet stack and is a peer of the other interface. Each run sends
+# `WAGYU_BENCH_MB` MiB from sockets on one stack to a listener on the other
+# stack, divided across 1, 4 or 8 streams. The baseline is the loopback link
+# of SmolNet, which sends the same TCP without a tunnel.
 #
 #     mix run bench/throughput.exs
 #
 # Environment:
 #
-#   * `WAGYU_BENCH_MB` - MiB sent per run (default 16)
-#   * `WAGYU_BENCH_TIME` - seconds measured per scenario (default 10)
-#   * `WAGYU_BENCH_MTU` - the stacks' MTU (default 1280)
+#   * `WAGYU_BENCH_MB` - the MiB that each run sends (default 16)
+#   * `WAGYU_BENCH_TIME` - the seconds measured for each scenario (default 10)
+#   * `WAGYU_BENCH_MTU` - the MTU of the stacks (default 1280)
 #
-# Both ends run in this VM and share its schedulers, so one interface talking
-# to a remote peer does about half this work. After Benchee's report the
-# script prints each scenario's median rate in MiB/s and, for the tunnel, the
-# packets the interface dropped: drops are what make many streams collapse.
+# The two ends run in this VM and use the same schedulers. Thus one interface
+# that sends to a remote peer does about half of this work. After the Benchee
+# report, the script prints the median rate of each scenario in MiB/s. For the
+# tunnel, it also prints the packets that the interface dropped. Dropped
+# packets are the cause when many streams collapse.
 
 defmodule Wagyu.Bench.Throughput do
   @moduledoc false
@@ -26,7 +28,7 @@ defmodule Wagyu.Bench.Throughput do
   @tunnel_b {10, 13, 0, 1}
   @drops [:egress_peer_dropped, :inbound_peer_dropped, :staged_dropped]
 
-  @doc "Starts two interfaces peered with each other, and completes their handshake."
+  @doc "Starts two interfaces that are peers of each other, and completes their handshake."
   def tunnel(mtu) do
     {a_public, a_private} = :crypto.generate_key(:ecdh, :x25519)
     {b_public, b_private} = :crypto.generate_key(:ecdh, :x25519)
@@ -44,24 +46,25 @@ defmodule Wagyu.Bench.Throughput do
     tunnel
   end
 
-  @doc "Starts a SmolNet loopback stack, whose egress feeds its own ingress."
+  @doc "Starts a SmolNet loopback stack. The egress of this stack goes to its own ingress."
   def loopback(mtu) do
     {:ok, _link, stack} = SmolNet.Loopback.start_link(addresses: [{{127, 0, 0, 1}, 8}], mtu: mtu)
     %{from: stack, to: stack, address: {127, 0, 0, 1}}
   end
 
   @doc """
-  Opens `streams` connections from `from` to a listener on `to`, each end
-  held by its own process. Runs reuse them: the socket that closes first
-  holds its slot through TIME_WAIT, about 10 seconds, and a stack has 64
-  slots by default, so a connection per run would soon exhaust them.
+  Opens `streams` connections from `from` to a listener on `to`. Each end of
+  a connection has its own process. All runs use the same connections. The
+  reason is that the socket that closes first keeps its slot through
+  TIME_WAIT, for about 10 seconds. A stack has 64 slots by default. Thus, a
+  new connection for each run would soon use all the slots.
   """
   def connect(%{from: from, to: to, address: address}, streams) do
     port = 10_000 + rem(System.unique_integer([:positive, :monotonic]), 50_000)
     {:ok, listener} = :gen_tcp.listen(port, tcp_options(to) ++ [ip: address, backlog: streams])
-    # One connection at a time: a listener takes one accept at a time, and
-    # a burst of connects can overrun its backlog. Each accepted socket goes
-    # to the process that receives on it.
+    # Open one connection at a time. A listener does one accept at a time,
+    # and a burst of connects can overflow its backlog. Each accepted socket
+    # goes to the process that receives on it.
     pairs =
       for _stream <- 1..streams do
         sender = spawn_link(fn -> sender(from, address, port) end)
@@ -76,7 +79,7 @@ defmodule Wagyu.Bench.Throughput do
     %{streams: streams, senders: senders, receivers: receivers, listener: listener}
   end
 
-  @doc "Sends `bytes` over `connections`, split evenly, and waits until all of it has arrived."
+  @doc "Sends `bytes` through `connections`, divided equally, and waits until all of it arrives."
   def transfer(%{senders: senders, receivers: receivers}, bytes) do
     per_stream = div(bytes, length(senders))
     for pid <- senders ++ receivers, do: send(pid, {:transfer, per_stream, self()})
@@ -91,7 +94,7 @@ defmodule Wagyu.Bench.Throughput do
     :gen_tcp.close(listener)
   end
 
-  @doc "The interface's drop counters."
+  @doc "Returns the drop counters of the interface."
   def drops(interface) do
     {:ok, %{counters: counters}} = Wagyu.info(interface)
     Map.take(counters, @drops)
@@ -173,8 +176,9 @@ tunnel = Throughput.tunnel(mtu)
 loopback = Throughput.loopback(mtu)
 drops = :ets.new(:drops, [:public])
 
-# Each scenario opens its connections once; every run then pushes `bytes`
-# through them. The tunnel's drop counters are compared across a scenario.
+# Each scenario opens its connections one time. Each run then sends `bytes`
+# through them. The script compares the drop counters of the tunnel before
+# and after a scenario.
 job = fn target, drops_of ->
   {fn connections -> Throughput.transfer(connections, bytes) end,
    before_scenario: fn streams ->

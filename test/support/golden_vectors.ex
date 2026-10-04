@@ -2,14 +2,16 @@ defmodule Wagyu.GoldenVectors do
   @moduledoc false
 
   # A WireGuard handshake transcript from fixed keys, as `wgpeer vectors`
-  # (test/interop) prints it. That program computes it step by step from the
-  # WireGuard whitepaper with golang.org/x/crypto, sharing no code with
-  # Decibel or Wagyu; the interop tests check that it still prints exactly
-  # this. Keys are hex, the initiator's index is 0x11223344 and the
-  # responder's 0x55667788, and each keepalive is the first transport
-  # message its sender sends. The cookie reply answers the initiation, as
-  # though it came from 127.0.0.1:51820, from a fixed cookie secret and
-  # nonce, and `initiation_mac2` is the initiation with MAC2 under its
+  # (test/interop) prints it. That program calculates the transcript step by
+  # step from the WireGuard whitepaper, with golang.org/x/crypto. It does not
+  # share code with Decibel or Wagyu. The interop tests make sure that it
+  # still prints exactly this transcript.
+  #
+  # The keys are hex. The index of the initiator is 0x11223344, and the index
+  # of the responder is 0x55667788. Each keepalive is the first transport
+  # message that its sender sends. The cookie reply answers the initiation as
+  # if the initiation came from 127.0.0.1:51820. The reply uses a fixed cookie
+  # secret and nonce. `initiation_mac2` is the initiation with MAC2 under its
   # cookie.
 
   @vectors [
@@ -41,9 +43,9 @@ defmodule Wagyu.GoldenVectors do
         "4061d5e7461c776abe65f75912946c06a2130e38f001eeef43fca8f1f39e1685b4f2b3fcb1d502abc2d04cb9"
   ]
 
-  @doc "The vectors in the order `wgpeer vectors` prints them, as hex."
+  @doc "Returns the vectors as hex, in the sequence that `wgpeer vectors` prints them."
   def hex, do: @vectors
 
-  @doc "One vector, decoded."
+  @doc "Returns one vector, decoded."
   def fetch!(name), do: @vectors |> Keyword.fetch!(name) |> Base.decode16!(case: :lower)
 end

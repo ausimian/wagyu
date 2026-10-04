@@ -3,22 +3,23 @@ defmodule Wagyu.IndexTable do
 
   # The interface's local receiver indices.
   #
-  # Every handshake and key slot a peer holds is addressed on the wire by a
-  # 32-bit index that this interface chose: the remote party puts it in the
-  # receiver field of each response, cookie reply and transport message it
-  # sends back. Indices are random and unique, so an off-path sender cannot
-  # guess a live one, and each maps to the peer process that owns it.
+  # On the wire, each handshake and key slot of a peer has a 32-bit index
+  # that this interface chose. The remote party puts this index in the
+  # receiver field of each response, cookie reply and transport message
+  # that it sends back. Indices are random and unique, so an off-path sender
+  # cannot guess a live index. Each index maps to the peer process that owns
+  # it.
   #
   # An index is active until its owner retires it or exits. It then becomes
-  # a drop-only tombstone for 180 seconds, so that delayed messages for the
-  # old slot are dropped rather than reaching a new owner, and only then is
-  # it deleted. Neither an active nor a tombstoned value is ever allocated
-  # again.
+  # a drop-only tombstone for 180 seconds. Thus delayed messages for the old
+  # slot are dropped, and do not reach a new owner. Only after this time is
+  # the index deleted. The table never allocates an active or tombstoned
+  # value again.
   #
-  # The table is a pure data structure. Time is passed in, in monotonic
-  # milliseconds, so retirement and expiry can be tested with a fake clock.
-  # Times must not decrease from one call to the next: tombstones expire in
-  # the order they were made.
+  # The table is a pure data structure. The caller passes in the time, in
+  # monotonic milliseconds, so tests can use a fake clock for retirement and
+  # expiry. Times must not decrease from one call to the next, because
+  # tombstones expire in the order that they were made.
 
   @retention 180_000
 
@@ -38,13 +39,14 @@ defmodule Wagyu.IndexTable do
   @spec new() :: t()
   def new, do: %__MODULE__{expiry: :queue.new()}
 
-  @doc "How long a retired index stays a tombstone, in milliseconds."
+  @doc "Returns how long a retired index stays a tombstone, in milliseconds."
   @spec retention() :: pos_integer()
   def retention, do: @retention
 
   @doc """
-  Allocates a random index for `owner`, never one that is active or
-  tombstoned. `random` returns candidate indices; tests supply their own.
+  Allocates a random index for `owner`. The index is never one that is
+  active or tombstoned. `random` returns candidate indices, and tests
+  supply their own function.
   """
   @spec allocate(t(), owner(), (-> index())) :: {index(), t()}
   def allocate(%__MODULE__{} = table, owner, random \\ &random/0) do
@@ -71,7 +73,7 @@ defmodule Wagyu.IndexTable do
   @spec owned(t(), owner()) :: MapSet.t(index())
   def owned(%__MODULE__{} = table, owner), do: Map.get(table.owners, owner, MapSet.new())
 
-  @doc "Retires an active index at time `now`. Anything else is left alone."
+  @doc "Retires an active index at time `now`. Other indices do not change."
   @spec retire(t(), term(), integer()) :: t()
   def retire(%__MODULE__{} = table, index, now) do
     case Map.pop(table.active, index) do
@@ -88,7 +90,7 @@ defmodule Wagyu.IndexTable do
     end
   end
 
-  @doc "Retires every index `owner` holds, at time `now`."
+  @doc "Retires every index that `owner` holds, at time `now`."
   @spec retire_owner(t(), owner(), integer()) :: t()
   def retire_owner(%__MODULE__{} = table, owner, now) do
     {owned, owners} = Map.pop(table.owners, owner, MapSet.new())
@@ -96,7 +98,7 @@ defmodule Wagyu.IndexTable do
     Enum.reduce(Enum.sort(owned), table, &tombstone(&2, &1, now))
   end
 
-  @doc "Deletes the tombstones whose retention has ended by time `now`."
+  @doc "Deletes the tombstones whose retention ends at or before time `now`."
   @spec expire(t(), integer()) :: t()
   def expire(%__MODULE__{} = table, now) do
     case :queue.peek(table.expiry) do

@@ -1,5 +1,6 @@
 defmodule Wagyu.SecretsTest do
-  # Changes the global log level and report handling, so it runs alone.
+  # This test changes the global log level and how reports are handled.
+  # Thus it runs alone.
   use ExUnit.Case, async: false
 
   import Wagyu.TestHelpers
@@ -9,8 +10,8 @@ defmodule Wagyu.SecretsTest do
   defmodule Handler do
     @moduledoc false
 
-    # Forwards every event, formatted as Elixir's default handler formats it,
-    # to the test process.
+    # Sends each event to the test process, with the format that the default
+    # handler of Elixir uses.
     def log(event, %{config: %{test: test}, formatter: {formatter, config}}) do
       send(test, {:log, IO.chardata_to_string(formatter.format(event, config))})
     end
@@ -21,8 +22,9 @@ defmodule Wagyu.SecretsTest do
     %{filters: filters} = :logger.get_primary_config()
     {translator, translator_config} = Keyword.fetch!(filters, :logger_translator)
 
-    # The equivalent of `handle_sasl_reports: true`, so that crash,
-    # supervisor and progress reports are logged, at the most detailed level.
+    # This is equivalent to `handle_sasl_reports: true`. Thus the logger
+    # records crash, supervisor and progress reports, at the most detailed
+    # level.
     :ok = :logger.remove_primary_filter(:logger_translator)
     :ok = :logger.add_primary_filter(:logger_translator, {translator, %{translator_config | sasl: true}})
     :ok = Logger.configure(level: :debug)
@@ -76,26 +78,28 @@ defmodule Wagyu.SecretsTest do
     options =
       options(name: name, private_key: private_key, peers: [Map.put(peer, :preshared_key, preshared_key)])
 
-    # A user's supervisor, whose progress reports print Wagyu's child spec.
+    # The supervisor of a user. Its progress reports print the child spec of
+    # Wagyu.
     {:ok, user_supervisor} = Supervisor.start_link([{Wagyu, options}], strategy: :one_for_one)
     root = Process.whereis(name)
     %{interface: interface} = children(root)
 
-    # The interface raises, so its report shows its state and last message
-    # and the crash report shows its stack trace, arguments included.
+    # The interface raises. Thus its report shows its state and last message.
+    # The crash report shows its stack trace, with the arguments.
     catch_exit(GenServer.call(interface, :crash))
     children = eventually(fn -> if child(root, :interface) != interface, do: children(root) end)
 
-    # A peer raises the same way, while it holds the transport session of
-    # a handshake it has responded to. Its Noise state, which includes the
-    # private key and the session keys, lives in its process dictionary, and
-    # crash reports include the dictionary of a process that is not
-    # sensitive.
+    # A peer raises in the same way. At that time, it holds the transport
+    # session of a handshake that it responded to. Its Noise state includes
+    # the private key and the session keys. This state is in its process
+    # dictionary. Crash reports include the dictionary of a process that is
+    # not sensitive.
     {:ok, %{public_key: public_key, listen: %{port: port}}} = Wagyu.info(root)
     {:ok, client} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}])
 
-    # The interface's `sys` debug log records its replies as they are, and
-    # the reply to the worker's claim carries the peer's configuration.
+    # The `sys` debug log of the interface records its replies without
+    # change. The reply to the claim of the worker contains the configuration
+    # of the peer.
     :ok = :sys.log(children.interface, true)
     :ok = :gen_udp.send(client, {127, 0, 0, 1}, port, noise_initiation(public_key, initiator, timestamp(1)))
     peer = only_child(children.peer_supervisor)
@@ -108,7 +112,8 @@ defmodule Wagyu.SecretsTest do
     assert {:error, _reason} =
              DynamicSupervisor.start_child(children.handshake_supervisor, {Wagyu.HandshakeWorker, :bad})
 
-    # Supervisors report their children's start arguments when those die.
+    # When children stop unexpectedly, their supervisors report the start
+    # arguments of the children.
     kill(children.handshake_supervisor)
     children(root)
     kill(root)
@@ -118,7 +123,8 @@ defmodule Wagyu.SecretsTest do
     logs = collect_logs()
     Supervisor.stop(user_supervisor)
 
-    # The reports were logged, and formatted the configuration redacted.
+    # The logger recorded the reports, and the formatted configuration was
+    # redacted.
     assert logs =~ "GenServer #{inspect(interface)} terminating"
     assert logs =~ "no function clause matching in Wagyu.Interface.handle_call/3"
     assert logs =~ "GenServer #{inspect(peer)} terminating"
@@ -127,10 +133,10 @@ defmodule Wagyu.SecretsTest do
     assert logs =~ "Start Call: Wagyu.HandshakeSupervisor.start_link("
     assert logs =~ "config: :redacted"
 
-    # Noise state, such as the peer's chaining and cipher keys, never
-    # appears. Session handles, which hold none, are inspected as
-    # #Decibel.Session<...>; state is a plain %Decibel... struct. A replay
-    # window is plain too, but holds only counters.
+    # Noise state, for example the chaining and cipher keys of the peer, does
+    # not appear. Session handles do not hold Noise state, and they show as
+    # #Decibel.Session<...>. Noise state is a plain %Decibel... struct. A
+    # replay window is also plain, but it holds only counters.
     assert logs =~ "#Decibel.Session<"
     assert logs =~ "%Decibel.ReplayWindow{"
     refute logs =~ ~r/%Decibel\.(?!ReplayWindow\{)/

@@ -6,26 +6,29 @@ defmodule Wagyu.Noise do
   # WireGuard is Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s with its identifier as
   # the prologue. The first message's payload is the initiator's 12-byte
   # TAI64N timestamp and the second's is empty. A peer without a preshared
-  # key uses 32 zero bytes. The psk2 modifier mixes the key in only at the
-  # end of the second message, so reading an initiation does not depend on
-  # the key's value. A responder therefore reads an initiation with the zero
-  # key to learn who sent it, and reads it again with that peer's key when
-  # it has one (see `Wagyu.HandshakeWorker`).
+  # key uses 32 zero bytes.
   #
-  # Noise's Split gives the initiator the first key to send with, which is
+  # The psk2 modifier mixes the key in only at the end of the second
+  # message. Thus the read of an initiation does not depend on the key's
+  # value. A responder reads an initiation with the zero key to learn who
+  # sent it. If that peer has a key, the responder then reads the initiation
+  # again with that key (see `Wagyu.HandshakeWorker`).
+  #
+  # Noise's Split gives the initiator the first key to send with. This is
   # WireGuard's convention and Decibel's default. Transport messages have
-  # empty associated data, and the ChaChaPoly nonce is four zero bytes
-  # followed by the 64-bit little-endian counter, so a transport header's
-  # counter is the session's nonce. WireGuard rotates keys by completing a
-  # new handshake, never with Noise's rekey.
+  # empty associated data. The ChaChaPoly nonce is four zero bytes followed
+  # by the 64-bit little-endian counter. Thus the counter in a transport
+  # header is the session's nonce. WireGuard rotates keys with a new
+  # handshake, and never with Noise's rekey.
   #
   # A session lives in the process dictionary of the process that creates
-  # it, so these functions run in that process: a handshake worker, the peer
-  # it hands the session to, or a peer that initiates. Every function that
-  # reads attacker-supplied data returns `:error` rather than raising.
+  # it. Thus these functions run in that process: a handshake worker, the
+  # peer that the worker hands the session to, or a peer that initiates.
+  # Every function that reads attacker-supplied data returns `:error`, and
+  # does not raise.
   #
-  # Sessions are made with `Decibel.new/3` unless the caller passes another
-  # function of the same shape. Only known-answer tests do, to fix the
+  # `Decibel.new/3` makes the sessions, if the caller does not pass another
+  # function of the same shape. Only known-answer tests do this, to fix the
   # ephemeral keys.
 
   alias Wagyu.Config
@@ -37,7 +40,8 @@ defmodule Wagyu.Noise do
   @prologue "WireGuard v1 zx2c4 Jason@zx2c4.com"
   @zero_psk <<0::256>>
 
-  # REJECT_AFTER_MESSAGES: no key sends or accepts a counter this high.
+  # REJECT_AFTER_MESSAGES: a key does not send or accept a counter this
+  # high.
   @reject_after_messages 0xFFFFFFFFFFFFDFFF
 
   @typedoc "Makes a session, as `Decibel.new/3` does."
@@ -45,8 +49,9 @@ defmodule Wagyu.Noise do
 
   @doc """
   Starts a responder session with the interface's key pair and
-  `preshared_key`, which defaults to none (32 zero bytes). The initiator is
-  not known until its initiation is read, so a first read uses the default.
+  `preshared_key`. The default is no key (32 zero bytes). The initiator is
+  not known until the responder reads its initiation, so a first read uses
+  the default.
   """
   @spec responder(Config.t(), <<_::256>>, new()) :: Decibel.session()
   def responder(
@@ -58,8 +63,9 @@ defmodule Wagyu.Noise do
   end
 
   @doc """
-  Starts an initiator session with the interface's key pair, to the holder
-  of `remote_key`, with the peer's `preshared_key` (32 zero bytes for none).
+  Starts an initiator session to the holder of `remote_key`. The session
+  uses the interface's key pair and the peer's `preshared_key` (32 zero
+  bytes for no key).
   """
   @spec initiator(Config.t(), <<_::256>>, <<_::256>>, new()) :: Decibel.session()
   def initiator(
@@ -72,10 +78,11 @@ defmodule Wagyu.Noise do
   end
 
   @doc """
-  Writes an initiator session's first handshake message and frames it as a
-  148-byte initiation from `sender_index` carrying `timestamp`, with MAC1
-  keyed by `mac1_key` (the responder's) and MAC2 by `cookie`, the
-  responder's latest, or zero without one.
+  Writes an initiator session's first handshake message. Frames it as a
+  148-byte initiation from `sender_index` that carries `timestamp`.
+
+  `mac1_key` (the responder's) keys MAC1. `cookie` keys MAC2. It is the
+  responder's latest cookie, or `nil`, which gives a zero MAC2.
   """
   @spec write_initiation(Decibel.session(), IndexTable.index(), <<_::96>>, <<_::256>>, <<_::128>> | nil) :: binary()
   def write_initiation(session, sender_index, <<_::binary-12>> = timestamp, mac1_key, cookie \\ nil) do
@@ -93,13 +100,13 @@ defmodule Wagyu.Noise do
   end
 
   @doc """
-  Reads an initiation's Noise fields into a responder session, returning the
+  Reads an initiation's Noise fields into a responder session. Returns the
   initiator's static public key and timestamp.
 
-  Returns `:error` when the message fails authentication or carries an
-  invalid public key. The session stays open either way, for the caller to
-  hand off or close. Every initiation is attacker-supplied, so this never
-  raises for one.
+  Returns `:error` if the message fails authentication or carries an
+  invalid public key. In both cases the session stays open, and the caller
+  hands it off or closes it. Every initiation is attacker-supplied, so this
+  function never raises for one.
   """
   @spec read_initiation(Decibel.session(), Initiation.t()) :: {:ok, <<_::256>>, <<_::96>>} | :error
   def read_initiation(session, %Initiation{
@@ -119,14 +126,15 @@ defmodule Wagyu.Noise do
 
   @doc """
   Writes a responder session's second handshake message, which has an empty
-  payload, once it has read an initiation, and frames it as a 92-byte
-  response from `sender_index` to the initiator's `receiver_index`, with
-  MAC1 keyed by `mac1_key` (the initiator's) and MAC2 by `cookie`, the
-  initiator's latest, or zero without one. The session is then ready for
-  transport.
+  payload. The session must first read an initiation. Frames the message as
+  a 92-byte response from `sender_index` to the initiator's
+  `receiver_index`. The session is then ready for transport.
 
-  Returns `:error`, leaving the session unchanged, if the initiator's keys
-  turn out to be unusable.
+  `mac1_key` (the initiator's) keys MAC1. `cookie` keys MAC2. It is the
+  initiator's latest cookie, or `nil`, which gives a zero MAC2.
+
+  Returns `:error`, and does not change the session, if the initiator's
+  keys are unusable.
   """
   @spec write_response(Decibel.session(), IndexTable.index(), IndexTable.index(), <<_::256>>, <<_::128>> | nil) ::
           {:ok, binary()} | :error
@@ -149,12 +157,12 @@ defmodule Wagyu.Noise do
   end
 
   @doc """
-  Reads a response into an initiator session that has written its
-  initiation. The session is then ready for transport.
+  Reads a response into an initiator session that wrote its initiation.
+  The session is then ready for transport.
 
-  Returns `:error` when the response fails authentication, leaving the
-  session unchanged and still waiting for the genuine response. Every
-  response is attacker-supplied, so this never raises for one.
+  Returns `:error` if the response fails authentication. The session does
+  not change, and it continues to wait for the genuine response. Every
+  response is attacker-supplied, so this function never raises for one.
   """
   @spec read_response(Decibel.session(), Response.t()) :: :ok | :error
   def read_response(session, %Response{ephemeral: ephemeral, encrypted_nothing: nothing}) do
@@ -169,9 +177,9 @@ defmodule Wagyu.Noise do
   message to `receiver_index`. Its counter is the session's next outbound
   nonce.
 
-  Returns `:error`, with nothing to send, once that counter reaches
-  REJECT_AFTER_MESSAGES (2^64 - 2^13 - 1). The counter is still consumed,
-  so every later call returns `:error` too.
+  Returns `:error`, with nothing to send, when that counter reaches
+  REJECT_AFTER_MESSAGES (2^64 - 2^13 - 1). The call still uses the counter,
+  so every later call also returns `:error`.
   """
   @spec seal(Decibel.session(), IndexTable.index(), iodata()) :: {:ok, binary()} | :error
   def seal(session, receiver_index, plaintext) do
@@ -185,12 +193,12 @@ defmodule Wagyu.Noise do
   end
 
   @doc """
-  Decrypts a transport message with a transport session, returning its
+  Decrypts a transport message with a transport session. Returns its
   plaintext, which is empty for a keepalive.
 
-  Returns `:error` when the message fails authentication. `Wagyu.Packet`
-  has already refused counters at or above REJECT_AFTER_MESSAGES. There is
-  no replay check here; that is the caller's.
+  Returns `:error` if the message fails authentication. `Wagyu.Packet`
+  already refused counters at or above REJECT_AFTER_MESSAGES. This function
+  does no replay check; the caller does it.
   """
   @spec open(Decibel.session(), Transport.t()) :: {:ok, binary()} | :error
   def open(session, %Transport{counter: counter, encrypted_packet: packet}) when counter < @reject_after_messages do

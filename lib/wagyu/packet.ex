@@ -23,7 +23,7 @@ defmodule Wagyu.Packet do
   @mac_size 16
 
   # Counters at or above REJECT_AFTER_MESSAGES (2^64 - 2^13 - 1) are never
-  # valid, so a frame carrying one is rejected before any crypto runs.
+  # valid, so a frame that carries one is rejected before any crypto runs.
   @reject_after_messages 0xFFFFFFFFFFFFDFFF
 
   @mac1_label "mac1----"
@@ -41,7 +41,7 @@ defmodule Wagyu.Packet do
   Errors:
 
     * `:invalid_length` - shorter than the 4-byte header, the wrong size for a
-      handshake or cookie message, or a transport message under 32 bytes
+      handshake or cookie message, or a transport message less than 32 bytes
     * `:unknown_type` - a type other than 1 to 4
     * `:invalid_reserved` - a known type with nonzero reserved bytes
     * `:invalid_counter` - a transport counter at or above the reject limit
@@ -144,13 +144,15 @@ defmodule Wagyu.Packet do
   def encode(message), do: raise(ArgumentError, "invalid WireGuard message: " <> inspect(message))
 
   @doc """
-  Encodes a transport message whose encrypted packet is iodata, copying it
-  once, straight into the frame. `encode/1` would need it flattened into a
-  binary first, and then copy it again behind the header.
+  Encodes a transport message whose encrypted packet is iodata. It copies
+  the packet one time, directly into the frame. `encode/1` needs the packet
+  as a flat binary first, and then copies it again behind the header.
 
-  Raises `ArgumentError` if `receiver` is not an index, `counter` is
-  negative or at or above the reject limit, or `packet` is not iodata or is
-  shorter than the AEAD tag.
+  Raises `ArgumentError` if one of these conditions is true:
+
+    * `receiver` is not an index.
+    * `counter` is negative, or at or above the reject limit.
+    * `packet` is not iodata, or is shorter than the AEAD tag.
   """
   @spec encode_transport(non_neg_integer(), non_neg_integer(), iodata()) :: binary()
   def encode_transport(receiver, counter, packet)
@@ -170,9 +172,9 @@ defmodule Wagyu.Packet do
   Returns the MAC1 key for messages sent to the holder of `public_key`:
   BLAKE2s-256("mac1----" || public_key).
 
-  Initiations are keyed with the responder's static public key and responses
-  with the initiator's, so a receiver checks MAC1 with the key derived from its
-  own public key.
+  The MAC1 key of an initiation comes from the responder's static public
+  key. The MAC1 key of a response comes from the initiator's. Thus a receiver
+  checks MAC1 with the key derived from its own public key.
   """
   @spec mac1_key(<<_::256>>) :: <<_::256>>
   def mac1_key(<<public_key::binary-32>>), do: Blake2s.hash(@mac1_label <> public_key)
@@ -189,11 +191,11 @@ defmodule Wagyu.Packet do
 
   MAC1 is keyed BLAKE2s-128 over every byte before the MAC1 field. MAC2 is
   keyed BLAKE2s-128 with `cookie` over every byte before the MAC2 field,
-  MAC1 included, or zero without a cookie, which is what a sender that has
-  none transmits.
+  which includes MAC1. Without a cookie, MAC2 is zero, which is what a
+  sender with no cookie transmits.
 
-  Raises `ArgumentError` for any other frame, a key that is not 32 bytes or
-  a cookie that is neither nil nor 16 bytes.
+  Raises `ArgumentError` for any other frame, for a key that is not 32
+  bytes, or for a cookie that is neither nil nor 16 bytes.
   """
   @spec put_macs(binary(), <<_::256>>, <<_::128>> | nil) :: binary()
   def put_macs(frame, key, cookie) do

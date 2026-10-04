@@ -1,30 +1,30 @@
 # Wagyu
 
 Wagyu is a user-mode [WireGuard](https://www.wireguard.com/) endpoint for
-`:gen_tcp` and `:gen_udp` sockets, written in Elixir. It needs no TUN device,
-root or kernel module: the sockets run on a userspace TCP/IP stack,
-[SmolNet](https://github.com/ausimian/smolnet), and Wagyu carries their packets
-to WireGuard peers over one UDP socket.
+`:gen_tcp` and `:gen_udp` sockets, written in Elixir. It does not need a TUN
+device, root or a kernel module. The sockets run on a userspace TCP/IP stack,
+[SmolNet](https://github.com/ausimian/smolnet). Wagyu sends their packets to
+WireGuard peers through one UDP socket.
 
 ## Why
 
-A conventional WireGuard setup adds a TUN device to the host and routes host
-traffic through it. That needs root or a kernel module, and it changes
-networking for everything on the machine.
+A conventional WireGuard setup adds a TUN device to the host and routes the
+traffic of the host through it. That setup needs root or a kernel module. It
+also changes the network configuration for all programs on the machine.
 
-Wagyu keeps the tunnel inside the BEAM. Each interface has its own SmolNet
-stack, a userspace TCP/IP stack, and only sockets opened on that stack use the
-tunnel. An Elixir application can therefore reach hosts on a WireGuard network
-without root, a kernel module or a TUN device, and without changing the host's
-routing or how the rest of the node connects.
+Wagyu keeps the tunnel in the BEAM. Each interface has its own SmolNet stack,
+which is a userspace TCP/IP stack. Only the sockets that you open on that stack
+use the tunnel. Thus an Elixir application can reach hosts on a WireGuard
+network without root, a kernel module or a TUN device. The routes of the host
+do not change, and the other connections of the node do not change.
 
 ## How
 
 ### Requirements
 
 - Elixir 1.18 or later.
-- A platform SmolNet ships native code for: macOS on Apple silicon, or Linux
-  (glibc) on x86_64 or ARM64.
+- A platform for which SmolNet supplies native code: macOS on Apple silicon,
+  or Linux (glibc) on x86_64 or ARM64.
 
 ### Installation
 
@@ -41,13 +41,13 @@ end
 ### Keys
 
 Keys are raw 32-byte binaries. `wg genkey`, `wg pubkey` and `wg genpsk`
-print them in base64, so decode those:
+print keys in base64. Decode their output:
 
 ```elixir
 local_private_key = Base.decode64!("yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=")
 ```
 
-Or generate a key pair in Elixir, and give the public key to the peer as
+You can also make a key pair in Elixir. Give the public key to the peer as
 `Base.encode64(public_key)`:
 
 ```elixir
@@ -80,19 +80,21 @@ under its own supervisor:
   )
 ```
 
-A peer may also have a `:preshared_key`, the 32-byte key `wg genpsk` makes,
-which both sides must configure alike. `Wagyu.Config` describes every option.
-An interface's configuration is fixed once it starts; to change it, stop the
-interface and start it again.
+A peer can also have a `:preshared_key`, which is the 32-byte key that
+`wg genpsk` makes. The two sides must use the same preshared key.
+`Wagyu.Config` describes all the options.
 
-To run it in your own supervision tree instead, list `{Wagyu, options}` as a
+You cannot change the configuration of an interface after it starts. To change
+the configuration, stop the interface and start it again.
+
+To run the interface in your own supervision tree, add `{Wagyu, options}` as a
 child.
 
 ### Connect through the tunnel with `:gen_tcp`
 
-`Wagyu.stack/1` returns the interface's network stack. Pass it, together with
-SmolNet's TCP module, in the options of an ordinary `:gen_tcp` call, and that
-socket's traffic goes through the tunnel:
+`Wagyu.stack/1` returns the network stack of the interface. Put the stack and
+the TCP module of SmolNet in the options of a usual `:gen_tcp` call. The
+traffic of that socket then goes through the tunnel:
 
 ```elixir
 {:ok, stack} = Wagyu.stack(:wg0)
@@ -111,13 +113,13 @@ options = [
 :ok = :gen_tcp.close(socket)
 ```
 
-The options apply to that socket only; the node's other TCP connections are
-unaffected. For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`. The destination
-must be reachable through the stack's routes and a peer's `allowed_ips`.
+The options apply only to that socket. The other TCP connections of the node
+do not change. For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`. The routes of
+the stack and the `allowed_ips` of a peer must include the destination.
 
 ### Send datagrams with `:gen_udp`
 
-UDP works the same way, with SmolNet's UDP module in the `udp_module`
+UDP works in the same way. Put the UDP module of SmolNet in the `udp_module`
 option:
 
 ```elixir
@@ -135,15 +137,15 @@ options = [
 :ok = :gen_udp.close(socket)
 ```
 
-For IPv6, use `SmolNet.Inet6.Udp` with `:inet6`. SmolNet's
-[`:gen_udp` guide](https://hexdocs.pm/smolnet/gen_udp.html) covers active
-mode, connected sockets and the limits on datagram size.
+For IPv6, use `SmolNet.Inet6.Udp` with `:inet6`. The
+[`:gen_udp` guide](https://hexdocs.pm/smolnet/gen_udp.html) of SmolNet
+describes active mode, connected sockets and the limits on datagram size.
 
 ### Connect with `:ssl`
 
-`:ssl` runs over the same sockets. Give it SmolNet's TCP module as its
-transport, in the `cb_info` option, and the stack as for `:gen_tcp`; the TLS
-options go in the same list:
+`:ssl` runs on the same sockets. Put the TCP module of SmolNet in the
+`cb_info` option as the transport. Put the stack in the options, as for
+`:gen_tcp`. The TLS options go in the same list:
 
 ```elixir
 {:ok, _apps} = Application.ensure_all_started(:ssl)
@@ -166,25 +168,29 @@ options = [
 :ok = :ssl.close(socket)
 ```
 
-- The stack does not resolve names, so connect to an address;
+- The stack does not resolve names. Thus, connect to an address.
   `:ssl.connect/4` with a host name returns `{:error, :einval}`.
-  `server_name_indication` gives `:ssl` the name to send in the handshake and
-  to check the certificate against.
-- For a server with a certificate from a private CA, pass that CA with
+  `server_name_indication` gives `:ssl` the name that it sends in the handshake.
+  `:ssl` also compares the certificate with this name.
+- If the certificate of the server comes from a private CA, give that CA in
   `cacertfile` instead of `cacerts`.
-- In an application, list `:ssl` in `extra_applications` rather than starting
-  it by hand.
+- In an application, add `:ssl` to `extra_applications`. Do not start `:ssl`
+  manually.
 - For IPv6, use `SmolNet.Inet6.Tcp` with `:inet6`.
 
-SmolNet's [`:ssl` guide](https://hexdocs.pm/smolnet/ssl.html) covers servers,
-upgrading a connected socket, and how errors and timeouts appear.
+The [`:ssl` guide](https://hexdocs.pm/smolnet/ssl.html) of SmolNet describes
+servers, how to upgrade a connected socket, and how errors and timeouts occur.
 
 ### Inspect and stop an interface
 
-`Wagyu.info/1` reports counters and peer state, and `Wagyu.stop/1` stops the
-interface. The `Wagyu` and `Wagyu.Config` module documentation covers every
-option, names and handles, failure and restart behaviour, and the limits on
-queued work.
+`Wagyu.info/1` gives the counters and the peer state. `Wagyu.stop/1` stops
+the interface. The module documentation for `Wagyu` and `Wagyu.Config`
+describes these items:
+
+- All the options.
+- Names and handles.
+- What occurs when a process fails, and how it restarts.
+- The limits on queued work.
 
 ## License
 

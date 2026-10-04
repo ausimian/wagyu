@@ -2,24 +2,25 @@ defmodule Wagyu.Interface.Supervisor do
   @moduledoc false
 
   # The root of one interface, and the PID that `Wagyu.start_link/1`
-  # returns. `:rest_for_one` over the children in this order sets the
-  # failure domains:
+  # returns. The strategy is `:rest_for_one`, and the sequence of the
+  # children sets the failure domains:
   #
-  #   * the link, and the SmolNet stack it owns, comes first, so a link or
-  #     stack failure restarts everything and invalidates application
-  #     sockets;
-  #   * an interface failure restarts the interface, the handshake workers
-  #     and the peers, but keeps the link, the stack and open sockets;
-  #   * a peer supervisor failure restarts only the peers.
+  #   * The link and the SmolNet stack that it owns come first. Thus a
+  #     failure of the link or the stack restarts all children, and the
+  #     application sockets become invalid.
+  #   * A failure of the interface restarts the interface, the handshake
+  #     workers and the peers. The link, the stack and the open sockets
+  #     stay.
+  #   * A failure of the peer supervisor restarts only the peers.
   #
-  # Children find one another through `Wagyu.Registry`, keyed by this
-  # supervisor's PID. The link is the first child, so if the registry
-  # restarts and loses their registrations, the link's exit rebuilds the
-  # whole interface and the children register again.
+  # Children find one another through `Wagyu.Registry`, with the PID of this
+  # supervisor as the key. The link is the first child. Thus, if the
+  # registry restarts and loses the registrations, the exit of the link
+  # starts the complete interface again, and the children register again.
   #
-  # The start argument is the validated configuration, whose `Inspect`
-  # implementation hides its keys, so supervisor reports never print them
-  # raw.
+  # The start argument is the validated configuration. Its `Inspect`
+  # implementation hides its keys. Thus supervisor reports never show the
+  # raw keys.
 
   use Supervisor
 
@@ -33,9 +34,9 @@ defmodule Wagyu.Interface.Supervisor do
   def init(%Config{} = config) do
     root = self()
 
-    # Workers and peers need the local key pair and stack settings, not the
-    # peer table, which only the interface consults. Leaving it out keeps
-    # each child's copy small.
+    # Workers and peers need the local key pair and the stack settings. They
+    # do not need the peer table, because only the interface uses it.
+    # Without the table, the copy for each child stays small.
     identity = %Config{config | peers: %{}, allowed_ips: %AllowedIPs{}}
 
     children = [

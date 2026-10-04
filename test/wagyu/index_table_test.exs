@@ -35,7 +35,7 @@ defmodule Wagyu.IndexTableTest do
     # 7 is active and 8 a tombstone, so both are skipped.
     assert {9, table} = IndexTable.allocate(table, :b, random)
 
-    # Just before the tombstone expires, 8 is still refused.
+    # Immediately before the tombstone expires, the table still refuses 8.
     table = IndexTable.expire(table, IndexTable.retention() - 1)
     assert {10, _table} = IndexTable.allocate(table, :b, random)
   end
@@ -56,7 +56,7 @@ defmodule Wagyu.IndexTableTest do
     assert IndexTable.lookup(table, index) == :unknown
     assert IndexTable.next_expiry(table) == nil
 
-    # Once it has expired, the value may be allocated again.
+    # After the tombstone expires, the table can allocate the value again.
     assert {42, _table} = IndexTable.allocate(table, :b, scripted([42]))
   end
 
@@ -73,7 +73,7 @@ defmodule Wagyu.IndexTableTest do
     assert Enum.map(1..4, &IndexTable.lookup(table, &1)) == [:retired, {:active, :b}, :retired, :retired]
     assert IndexTable.owned(table, :a) == MapSet.new()
 
-    # Each tombstone lasts 180 seconds from its own retirement.
+    # Each tombstone lasts 180 seconds from the time that its index retired.
     table = IndexTable.expire(table, 180_000)
     assert Enum.map(1..4, &IndexTable.lookup(table, &1)) == [:retired, {:active, :b}, :retired, :unknown]
 

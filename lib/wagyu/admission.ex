@@ -3,15 +3,17 @@ defmodule Wagyu.Admission do
 
   # Bounds one process's mailbox in packets and bytes.
   #
-  # A sender admits a message before sending it, and the receiver releases it
-  # when it takes the message off its mailbox, so the mailbox never holds
+  # A sender admits a message before it sends it. The receiver releases the
+  # message when it takes it off its mailbox. Thus the mailbox never holds
   # more than the bound. The counts live in `:counters`, which both sides
-  # update without messaging each other. A sender adds first and backs out
-  # when the total is over the bound, so concurrent senders may refuse
-  # needlessly near the limit but never overshoot it.
+  # update without messages to each other.
+  #
+  # A sender adds first, and removes its addition if the total is more than
+  # the bound. Thus concurrent senders can refuse without need near the
+  # limit, but they never go past it.
   #
   # The counts belong to one receiver incarnation. A receiver that exits
-  # with admitted messages unread takes its counts with it; its replacement
+  # with unread admitted messages takes its counts with it. Its replacement
   # starts from zero with a new `Admission`.
 
   @packets 1
@@ -63,7 +65,7 @@ defmodule Wagyu.Admission do
     end
   end
 
-  @doc "Releases a message the receiver has taken off its mailbox."
+  @doc "Releases a message that the receiver took off its mailbox."
   @spec release(t(), non_neg_integer(), non_neg_integer()) :: :ok
   def release(%__MODULE__{counters: counters}, packets, bytes) do
     :ok = :counters.sub(counters, @packets, packets)

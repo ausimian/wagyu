@@ -1,15 +1,17 @@
-// Command wgpeer is the other side of Wagyu's interoperability tests.
+// Command wgpeer is the other side of the interoperability tests of Wagyu.
 //
 //	wgpeer peer <tunnel-address> <mtu> [<delay-ms>]
 //	wgpeer vectors
 //
-// "peer" runs one wireguard-go device over its userspace (gVisor) network
-// stack, so it needs neither a TUN device nor root. The device's UDP socket
-// is a real one. A delay holds back every datagram the device sends by that
-// many milliseconds, in order, which simulates a round trip of that length.
-// The test drives it with one command per line on stdin, and each command
-// answers "ok", "error <reason>" or, for "get", the device's UAPI dump
-// followed by "end":
+// "peer" runs one wireguard-go device on its userspace (gVisor) network
+// stack. Thus it does not need a TUN device or root. The UDP socket of the
+// device is a real socket. A delay holds each datagram that the device
+// sends for that number of milliseconds, in sequence. This simulates a
+// round trip of that length.
+//
+// The test controls the device with one command for each line on stdin.
+// Each command answers "ok" or "error <reason>". For "get", the answer is
+// the UAPI dump of the device, followed by "end":
 //
 //	set          followed by UAPI "key=value" lines and an empty line,
 //	             passed to IpcSet
@@ -29,9 +31,9 @@
 //
 // The process exits when stdin closes.
 //
-// "vectors" prints a WireGuard handshake transcript computed from fixed
-// keys, following the whitepaper with golang.org/x/crypto rather than with
-// Decibel or Wagyu. Wagyu's golden vectors are this output.
+// "vectors" prints a WireGuard handshake transcript that it calculates from
+// fixed keys. It uses the whitepaper and golang.org/x/crypto, not Decibel or
+// Wagyu. The golden vectors of Wagyu are this output.
 package main
 
 import (
@@ -87,7 +89,8 @@ func runPeer(address, mtuText, delayText string) error {
 		return err
 	}
 
-	// wireguard-go's default logger writes to stdout, which carries replies.
+	// The default logger of wireguard-go writes to stdout, which carries the
+	// replies.
 	logger := &device.Logger{Verbosef: device.DiscardLogf, Errorf: stderrf}
 	if os.Getenv("WGPEER_VERBOSE") != "" {
 		logger.Verbosef = stderrf
@@ -193,8 +196,8 @@ func echoUDP(tnet *netstack.Net, tunnel netip.Addr, portText string) error {
 	return nil
 }
 
-// serveTCP accepts connections on a netstack port and hands each to handle
-// on its own goroutine.
+// serveTCP accepts connections on a netstack port. It gives each connection
+// to handle, on its own goroutine.
 func serveTCP(tnet *netstack.Net, tunnel netip.Addr, portText string, handle func(net.Conn)) error {
 	port, err := parsePort(portText)
 	if err != nil {
@@ -233,9 +236,9 @@ func sink(connection net.Conn) {
 	fmt.Fprint(connection, n)
 }
 
-// delayedBind sends each batch of datagrams a fixed delay after the device
-// hands it over, in order. The device reuses its buffers once Send returns,
-// so the batch is copied.
+// delayedBind sends each batch of datagrams, in sequence, at a fixed delay
+// after the device gives it. The device uses its buffers again after Send
+// returns. Thus delayedBind copies the batch.
 type delayedBind struct {
 	conn.Bind
 	delay time.Duration
