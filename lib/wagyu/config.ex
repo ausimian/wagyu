@@ -8,6 +8,10 @@ defmodule Wagyu.Config do
   you. Call it yourself only to check options before you start an
   interface.
 
+  `put_peers/2` validates a new peer set against a configuration. `new/1`
+  uses it for the `:peers` option. `Wagyu.replace_peers/2` applies the same
+  checks to the peer set of a running interface.
+
   ## Options
 
     * `:private_key` (required) - the X25519 private key of the interface,
@@ -217,19 +221,67 @@ defmodule Wagyu.Config do
          public_key = public_key(private_key),
          {:ok, listen} <- listen(Keyword.get(options, :listen, @default_listen)),
          {:ok, listen_family} <- family(listen.address),
-         {:ok, stack} <- stack(Keyword.get(options, :stack, [])),
-         {:ok, peers} <- peers(Keyword.get(options, :peers, []), listen_family, {public_key, private_key}),
+         {:ok, stack} <- stack(Keyword.get(options, :stack, [])) do
+      put_peers(
+        %__MODULE__{name: name, private_key: private_key, public_key: public_key, listen: listen, stack: stack},
+        Keyword.get(options, :peers, []),
+        %{family: listen_family, keys: {public_key, private_key}}
+      )
+    end
+  end
+
+  @doc """
+  Validates `peers` for the interface of `config`, and returns `config` with
+  these peers in place of its peers.
+
+  `peers` has the same form as the `:peers` option, and gets the same
+  checks. The checks include the checks that need the interface: the
+  address family of each endpoint, and the public key of each peer. The
+  errors are the same as for `new/1`. Their paths start with
+  `[:peers, index]`.
+
+  ## Examples
+
+      iex> {:ok, config} = Wagyu.Config.new(private_key: :binary.copy(<<1>>, 32))
+      iex> peer = %{public_key: :binary.copy(<<9>>, 32), allowed_ips: [{{10, 0, 0, 1}, 24}]}
+      iex> {:ok, config} = Wagyu.Config.put_peers(config, [peer])
+      iex> config.peers[peer.public_key].allowed_ips
+      [{{10, 0, 0, 0}, 24}]
+
+      iex> {:ok, config} = Wagyu.Config.new(private_key: :binary.copy(<<1>>, 32))
+      iex> Wagyu.Config.put_peers(config, [%{public_key: config.public_key}])
+      {:error, {:invalid_option, [:peers, 0, :public_key], :local_key}}
+  """
+  @spec put_peers(t(), term()) :: {:ok, t()} | {:error, error()}
+  def put_peers(%__MODULE__{} = config, peers) do
+    {:ok, family} = family(config.listen.address)
+    put_peers(config, peers, %{family: family, keys: {config.public_key, config.private_key}})
+  end
+
+  # `Wagyu.replace_peers/2` calls this function in the calling process. It
+  # does the checks that do not need the interface, and builds the peers.
+  # Thus only `Wagyu.Config.Peer` structs go to the interface, and raw
+  # preshared keys do not appear in a message to it. The interface then
+  # completes the checks with `put_peers/2`.
+  @doc false
+  @spec build_peers(term()) :: {:ok, [Peer.t()]} | {:error, error()}
+  def build_peers(peers) do
+    with {:ok, peers} <- peers(peers, nil),
+         {:ok, _allowed_ips} <- allowed_ips(peers),
+         do: {:ok, peers}
+  end
+
+  # Applies all checks again to peers from `build_peers/1`, with the
+  # identity of the interface of `config`.
+  @doc false
+  @spec put_built_peers(t(), [Peer.t()]) :: {:ok, t()} | {:error, error()}
+  def put_built_peers(%__MODULE__{} = config, peers) when is_list(peers),
+    do: put_peers(config, Enum.map(peers, fn %Peer{} = peer -> Map.from_struct(peer) end))
+
+  defp put_peers(config, peers, local) do
+    with {:ok, peers} <- peers(peers, local),
          {:ok, allowed_ips} <- allowed_ips(peers) do
-      {:ok,
-       %__MODULE__{
-         name: name,
-         private_key: private_key,
-         public_key: public_key,
-         listen: listen,
-         stack: stack,
-         peers: Map.new(peers, &{&1.public_key, &1}),
-         allowed_ips: allowed_ips
-       }}
+      {:ok, %{config | peers: Map.new(peers, &{&1.public_key, &1}), allowed_ips: allowed_ips}}
     end
   end
 
@@ -352,18 +404,20 @@ defmodule Wagyu.Config do
 
   # Peers
 
-  defp peers(peers, listen_family, local_keys) do
+  # `local` holds the address family and the key pair of the interface.
+  # Without it (`nil`), the checks that need them do not occur.
+  defp peers(peers, local) do
     with :ok <- list(peers, [:peers], @max_peers),
-         {:ok, peers} <- map_indexed(peers, [:peers], &peer(&1, &2, listen_family, local_keys)),
+         {:ok, peers} <- map_indexed(peers, [:peers], &peer(&1, &2, local)),
          :ok <- unique(Enum.map(peers, & &1.public_key), &[:peers, &1, :public_key]) do
       {:ok, peers}
     end
   end
 
-  defp peer(value, path, listen_family, local_keys) do
+  defp peer(value, path, local) do
     with :ok <- map(value, path, @peer_options, [:public_key]),
-         {:ok, public_key} <- peer_public_key(value.public_key, path ++ [:public_key], local_keys),
-         {:ok, endpoint} <- endpoint(Map.get(value, :endpoint), path ++ [:endpoint], listen_family),
+         {:ok, public_key} <- peer_public_key(value.public_key, path ++ [:public_key], local),
+         {:ok, endpoint} <- endpoint(Map.get(value, :endpoint), path ++ [:endpoint], local),
          {:ok, allowed_ips} <- peer_allowed_ips(Map.get(value, :allowed_ips, []), path ++ [:allowed_ips]),
          {:ok, preshared_key} <- preshared_key(Map.fetch(value, :preshared_key), path ++ [:preshared_key]),
          {:ok, keepalive} <-
@@ -379,7 +433,9 @@ defmodule Wagyu.Config do
     end
   end
 
-  defp peer_public_key(value, path, {local_key, private_key}) do
+  defp peer_public_key(value, path, nil), do: key(value, path)
+
+  defp peer_public_key(value, path, %{keys: {local_key, private_key}}) do
     case key(value, path) do
       {:ok, ^local_key} -> invalid(path, :local_key)
       {:ok, key} -> if usable?(key, private_key), do: {:ok, key}, else: invalid(path, :invalid)
@@ -397,21 +453,25 @@ defmodule Wagyu.Config do
     ErlangError -> false
   end
 
-  defp endpoint(nil, _path, _listen_family), do: {:ok, nil}
+  defp endpoint(nil, _path, _local), do: {:ok, nil}
 
-  defp endpoint(value, path, listen_family) do
+  defp endpoint(value, path, local) do
     with :ok <- map(value, path, @endpoint_options, @endpoint_options),
          {:ok, family} <- address(value.address, path ++ [:address]),
-         :ok <- endpoint_address(value.address, family, listen_family, path ++ [:address]),
+         :ok <- endpoint_address(value.address, family, local, path ++ [:address]),
          :ok <- port(value.port, 1, path ++ [:port]) do
       {:ok, value}
     end
   end
 
-  defp endpoint_address(_address, family, listen_family, path) when family != listen_family,
+  # The family check needs the interface. Thus the check of an unspecified
+  # address also waits for it, and the two checks keep their sequence.
+  defp endpoint_address(_address, _family, nil, _path), do: :ok
+
+  defp endpoint_address(_address, family, %{family: listen_family}, path) when family != listen_family,
     do: invalid(path, :family_mismatch)
 
-  defp endpoint_address(address, _family, _listen_family, path) do
+  defp endpoint_address(address, _family, _local, path) do
     if unspecified?(address), do: invalid(path, :invalid), else: :ok
   end
 
