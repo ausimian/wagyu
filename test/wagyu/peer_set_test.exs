@@ -622,9 +622,20 @@ defmodule Wagyu.PeerSetTest do
       before = interface_state(context)
       stored = config(context)
 
+      # The group of the peer cannot see the exit of the peer. Thus only the
+      # interface can stop the sender, which holds frames that the peer
+      # sealed before the call.
+      %{sender: sender} = before.peers[a.key]
+      {:dictionary, dictionary} = Process.info(sender, :dictionary)
+      {:"$ancestors", [group | _ancestors]} = List.keyfind(dictionary, :"$ancestors", 0)
+      :ok = :sys.suspend(group)
+      sender_exited = monitor_exit(sender)
+
       assert :ok = Wagyu.revoke_sessions(context.interface, a.key)
 
       exited.(:shutdown)
+      sender_exited.(:shutdown)
+      :ok = :sys.resume(group)
       state = interface_state(context)
       assert state.config == before.config
       assert config(context) == stored

@@ -155,8 +155,8 @@ defmodule Wagyu do
       preshared key, and makes a new session with the new process. This
       also applies to an initiation that arrived before the call.
 
-  Until the old process exits, it can still send datagrams that it
-  encrypted before the call.
+  Until the processes of the old peer exit, they can still send datagrams
+  that the peer encrypted before the call.
 
   For example, to rotate a preshared key, change the key on the remote
   side, then do these steps:

@@ -1116,15 +1116,18 @@ defmodule Wagyu.Interface do
     schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices})
   end
 
-  # Forgets the running peer of `key`, and stops its process. The interface
-  # does not wait for the exit, and does not see it. A worker that claimed
-  # the old process can still hand it a session. Its indices are already
-  # tombstones, so that session carries no traffic.
+  # Forgets the running peer of `key`, and stops its processes. The
+  # interface sends the exit signal to the peer and to its sender at the
+  # same time, so the sender does not wait for its group to see the exit of
+  # the peer. The group then stops. The interface does not wait for the
+  # exits, and does not see them. A worker that claimed the old process can
+  # still hand it a session. Its indices are already tombstones, so that
+  # session carries no traffic.
   defp stop_peer(state, key) do
     case state.peers do
       %{^key => peer} ->
         Process.demonitor(peer.monitor, [:flush])
-        Process.exit(peer.pid, :shutdown)
+        for pid <- [peer.pid, peer.sender], do: Process.exit(pid, :shutdown)
         forget(%{state | monitors: Map.delete(state.monitors, peer.monitor)}, key, peer)
 
       _not_running ->
