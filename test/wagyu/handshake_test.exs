@@ -290,8 +290,8 @@ defmodule Wagyu.HandshakeTest do
     :ok = :sys.suspend(peer)
 
     # A full inbound queue does not stop handshakes.
-    send_datagrams(context, List.duplicate(transport(index), 200))
-    assert eventually(fn -> match?({128, _bytes}, Admission.usage(inbound)) end)
+    send_datagrams(context, List.duplicate(transport(index), 700))
+    assert eventually(fn -> match?({512, _bytes}, Admission.usage(inbound)) end)
 
     # A maximum of two handoffs can wait for the peer. The interface refuses
     # the third claim and does not record its timestamp.
@@ -366,19 +366,19 @@ defmodule Wagyu.HandshakeTest do
     %{local_index: index, peer: peer} = responded(context, timestamp(1))
     :ok = :sys.suspend(peer)
 
-    send_datagrams(context, List.duplicate(transport(index), 200))
+    send_datagrams(context, List.duplicate(transport(index), 700))
 
     # UDP can lose some of the burst. Thus, compare with the datagrams that
     # arrived.
     counters = settled(context)
-    assert counters.datagrams > 128
-    assert counters.inbound_routed == 128
-    assert counters.inbound_peer_dropped == counters.datagrams - 1 - 128
+    assert counters.datagrams > 512
+    assert counters.inbound_routed == 512
+    assert counters.inbound_peer_dropped == counters.datagrams - 1 - 512
 
     # After the peer exits, the packets that it did not take count as
     # dropped.
     kill(peer)
-    dropped = counters.inbound_peer_dropped + 128
+    dropped = counters.inbound_peer_dropped + 512
     assert %{inbound_peer_dropped: ^dropped} = counters(context.interface, &(&1.inbound_peer_dropped == dropped))
   end
 

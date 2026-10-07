@@ -191,11 +191,18 @@ defmodule Wagyu.Interface do
   # interface at one time.
   @egress_packets 256
   @egress_bytes 512 * 1024
-  # The bounds of the inbound queue and the outbound queue of each peer.
-  # Each queue has its own bound. The same bound applies again to the
-  # outbound packets that a peer holds while it has no key to send them.
+  # The bound of the outbound queue of each peer. The same bound applies
+  # again to the outbound packets that a peer holds while it has no key to
+  # send them.
   @peer_packets 128
   @peer_bytes 256 * 1024
+  # The bound of the inbound queue of each peer. A kernel WireGuard peer
+  # sends in bursts that are larger than the outbound bound. With a bound of
+  # 128 frames, the interface refused up to 1.5% of a bulk download, and TCP
+  # stalled until it retransmitted. With 512 frames, it refused none, and
+  # the median round trip increased by about 1 ms (#55).
+  @peer_inbound_packets 512
+  @peer_inbound_bytes 1024 * 1024
   # The handoffs that can wait for a peer: one that the peer takes now, and
   # one more. A newer handshake replaces an older handshake. Thus a deeper
   # queue would only hold handshakes that the peer will discard.
@@ -1050,7 +1057,7 @@ defmodule Wagyu.Interface do
 
   defp ensure_peer(state, key) do
     {:ok, config} = Config.fetch_peer(state.config, key)
-    inbound = Admission.new(@peer_packets, @peer_bytes)
+    inbound = Admission.new(@peer_inbound_packets, @peer_inbound_bytes)
     outbound = Admission.new(@peer_packets, @peer_bytes)
     staging = Admission.new(@peer_packets, @peer_bytes)
     handoffs = Admission.new(@peer_handoffs, 1)

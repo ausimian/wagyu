@@ -126,7 +126,7 @@ defmodule Wagyu do
   the new peer is added. A peer that stays keeps its sessions, its timers
   and its queued traffic. No change starts a new handshake.
 
-  The interface admits a maximum of 128 inbound packets to a peer before
+  The interface admits a maximum of 512 inbound packets to a peer before
   the peer decrypts them. The peer checks these packets against the
   AllowedIPs that applied when the interface admitted them. Thus, for a
   short time after a change, the inbound check can use the old AllowedIPs.
@@ -226,8 +226,9 @@ defmodule Wagyu do
     * The interface reads datagrams from the socket in batches of limited
       size.
     * Up to 8 handshake workers run, and up to 64 initiations wait for them.
-    * Each peer queues up to 128 packets or 256 KiB in each direction. It
-      can also hold the same quantity again in packets that wait for a key.
+    * Each peer queues up to 512 inbound packets or 1 MiB, and up to 128
+      outbound packets or 256 KiB. It can also hold up to 128 packets or
+      256 KiB that wait for a key.
     * Up to 2 accepted handshakes wait for the process of each peer.
     * The stack receives a maximum of 32 packets in each call, and only one
       call at a time.
