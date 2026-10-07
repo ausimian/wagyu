@@ -55,11 +55,17 @@ defmodule Wagyu.WgPeer do
         args: ["peer", :inet.ntoa(address) |> to_string(), Integer.to_string(mtu), Integer.to_string(delay)]
       ])
 
-    :ok = command(port, ["set" | Enum.map(uapi, &uapi_line/1)] ++ [""])
+    :ok = set(port, uapi)
     :ok = command(port, ["up"])
     %{"listen_port" => listen_port} = get(port).device
     {port, String.to_integer(listen_port)}
   end
+
+  @doc """
+  Changes the configuration of a running device with `uapi`, a keyword list
+  of UAPI keys and values, in sequence.
+  """
+  def set(port, uapi), do: command(port, ["set" | Enum.map(uapi, &uapi_line/1)] ++ [""])
 
   @doc """
   Returns the UAPI state of the device as `%{device: fields, peers: [fields]}`.

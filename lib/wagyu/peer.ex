@@ -215,7 +215,7 @@ defmodule Wagyu.Peer do
   #     after that. If the peer does not attempt a handshake at that time,
   #     it also discards its initiation and staged packets. Then, a peer
   #     with no persistent keepalive and no handshake attempt asks the
-  #     interface to forget it (`Wagyu.Interface.release_peer/3`) and exits.
+  #     interface to forget it (`Wagyu.Interface.release_peer/2`) and exits.
   #     The interface starts a new peer when it next needs one, with the
   #     endpoint that this peer had.
   #
@@ -229,6 +229,31 @@ defmodule Wagyu.Peer do
   #
   # The deadlines are in the process, so they go with the process when it
   # crashes. The interface's supervisor stops peers with the interface.
+  #
+  # Endpoint. Each time the endpoint changes, the peer tells the interface
+  # (`Wagyu.Interface.endpoint_learned/4`). The interface starts the next
+  # process of the key with the last endpoint. Thus the endpoint stays when
+  # the process exits.
+  #
+  # Configuration. When the peer set of the interface changes, the peer can
+  # get `{:wg_configure, peer, filter}`. The message has the new
+  # configuration of this peer and its new source filter. The peer keeps its
+  # key pairs, replay windows, timers and staged packets:
+  #
+  #   * New handshakes use the new preshared key. The key pairs that the
+  #     peer has stay valid until they expire.
+  #   * A new endpoint that is not `nil` replaces the current endpoint. A
+  #     change to `nil` keeps the current endpoint.
+  #   * The source filter applies to each frame after the message. Frames
+  #     that the interface admitted before the change are in the mailbox
+  #     before the message, so the old filter applies to them.
+  #   * A new persistent keepalive arms its timer again with the new
+  #     interval. A change to 0 cancels the timer.
+  #
+  # The peer counts the configure messages that it takes, and reports this
+  # count with each endpoint. Thus the interface can ignore an endpoint that
+  # the peer learned before it took the latest configuration. After each
+  # configure message, the peer reports its current endpoint again.
   #
   # The peer counts handshake events in the interface's shared counters. It
   # counts the frames and packets that it drops in its own state.
@@ -336,6 +361,7 @@ defmodule Wagyu.Peer do
       outbound_dropped: 0,
       inbound_dropped: 0,
       persistent_keepalive: peer.persistent_keepalive * 1_000,
+      configured: 0,
       last_minute_rekey: false,
       timers: %{},
       timer: nil,
@@ -380,7 +406,12 @@ defmodule Wagyu.Peer do
   def handle_info(message, state), do: handle(message, settle(state))
 
   @impl true
-  def format_status(status), do: Wagyu.Redact.format_status(status, [:identity, :peer, :staged, :plaintext])
+  def format_status(status),
+    do: Wagyu.Redact.format_status(status, [:identity, :peer, :staged, :plaintext], message: &redact_message/1)
+
+  # The configuration in a configure message holds the preshared key.
+  defp redact_message({:wg_configure, %Config.Peer{}, filter}), do: {:wg_configure, :redacted, filter}
+  defp redact_message(message), do: message
 
   defp handle({:wg_handoff, ticket, metadata}, state) do
     Admission.release(state.handoffs, 1, 0)
@@ -390,6 +421,29 @@ defmodule Wagyu.Peer do
   defp handle(:wg_handoff_abandoned, state) do
     Admission.release(state.handoffs, 1, 0)
     {:noreply, state}
+  end
+
+  defp handle({:wg_configure, %Config.Peer{} = peer, allowed_ips}, state) do
+    old = state.peer
+    state = %{state | peer: peer, allowed_ips: allowed_ips, configured: state.configured + 1}
+
+    state =
+      if peer.endpoint != nil and peer.endpoint != old.endpoint,
+        do: %{state | endpoint: endpoint(peer.endpoint)},
+        else: state
+
+    # The interface ignores the endpoints that the peer reported before
+    # this message. Thus the peer reports its current endpoint again.
+    if state.endpoint, do: report_endpoint(state)
+
+    state =
+      cond do
+        peer.persistent_keepalive == old.persistent_keepalive -> state
+        peer.persistent_keepalive == 0 -> cancel_timer(%{state | persistent_keepalive: 0}, :persistent_keepalive)
+        true -> persistent_keepalive(%{state | persistent_keepalive: peer.persistent_keepalive * 1_000})
+      end
+
+    {:noreply, arm(state)}
   end
 
   defp handle({:wg_outbound, packets}, state) do
@@ -465,7 +519,7 @@ defmodule Wagyu.Peer do
           |> install_next(key_pair(session, index, remote_index, state.clock.(), false))
           |> new_key_pair()
 
-        transmit(%{state | endpoint: source, received: timestamp}, frame, :responses_sent)
+        transmit(%{learn_endpoint(state, source) | received: timestamp}, frame, :responses_sent)
 
       :error ->
         :ok = Decibel.close(session)
@@ -582,7 +636,7 @@ defmodule Wagyu.Peer do
       # and the next packet starts a new handshake.
       key_pair = key_pair(session, index, response.sender_index, sent_at, true)
 
-      %{state | initiation: nil, endpoint: source}
+      %{learn_endpoint(state, source) | initiation: nil}
       |> received_authenticated()
       |> install_current(key_pair)
       |> new_key_pair()
@@ -617,7 +671,7 @@ defmodule Wagyu.Peer do
     end
   end
 
-  defp receive_plaintext(state, "", source), do: %{state | endpoint: source} |> count(:keepalives_received)
+  defp receive_plaintext(state, "", source), do: state |> learn_endpoint(source) |> count(:keepalives_received)
 
   defp receive_plaintext(state, plaintext, source) do
     state = received_data(state)
@@ -626,7 +680,7 @@ defmodule Wagyu.Peer do
          {:allowed, true} <- {:allowed, AllowedIPs.allowed?(state.allowed_ips, address, state.public_key)} do
       %{packets: packets, count: waiting} = state.plaintext
       packets = [binary_part(plaintext, 0, length) | packets]
-      %{state | endpoint: source, plaintext: %{state.plaintext | packets: packets, count: waiting + 1}}
+      %{learn_endpoint(state, source) | plaintext: %{state.plaintext | packets: packets, count: waiting + 1}}
     else
       {:ip, {:error, _reason}} -> state |> count(:transport_malformed) |> dropped()
       {:allowed, false} -> state |> count(:transport_source_denied) |> dropped()
@@ -1001,7 +1055,7 @@ defmodule Wagyu.Peer do
   # These messages then arrive and the peer handles them first. The peer
   # asks again later.
   defp exit_if_idle(state) do
-    case Interface.release_peer(state.root, state.public_key, state.endpoint) do
+    case Interface.release_peer(state.root, state.public_key) do
       :ok -> {:stop, state}
       :busy -> set_timer(state, :zero, state.clock.() + @rekey_timeout)
     end
@@ -1046,6 +1100,15 @@ defmodule Wagyu.Peer do
 
   defp endpoint(nil), do: nil
   defp endpoint(%{address: address, port: port}), do: {address, port}
+
+  defp learn_endpoint(%{endpoint: endpoint} = state, endpoint), do: state
+
+  defp learn_endpoint(state, endpoint), do: report_endpoint(%{state | endpoint: endpoint})
+
+  defp report_endpoint(state) do
+    :ok = Interface.endpoint_learned(state.root, state.public_key, state.configured, state.endpoint)
+    state
+  end
 
   defp close(session) do
     :ok = Decibel.close(session)

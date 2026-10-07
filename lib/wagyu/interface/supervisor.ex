@@ -5,18 +5,21 @@ defmodule Wagyu.Interface.Supervisor do
   # returns. The strategy is `:rest_for_one`, and the sequence of the
   # children sets the failure domains:
   #
-  #   * The link and the SmolNet stack that it owns come first. Thus a
-  #     failure of the link or the stack restarts all children, and the
-  #     application sockets become invalid.
+  #   * The store of the configuration (`Wagyu.ConfigStore`) comes first.
+  #     It keeps the latest peer set for the children after it. A failure
+  #     of the store restarts all children with the start options.
+  #   * The link and the SmolNet stack that it owns come next. Thus a
+  #     failure of the link or the stack restarts all children after the
+  #     store, and the application sockets become invalid.
   #   * A failure of the interface restarts the interface, the handshake
   #     workers and the peers. The link, the stack and the open sockets
   #     stay.
   #   * A failure of the peer supervisor restarts only the peers.
   #
   # Children find one another through `Wagyu.Registry`, with the PID of this
-  # supervisor as the key. The link is the first child. Thus, if the
-  # registry restarts and loses the registrations, the exit of the link
-  # starts the complete interface again, and the children register again.
+  # supervisor as the key. The store and the link exit when the registry
+  # exits. Thus, if the registry restarts and loses the registrations, the
+  # complete interface starts again, and the children register again.
   #
   # The start argument is the validated configuration. Its `Inspect`
   # implementation hides its keys. Thus supervisor reports never show the
@@ -40,8 +43,9 @@ defmodule Wagyu.Interface.Supervisor do
     identity = %Config{config | peers: %{}, allowed_ips: %AllowedIPs{}}
 
     children = [
+      {Wagyu.ConfigStore, {root, config}},
       {Wagyu.Link, root: root, stack: config.stack},
-      {Wagyu.Interface, {root, config}},
+      {Wagyu.Interface, root},
       {Wagyu.HandshakeSupervisor, {root, identity}},
       {Wagyu.PeerSupervisor, {root, identity}}
     ]

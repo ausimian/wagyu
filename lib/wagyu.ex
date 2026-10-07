@@ -35,8 +35,10 @@ defmodule Wagyu do
           ]
         )
 
-  After the interface starts, you cannot change its configuration. To
-  change the configuration, stop the interface and start it again.
+  After the interface starts, you can change its peers with
+  `replace_peers/2` (see [Changing peers](#module-changing-peers)). To
+  change the private key, the listen address or the stack options, stop
+  the interface and start it again.
 
   If the options are not valid, `start_link/1` returns the error from
   `Wagyu.Config.new/1`, for example
@@ -66,15 +68,15 @@ defmodule Wagyu do
   `{:error, {:already_started, pid}}`. The name becomes free when the
   interface stops or crashes.
 
-  `stack/1`, `info/1` and `stop/1` accept the PID from `start_link/1` or the
-  name. Each call looks up the name again. Thus the name always refers to
+  `stack/1`, `info/1`, `replace_peers/2`, `revoke_sessions/2` and `stop/1`
+  accept the PID from `start_link/1` or the name. Each call looks up the name again. Thus the name always refers to
   the interface that has that name at the time of the call. A restarted
   interface has a new PID but keeps its name. For long-lived code, keep the
   name, not the PID.
 
-  All three functions return `{:error, :not_running}` if no interface runs
-  under that PID or name. `stack/1` and `info/1` also return this error
-  while the interface restarts.
+  These functions return `{:error, :not_running}` if no interface runs
+  under that PID or name. `stack/1`, `info/1`, `replace_peers/2` and
+  `revoke_sessions/2` also return this error while the interface restarts.
 
     * `stack/1` returns `{:ok, stack}`. This is the SmolNet stack on which
       you open sockets, for example with
@@ -88,6 +90,80 @@ defmodule Wagyu do
       supervisor. Its supervisor starts it again, because it is a permanent
       child. Use `Supervisor.terminate_child/2` instead.
 
+  ## Changing peers
+
+  `replace_peers/2` replaces the peer set of a running interface. The
+  stack, the sockets and the sessions of unchanged peers stay. The new
+  peer set has the same form as the `:peers` option, and gets the same
+  checks. If the peer set is not valid, nothing changes.
+
+      :ok = Wagyu.replace_peers(:wg0, peers)
+
+  The interface applies a valid peer set in one step. After `:ok`, `info/1`
+  shows the new peer set, and the interface routes all egress with the new
+  AllowedIPs. The interface compares the old and the new configuration of
+  each public key:
+
+    * **Added.** The peer starts when traffic or a handshake first needs
+      it. A peer with a persistent keepalive starts immediately.
+    * **Removed.** The interface stops the process of the peer, and drops
+      and counts the packets that wait for it. Its sessions stop, and the
+      interface refuses its traffic and its handshakes. The interface also
+      forgets the endpoint that it learned for the peer.
+    * **AllowedIPs.** The routes change. Because prefixes can be nested,
+      this can also change the sources that a different peer can send
+      from.
+    * **Endpoint.** A new endpoint replaces the current endpoint, also an
+      endpoint that the peer learned from its traffic. A change to `nil`
+      keeps the current endpoint.
+    * **Persistent keepalive.** The peer uses the new interval. A change
+      from 0 starts the peer. A change to 0 stops the keepalives.
+    * **Preshared key.** New handshakes use the new key. The current
+      sessions stay valid until they expire. To stop them, call
+      `revoke_sessions/2` after `replace_peers/2` returns.
+
+  A different public key is a different peer: the old peer is removed, and
+  the new peer is added. A peer that stays keeps its sessions, its timers
+  and its queued traffic. No change starts a new handshake.
+
+  The interface admits a maximum of 128 inbound packets to a peer before
+  the peer decrypts them. The peer checks these packets against the
+  AllowedIPs that applied when the interface admitted them. Thus, for a
+  short time after a change, the inbound check can use the old AllowedIPs.
+  Outbound packets use the new routes immediately.
+
+  The interface keeps the replay timestamps of a removed peer. Thus an
+  attacker cannot replay a captured handshake initiation after you add the
+  peer again. See `t:info/0`.
+
+  ### Revoking sessions
+
+  `revoke_sessions/2` discards the sessions of one peer and keeps its
+  configuration. The interface stops the process of the peer, the same as
+  for a removed peer. The routes, the learned endpoint and the replay
+  timestamps of the peer stay. Thus egress to the peer always has a route.
+  The next packet or handshake starts a new process, which completes a new
+  handshake. A peer with a persistent keepalive starts again immediately.
+
+  After `:ok`, no session from before the call carries traffic. A handshake
+  from the remote side gets its peer from the interface, in sequence with
+  the call:
+
+    * A handshake that got its peer before the call goes to the old
+      process, which the call stops.
+    * A handshake that gets its peer after the call uses the current
+      preshared key, and makes a new session with the new process. This
+      also applies to an initiation that arrived before the call.
+
+  Until the old process exits, it can still send datagrams that it
+  encrypted before the call.
+
+  For example, to rotate a preshared key, change the key on the remote
+  side, then do these steps:
+
+      :ok = Wagyu.replace_peers(:wg0, peers_with_new_key)
+      :ok = Wagyu.revoke_sessions(:wg0, remote_public_key)
+
   ## Failure and restart
 
   If the stack fails, or if the process that gives packets to the stack
@@ -99,6 +175,18 @@ defmodule Wagyu do
   All other failures in the interface restart the protocol processes, but
   the stack and its sockets stay. The interface loses its sessions, and the
   peers complete new handshakes.
+
+  The interface keeps the latest peer set from `replace_peers/2` in a
+  separate process. Thus all of these failures keep the latest peer set,
+  and you do not have to apply it again. The interface goes back to the
+  peers of the start options in only two cases:
+
+    * The process that keeps the peer set fails. It holds only data and
+      does no I/O, so it is not expected to fail. It also stops if the
+      internal registry of Wagyu fails. Then the complete interface
+      restarts, with a new stack.
+    * The supervisor of the interface restarts, for example because your
+      supervisor restarted it.
 
   ## Timers
 
@@ -156,6 +244,9 @@ defmodule Wagyu do
 
   The interface keeps the timestamps until the interface restarts. Thus it
   refuses a replayed initiation, even if the process of the peer restarted.
+  It also keeps the timestamps of a peer that `replace_peers/2` removed, for
+  a maximum of 1024 removed peers. If you add the peer again, the interface
+  uses these timestamps.
 
   ### Under load
 
@@ -224,7 +315,11 @@ defmodule Wagyu do
     * `:initiations_unknown_peer` - authenticated initiations from a key
       that is not a configured peer
     * `:initiations_replayed` - initiations with a timestamp that was not
-      later than the last one accepted from the same peer
+      later than the last one accepted from the same peer. The interface
+      keeps the timestamps until it restarts. It also keeps the timestamps
+      of the last 1024 peers that `replace_peers/2` removed. When more
+      peers are removed, it discards the timestamps of the peer that was
+      removed first.
     * `:initiations_rate_limited` - initiations that arrived less than 20 ms
       after the last one accepted from the same peer
     * `:initiations_unavailable` - initiations for a peer process that
@@ -375,6 +470,53 @@ defmodule Wagyu do
     end
   end
 
+  @doc """
+  Replaces the peers of a running interface.
+
+  `peers` has the same form as the `:peers` option of `Wagyu.Config`, and
+  gets the same checks and limits. The interface applies a valid peer set in
+  one step. See [Changing peers](#module-changing-peers).
+
+  Returns one of these values:
+
+    * `:ok`
+    * `{:error, {:invalid_option, path, reason}}` - an invalid option, with
+      the same path and reason as from `Wagyu.Config.new/1`. `path` starts
+      with `[:peers, index]`. Nothing changes.
+
+  The caller does the checks that do not need the interface first. The
+  interface then does the checks of the endpoint families and of the public
+  keys. Thus, if more than one option is not valid, the error can be for a
+  different option than the first error of `Wagyu.Config.new/1`.
+    * `{:error, :not_running}` - no interface runs under that PID or name.
+      This error also occurs if the interface restarts during the call. In
+      that case, the new peer set can be in force or not. Call the function
+      again.
+  """
+  @spec replace_peers(interface(), [map()]) :: :ok | {:error, Config.error() | :not_running}
+  def replace_peers(interface, peers) do
+    with {:ok, peers} <- Config.build_peers(peers),
+         {:ok, pid} <- interface_process(interface) do
+      Wagyu.Interface.replace_peers(pid, peers)
+    end
+  end
+
+  @doc """
+  Discards the sessions of the peer with `public_key`, and keeps its
+  configuration. The next packet or handshake makes a new session. See
+  [Revoking sessions](#module-revoking-sessions).
+
+  Returns one of these values:
+
+    * `:ok` - also if the peer had no sessions
+    * `{:error, :unknown_peer}` - `public_key` is not in the peer set
+    * `{:error, :not_running}` - no interface runs under that PID or name
+  """
+  @spec revoke_sessions(interface(), <<_::256>>) :: :ok | {:error, :unknown_peer | :not_running}
+  def revoke_sessions(interface, public_key) do
+    with {:ok, pid} <- interface_process(interface), do: Wagyu.Interface.revoke_sessions(pid, public_key)
+  end
+
   @doc "Stops the interface, its UDP socket and its SmolNet stack."
   @spec stop(interface()) :: :ok | {:error, :not_running}
   def stop(interface) do
@@ -391,6 +533,15 @@ defmodule Wagyu do
     case Config.new(options) do
       {:ok, config} -> config
       {:error, reason} -> raise ArgumentError, "invalid Wagyu options: " <> inspect(reason)
+    end
+  end
+
+  defp interface_process(interface) do
+    with {:ok, root} <- root(interface),
+         {:ok, pid, _value} <- Wagyu.Registry.lookup(root, :interface) do
+      {:ok, pid}
+    else
+      _not_running -> {:error, :not_running}
     end
   end
 
