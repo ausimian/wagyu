@@ -1024,11 +1024,27 @@ defmodule Wagyu.PeerTest do
 
     # When the test kills the peer, the peer logs its exit.
     @tag :capture_log
+    @tag :no_endpoint
+    test "a peer that fails keeps the endpoint it learned", context do
+      {_session, _index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+      assert eventually(fn -> :sys.get_state(context.children.interface).endpoints[context.remote_key] end)
+      kill(peer)
+
+      # The next process has the endpoint that the failed process learned.
+      demand(context)
+      assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context)
+      assert :sys.get_state(peer(context)).endpoint == context.remote_endpoint
+      assert %{initiations_no_endpoint: 0} = counters(context.interface)
+    end
+
+    # When the test kills the peer, the peer logs its exit.
+    @tag :capture_log
     test "the interface forgets a peer only when nothing is waiting for it", context do
       {peer, _clock, _session, index} = initiated(context)
       %{peers: %{} = peers} = :sys.get_state(context.children.interface)
       %{outbound: outbound} = Map.fetch!(peers, context.remote_key)
-      release = fn -> in_process(peer, &Wagyu.Interface.release_peer(&1.root, &1.public_key, &1.endpoint)) end
+      release = fn -> in_process(peer, &Wagyu.Interface.release_peer(&1.root, &1.public_key)) end
 
       :ok = Admission.admit(outbound, 1, 10)
       assert release.() == :busy

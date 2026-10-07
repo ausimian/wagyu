@@ -10,7 +10,7 @@ defmodule Wagyu.Registry do
   # to communicate with its owner. This data is the admission bounds of its
   # mailbox and its shared counters.
 
-  @type role :: :link | :interface | :handshake_supervisor | :peer_supervisor
+  @type role :: :config | :link | :interface | :handshake_supervisor | :peer_supervisor
 
   @spec child_spec(term()) :: Supervisor.child_spec()
   def child_spec(_arg), do: Registry.child_spec(keys: :unique, name: __MODULE__)

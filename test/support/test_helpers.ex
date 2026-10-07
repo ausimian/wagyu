@@ -7,7 +7,7 @@ defmodule Wagyu.TestHelpers do
   alias Wagyu.Packet
   alias Wagyu.Packet.{Initiation, Response, Transport}
 
-  @roles [:link, :interface, :handshake_supervisor, :peer_supervisor]
+  @roles [:config, :link, :interface, :handshake_supervisor, :peer_supervisor]
 
   # The Noise parameters of WireGuard, for the remote parties that the tests
   # simulate. These values do not come from `Wagyu.Noise`.

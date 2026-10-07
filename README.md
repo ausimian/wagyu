@@ -84,8 +84,11 @@ A peer can also have a `:preshared_key`, which is the 32-byte key that
 `wg genpsk` makes. The two sides must use the same preshared key.
 `Wagyu.Config` describes all the options.
 
-You cannot change the configuration of an interface after it starts. To change
-the configuration, stop the interface and start it again.
+To change the peers of a running interface, call `Wagyu.replace_peers/2` with a
+new peer set. The stack, the sockets and the sessions of unchanged peers stay.
+`Wagyu.revoke_sessions/2` discards the sessions of one peer, for example after
+you rotate its preshared key. To change the private key, the listen address or
+the stack options, stop the interface and start it again.
 
 To run the interface in your own supervision tree, add `{Wagyu, options}` as a
 child.
@@ -189,6 +192,7 @@ describes these items:
 
 - All the options.
 - Names and handles.
+- How to change the peers of a running interface.
 - What occurs when a process fails, and how it restarts.
 - The limits on queued work.
 

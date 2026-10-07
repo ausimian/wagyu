@@ -226,13 +226,13 @@ defmodule WagyuTest do
         assert %{egress_routed: 1} = counters(interface, &(&1.egress_routed == 1))
 
         {pids, stack_monitor} = processes(interface)
-        assert length(pids) == 6
+        assert length(pids) == 7
 
         assert :ok = Wagyu.stop(interface)
         assert_receive {:DOWN, ^stack_monitor, :process, _object, _reason}
         assert Enum.filter(pids, &Process.alive?/1) == []
 
-        for role <- [:link, :interface, :handshake_supervisor, :peer_supervisor],
+        for role <- [:config, :link, :interface, :handshake_supervisor, :peer_supervisor],
             do: assert(Wagyu.Registry.lookup(interface, role) == :error)
       end
 

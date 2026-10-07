@@ -326,6 +326,64 @@ defmodule Wagyu.ConfigTest do
     end
   end
 
+  describe "put_peers/2" do
+    test "replaces the peers and their routes, and keeps the other fields" do
+      {:ok, config} = Config.new(options())
+      new = peer(%{allowed_ips: [{{10, 1, 2, 3}, 16}], persistent_keepalive: 25})
+
+      assert {:ok, replaced} = Config.put_peers(config, [new])
+      assert Map.drop(replaced, [:peers, :allowed_ips]) == Map.drop(config, [:peers, :allowed_ips])
+      key = new.public_key
+      assert %{^key => %Peer{allowed_ips: [{{10, 1, 0, 0}, 16}], persistent_keepalive: 25}} = replaced.peers
+      assert AllowedIPs.lookup(replaced.allowed_ips, {10, 1, 9, 9}) == {:ok, new.public_key}
+      assert AllowedIPs.lookup(replaced.allowed_ips, {192, 0, 2, 1}) == :error
+
+      assert {:ok, empty} = Config.put_peers(config, [])
+      assert empty.peers == %{}
+      assert empty.allowed_ips == %AllowedIPs{}
+    end
+
+    test "gives the same errors as new/1, at the same paths" do
+      options = options()
+      {:ok, config} = Config.new(options)
+      {own_key, _private_key} = :crypto.generate_key(:ecdh, :x25519, options[:private_key])
+      repeated = peer()
+
+      for peers <- [
+            :invalid,
+            [peer(), %{public_key: own_key}],
+            [peer(%{public_key: <<0::256>>})],
+            [peer(%{endpoint: %{address: {0x2001, 0xDB8, 0, 0, 0, 0, 0, 1}, port: 1}})],
+            [peer(%{endpoint: %{address: {0, 0, 0, 0}, port: 1}})],
+            [repeated, repeated],
+            [peer(), peer()],
+            [peer(%{preshared_key: nil})],
+            for(_n <- 1..1025, do: %{public_key: public_key()})
+          ] do
+        assert {:error, _reason} = error = Config.put_peers(config, peers)
+        assert Config.new(Keyword.put(options, :peers, peers)) == error
+      end
+    end
+
+    test "build_peers/1 does the checks that do not need the interface, and put_built_peers/2 does all" do
+      {:ok, config} = Config.new(options())
+      ipv6 = peer(%{endpoint: %{address: {0x2001, 0xDB8, 0, 0, 0, 0, 0, 1}, port: 1}})
+
+      assert {:ok, [%Peer{} = built]} = Config.build_peers([ipv6])
+      assert Config.put_built_peers(config, [built]) == invalid([:peers, 0, :endpoint, :address], :family_mismatch)
+
+      assert {:ok, [%Peer{} = built]} = Config.build_peers([%{public_key: config.public_key}])
+      assert Config.put_built_peers(config, [built]) == invalid([:peers, 0, :public_key], :local_key)
+
+      assert Config.build_peers([peer(%{preshared_key: <<1>>})]) ==
+               invalid([:peers, 0, :preshared_key], :invalid_length)
+
+      valid = peer(%{preshared_key: :binary.copy(<<7>>, 32)})
+      assert {:ok, built} = Config.build_peers([valid])
+      assert Config.put_built_peers(config, built) == Config.put_peers(config, [valid])
+    end
+  end
+
   describe "allowed IPs" do
     test "are normalized and routed by longest prefix" do
       gateway = peer(%{allowed_ips: [{{10, 13, 99, 1}, 16}, {{0xFD00, 0, 0, 0, 0, 0, 0, 1}, 8}]})

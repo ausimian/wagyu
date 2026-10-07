@@ -396,6 +396,159 @@ defmodule Wagyu.InteropTest do
     end
   end
 
+  describe "changing peers" do
+    defp go_peer(context, go_port, overrides) do
+      Map.merge(
+        %{
+          public_key: context.go_key,
+          endpoint: %{address: {127, 0, 0, 1}, port: go_port},
+          allowed_ips: [{{0, 0, 0, 0}, 0}]
+        },
+        overrides
+      )
+    end
+
+    defp start_wagyu_with_peers(context, peers) do
+      interface = start_supervised!({Wagyu, options(private_key: context.wagyu_private, peers: peers)})
+      {:ok, %{listen: %{port: port}}} = Wagyu.info(interface)
+      %{interface: interface, port: port, children: children(interface)}
+    end
+
+    # Receives data until at least `size` bytes have arrived. Returns all of
+    # them.
+    defp recv_at_least(socket, size, acc \\ "") do
+      if byte_size(acc) >= size do
+        acc
+      else
+        {:ok, data} = SmolNet.recv(socket, 0, 10_000)
+        recv_at_least(socket, size, acc <> data)
+      end
+    end
+
+    defp ping(socket, address, payload \\ "ping") do
+      :ok = SmolNet.sendto(socket, payload, %{family: :inet, addr: address, port: 7})
+      assert {:ok, %{data: ^payload, source: %{addr: ^address}}} = SmolNet.recvfrom(socket, 0, 10_000)
+    end
+
+    test "a change of AllowedIPs during a TCP stream keeps the stream and its session", context do
+      {device, go_port} = start_go(context, [])
+      :ok = WgPeer.echo(device, :tcp, 7)
+      wagyu = start_wagyu(context, %{address: {127, 0, 0, 1}, port: go_port})
+      data = :crypto.strong_rand_bytes(1_000_000)
+      tcp = connect(wagyu, 7)
+      sender = send_async(tcp, data)
+      first = recv_at_least(tcp, 100_000)
+      peer = wagyu_peer(wagyu)
+
+      # The new prefix of wireguard-go is nested in the default route of a
+      # second peer. Thus the source filter of wireguard-go also changes.
+      {other, _private_key} = keypair()
+      narrowed = go_peer(context, go_port, %{allowed_ips: [{{10, 13, 0, 0}, 24}]})
+      :ok = Wagyu.replace_peers(wagyu.interface, [narrowed, %{public_key: other, allowed_ips: [{{0, 0, 0, 0}, 0}]}])
+
+      assert first <> recv_exactly(tcp, byte_size(data) - byte_size(first)) == data
+      Task.await(sender, 30_000)
+      :ok = SmolNet.close(tcp)
+
+      assert %{configured: 1} = :sys.get_state(peer)
+      assert [{_id, ^peer, _type, _modules}] = DynamicSupervisor.which_children(wagyu.children.peer_supervisor)
+
+      assert %{initiations_sent: 1, responses_accepted: 1, transport_invalid: 0, transport_source_denied: 0} =
+               counters(wagyu.interface)
+    end
+
+    test "a second wireguard-go peer added at run time carries traffic", context do
+      {device, go_port} = start_go(context, [])
+      :ok = WgPeer.echo(device, :udp, 7)
+      first = go_peer(context, go_port, %{allowed_ips: [{@go_address, 32}]})
+      wagyu = start_wagyu_with_peers(context, [first])
+      socket = udp(wagyu)
+      ping(socket, @go_address)
+
+      {second_key, second_private} = keypair()
+      second_address = {10, 13, 0, 3}
+
+      {second_device, second_port} =
+        WgPeer.start!(context.wgpeer, second_address,
+          private_key: second_private,
+          listen_port: 0,
+          public_key: context.wagyu_key,
+          allowed_ip: "10.13.0.2/32"
+        )
+
+      :ok = WgPeer.echo(second_device, :udp, 7)
+
+      second = %{
+        public_key: second_key,
+        endpoint: %{address: {127, 0, 0, 1}, port: second_port},
+        allowed_ips: [{second_address, 32}]
+      }
+
+      :ok = Wagyu.replace_peers(wagyu.interface, [first, second])
+
+      ping(socket, second_address)
+      ping(socket, @go_address)
+      assert %{initiations_sent: 2, responses_accepted: 2, transport_invalid: 0} = counters(wagyu.interface)
+    end
+
+    test "Wagyu refuses the traffic and the initiations of a removed wireguard-go peer", context do
+      {device, go_port} = start_go(context, [])
+      :ok = WgPeer.echo(device, :udp, 7)
+      wagyu = start_wagyu(context, %{address: {127, 0, 0, 1}, port: go_port})
+      socket = udp(wagyu, 9_000)
+      ping(socket, @go_address)
+
+      :ok = Wagyu.replace_peers(wagyu.interface, [])
+
+      # wireguard-go still has a session, so its packet goes out under it.
+      :ok = WgPeer.send_udp(device, @wagyu_address, 9_000, "late")
+      assert %{unknown_index: 1} = counters(wagyu.interface, &(&1.unknown_index == 1))
+
+      # When wireguard-go configures Wagyu again, it discards the session.
+      # Thus its next packet starts a handshake.
+      :ok = WgPeer.set(device, public_key: context.wagyu_key, remove: "true")
+
+      :ok =
+        WgPeer.set(device,
+          public_key: context.wagyu_key,
+          endpoint: "127.0.0.1:#{wagyu.port}",
+          allowed_ip: "10.13.0.2/32"
+        )
+
+      :ok = WgPeer.send_udp(device, @wagyu_address, 9_000, "again")
+
+      assert %{initiations_unknown_peer: 1, responses_sent: 0} =
+               counters(wagyu.interface, &(&1.initiations_unknown_peer == 1))
+
+      assert SmolNet.recvfrom(socket, 0, 200) == {:error, :timeout}
+    end
+
+    test "after a preshared key rotation on both sides, revoked sessions give way to a new handshake",
+         context do
+      [old_psk, new_psk] = [:binary.copy(<<1>>, 32), :binary.copy(<<2>>, 32)]
+      {device, go_port} = start_go(context, preshared_key: old_psk)
+      :ok = WgPeer.echo(device, :udp, 7)
+      peer = go_peer(context, go_port, %{preshared_key: old_psk})
+      wagyu = start_wagyu_with_peers(context, [peer])
+      socket = udp(wagyu)
+      ping(socket, @go_address)
+      old = wagyu_peer(wagyu)
+
+      :ok = WgPeer.set(device, public_key: context.wagyu_key, update_only: "true", preshared_key: new_psk)
+      :ok = Wagyu.replace_peers(wagyu.interface, [%{peer | preshared_key: new_psk}])
+      :ok = Wagyu.revoke_sessions(wagyu.interface, context.go_key)
+
+      # A new process makes a new handshake with the new key. wireguard-go
+      # takes a maximum of one initiation from a peer in each 20 ms.
+      Process.sleep(50)
+      ping(socket, @go_address, "after rotation")
+      refute wagyu_peer(wagyu) == old
+
+      assert %{initiations_sent: 2, responses_accepted: 2, responses_invalid: 0, transport_invalid: 0} =
+               counters(wagyu.interface)
+    end
+  end
+
   test "wgpeer vectors still prints the golden transcript", %{wgpeer: wgpeer} do
     assert WgPeer.vectors!(wgpeer) == Wagyu.GoldenVectors.hex()
   end

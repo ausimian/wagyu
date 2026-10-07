@@ -11,6 +11,9 @@ defmodule Wagyu.Interface do
   #   * the local receiver-index table
   #   * the greatest initiation timestamp accepted from each peer
   #
+  # The interface reads its configuration from `Wagyu.ConfigStore` when it
+  # starts. Thus a restarted interface has the latest peer set.
+  #
   # For each datagram, the interface does only a fixed quantity of work:
   # decode, MAC1 and MAC2 checks, a cookie reply, admission and an index
   # lookup. It never runs Noise.
@@ -103,19 +106,61 @@ defmodule Wagyu.Interface do
   # retires credit, it tells the link.
   #
   # A peer that is idle for long enough to discard its keys asks the
-  # interface to forget it (`release_peer/3`). After the interface forgets
+  # interface to forget it (`release_peer/2`). After the interface forgets
   # the peer, the peer exits. The interface agrees only when no admitted
   # message for the peer still waits to reach it.
   #
   # In the same step, the interface no longer forwards messages to the peer,
   # and it retires the indices of the peer. Thus the exit causes no loss of
-  # messages, and the next message starts a new process. The interface
-  # keeps the endpoint of the peer, which the peer possibly learned from its
-  # traffic. The interface starts the next process with that endpoint.
+  # messages, and the next message starts a new process.
+  #
+  # A peer tells the interface each endpoint that it learns from its
+  # traffic (`endpoint_learned/4`). The interface keeps the last one, and
+  # starts the next process of the key with it. Thus a released, revoked or
+  # failed peer does not lose its endpoint.
+  #
+  # Peer set changes. `replace_peers/2` applies a validated peer set in one
+  # call, and writes it to the store first. The interface compares the old
+  # and the new record of each key:
+  #
+  #   * It forgets a removed peer, the same as a peer that exits, and stops
+  #     its process with `:shutdown`. It does not wait for the exit, and it
+  #     ignores the exit when it arrives. It also discards the learned
+  #     endpoint of the key.
+  #   * It sends `{:wg_configure, peer, filter}` to a running peer whose
+  #     endpoint, preshared key, persistent keepalive or source filter
+  #     changed. A change to the AllowedIPs of one peer can change the
+  #     filter of a different peer, because prefixes can nest. Thus the
+  #     interface computes the filter of each running peer again.
+  #   * It starts an added peer, or a peer whose persistent keepalive
+  #     changes from 0, if that peer has a persistent keepalive.
+  #
+  # Frames that the interface admitted to a peer before the change are in
+  # the mailbox of the peer before the configure message. Thus the peer
+  # checks them against the filter that was in force when they were
+  # admitted. Egress routes immediately with the new table.
+  #
+  # A peer can learn an endpoint before it takes a configure message. The
+  # interface counts the configure messages that it sends to each process,
+  # and the peer counts the ones that it takes. The interface ignores a
+  # learned endpoint that the peer reports with a smaller count. Thus an
+  # old endpoint cannot replace an endpoint from the configuration.
+  #
+  # `revoke_sessions/2` forgets the running peer of a key, and stops it, the
+  # same as for a removed peer. The configuration, the routes, the learned
+  # endpoint and the timestamps of the key stay. The next traffic or
+  # authorized initiation starts a new process. The interface starts a peer
+  # with a persistent keepalive again immediately.
+  #
+  # The interface keeps the timestamps of a removed key, so that a captured
+  # initiation cannot be replayed after the key is added again. It keeps them
+  # for a maximum of `@removed_keys` removed keys, and discards the oldest
+  # removal first. A key that is added again leaves the removed set.
   #
   # Synchronous calls go in one direction only. Workers and peers can call
   # the interface. The interface calls only the supervisors that start
-  # them, never a peer, a worker or the link.
+  # them and the store, never a peer, a worker or the link. The store calls
+  # no process.
   #
   # Time comes from `state.clock`, in monotonic milliseconds. Tests replace
   # it with a fake clock.
@@ -125,6 +170,7 @@ defmodule Wagyu.Interface do
   alias Wagyu.Admission
   alias Wagyu.AllowedIPs
   alias Wagyu.Config
+  alias Wagyu.ConfigStore
   alias Wagyu.Cookie
   alias Wagyu.EgressCredit
   alias Wagyu.HandshakeQueue
@@ -180,6 +226,9 @@ defmodule Wagyu.Interface do
   # persistent keepalive again. Thus a peer that fails immediately at each
   # start cannot cause a tight restart loop.
   @peer_restart 1_000
+  # The maximum number of removed keys for which the interface keeps
+  # timestamps.
+  @removed_keys 1024
   # The minimum time between two accepted initiations from one peer, in
   # milliseconds (50 each second, as in wireguard-go and Linux).
   @initiation_interval 20
@@ -260,8 +309,8 @@ defmodule Wagyu.Interface do
     unavailable: :initiations_unavailable
   ]
 
-  @spec start_link({pid(), Config.t()}) :: GenServer.on_start()
-  def start_link({root, %Config{} = config}), do: GenServer.start_link(__MODULE__, {root, config})
+  @spec start_link(pid()) :: GenServer.on_start()
+  def start_link(root), do: GenServer.start_link(__MODULE__, root)
 
   @doc """
   Admits egress packets from the link and sends them to the interface of
@@ -294,6 +343,33 @@ defmodule Wagyu.Interface do
     GenServer.call(interface, :info)
   catch
     :exit, _reason -> :error
+  end
+
+  @doc """
+  Replaces the peer set of `interface` with `peers` from
+  `Wagyu.Config.build_peers/1`. Returns `:ok`, the error of
+  `Wagyu.Config.put_peers/2`, or `{:error, :not_running}`.
+
+  The call has no timeout. Thus a caller never abandons a call that the
+  interface then applies.
+  """
+  @spec replace_peers(pid(), [Config.Peer.t()]) :: :ok | {:error, Config.error() | :not_running}
+  def replace_peers(interface, peers) when is_list(peers) do
+    GenServer.call(interface, {:replace_peers, peers}, :infinity)
+  catch
+    :exit, _reason -> {:error, :not_running}
+  end
+
+  @doc """
+  Stops the running peer of `public_key` and discards its sessions. Returns
+  `:ok`, `{:error, :unknown_peer}` if the key is not configured, or
+  `{:error, :not_running}`.
+  """
+  @spec revoke_sessions(pid(), term()) :: :ok | {:error, :unknown_peer | :not_running}
+  def revoke_sessions(interface, public_key) do
+    GenServer.call(interface, {:revoke_sessions, public_key}, :infinity)
+  catch
+    :exit, _reason -> {:error, :not_running}
   end
 
   @doc """
@@ -408,20 +484,36 @@ defmodule Wagyu.Interface do
   end
 
   @doc """
+  Tells the interface of `root` that the calling peer, which is the running
+  peer for `public_key`, now sends to `endpoint`. `configured` is the
+  number of configure messages that the peer took. The next process for
+  the key starts with the last endpoint that the interface accepted.
+  """
+  @spec endpoint_learned(term(), <<_::256>>, non_neg_integer(), {:inet.ip_address(), :inet.port_number()}) :: :ok
+  def endpoint_learned(root, public_key, configured, endpoint) do
+    case Wagyu.Registry.lookup(root, :interface) do
+      {:ok, interface, _value} -> send(interface, {:wg_endpoint, public_key, self(), configured, endpoint})
+      :error -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Forgets the calling peer, which is the running peer for `public_key`.
   The peer then exits. The interface retires its indices. The next traffic
-  for the key starts a new process, with `endpoint` as its endpoint if
-  `endpoint` is not `nil`.
+  for the key starts a new process, with the last endpoint that the peer
+  reported (`endpoint_learned/4`).
 
   Returns `:busy`, and forgets nothing, while admitted messages for the
   peer still wait for it to take them. Also returns `:ok` if the caller is
   not that peer, or if no interface runs, because nothing will go to the
   caller in either case.
   """
-  @spec release_peer(term(), <<_::256>>, {:inet.ip_address(), :inet.port_number()} | nil) :: :ok | :busy
-  def release_peer(root, public_key, endpoint) do
+  @spec release_peer(term(), <<_::256>>) :: :ok | :busy
+  def release_peer(root, public_key) do
     case Wagyu.Registry.lookup(root, :interface) do
-      {:ok, interface, _value} -> GenServer.call(interface, {:release_peer, public_key, endpoint}, :infinity)
+      {:ok, interface, _value} -> GenServer.call(interface, {:release_peer, public_key}, :infinity)
       :error -> :ok
     end
   catch
@@ -444,47 +536,54 @@ defmodule Wagyu.Interface do
   end
 
   @impl true
-  def init({root, %Config{} = config}) do
+  def init(root) do
     # Trap exits so that terminate/2 closes the socket on shutdown.
     Process.flag(:trap_exit, true)
 
-    case open_socket(config.listen) do
-      {:ok, socket, port} ->
-        egress = Admission.new(@egress_packets, @egress_bytes)
-        credit = EgressCredit.new()
-        :ok = Wagyu.Registry.register(root, :interface, %{egress: egress, credit: credit})
-
-        {:ok,
-         %{
-           root: root,
-           config: config,
-           socket: socket,
-           # The socket of the backend has no Erlang link to its owner.
-           # Thus a monitor reports that it closed.
-           socket_monitor: :inet.monitor(socket),
-           port: port,
-           mac1_key: Packet.mac1_key(config.public_key),
-           egress: egress,
-           credit: credit,
-           counters: :counters.new(length(@counters), []),
-           handshakes: HandshakeQueue.new(),
-           cookies: Cookie.checker(config.public_key),
-           limiter: RateLimiter.new(),
-           under_load_until: nil,
-           peers: %{},
-           endpoints: %{},
-           monitors: %{},
-           initiations: %{},
-           sent: %{},
-           started: TAI64N.now(),
-           indices: IndexTable.new(),
-           expiry_timer: nil,
-           clock: fn -> System.monotonic_time(:millisecond) end
-         }}
-
-      {:error, reason} ->
-        {:stop, reason}
+    with {:config, {:ok, config}} <- {:config, ConfigStore.fetch(root)},
+         {:ok, socket, port} <- open_socket(config.listen) do
+      start(root, config, socket, port)
+    else
+      {:config, :error} -> {:stop, :config_unavailable}
+      {:error, reason} -> {:stop, reason}
     end
+  end
+
+  defp start(root, config, socket, port) do
+    egress = Admission.new(@egress_packets, @egress_bytes)
+    credit = EgressCredit.new()
+    :ok = Wagyu.Registry.register(root, :interface, %{egress: egress, credit: credit})
+
+    {:ok,
+     %{
+       root: root,
+       config: config,
+       socket: socket,
+       # The socket of the backend has no Erlang link to its owner. Thus a
+       # monitor reports that it closed.
+       socket_monitor: :inet.monitor(socket),
+       port: port,
+       mac1_key: Packet.mac1_key(config.public_key),
+       egress: egress,
+       credit: credit,
+       counters: :counters.new(length(@counters), []),
+       handshakes: HandshakeQueue.new(),
+       cookies: Cookie.checker(config.public_key),
+       limiter: RateLimiter.new(),
+       under_load_until: nil,
+       peers: %{},
+       endpoints: %{},
+       monitors: %{},
+       initiations: %{},
+       sent: %{},
+       # The removed keys whose timestamps the interface keeps, oldest
+       # first.
+       removed: :queue.new(),
+       started: TAI64N.now(),
+       indices: IndexTable.new(),
+       expiry_timer: nil,
+       clock: fn -> System.monotonic_time(:millisecond) end
+     }}
   end
 
   @impl true
@@ -543,17 +642,39 @@ defmodule Wagyu.Interface do
     end
   end
 
-  def handle_call({:release_peer, key, endpoint}, {caller, _tag}, state) do
+  def handle_call({:release_peer, key}, {caller, _tag}, state) do
     case state.peers do
       %{^key => %{pid: ^caller} = peer} ->
         if idle?(peer) do
-          {:reply, :ok, release(state, key, caller, endpoint)}
+          {:reply, :ok, release(state, key, caller)}
         else
           {:reply, :busy, state}
         end
 
       _not_this_peer ->
         {:reply, :ok, state}
+    end
+  end
+
+  # The store has the new peer set before the interface applies it. Thus, if
+  # the interface fails during the change, it starts again with the new
+  # peer set.
+  def handle_call({:replace_peers, peers}, _from, state) do
+    case Config.put_built_peers(state.config, peers) do
+      {:ok, config} ->
+        :ok = ConfigStore.put(state.root, config)
+        {:reply, :ok, apply_peers(state, config)}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  def handle_call({:revoke_sessions, key}, _from, state) do
+    cond do
+      not is_map_key(state.config.peers, key) -> {:reply, {:error, :unknown_peer}, state}
+      is_map_key(state.peers, key) -> {:reply, :ok, state |> stop_peer(key) |> start_with_keepalive(key)}
+      true -> {:reply, :ok, state}
     end
   end
 
@@ -599,6 +720,16 @@ defmodule Wagyu.Interface do
     end
   end
 
+  def handle_info({:wg_endpoint, key, pid, configured, endpoint}, state) do
+    case state.peers do
+      %{^key => %{pid: ^pid, configured: ^configured}} ->
+        {:noreply, %{state | endpoints: Map.put(state.endpoints, key, endpoint)}}
+
+      _not_this_peer_or_old ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:DOWN, monitor, :process, pid, reason}, state) do
     case Map.pop(state.monitors, monitor) do
       {:worker, monitors} ->
@@ -618,25 +749,12 @@ defmodule Wagyu.Interface do
 
   # The peer supervisor started or restarted. Peers with a persistent
   # keepalive start with it.
-  def handle_info(:peer_supervisor_started, state) do
-    {:noreply,
-     state.config.peers
-     |> Map.values()
-     |> Enum.filter(&(&1.persistent_keepalive > 0))
-     |> Enum.reduce(state, fn peer, state ->
-       case ensure_peer(state, peer.public_key) do
-         {:ok, _peer, state} -> state
-         {:error, state} -> state
-       end
-     end)}
-  end
+  def handle_info(:peer_supervisor_started, state),
+    do: {:noreply, state.config.peers |> Map.keys() |> Enum.reduce(state, &start_with_keepalive(&2, &1))}
 
-  def handle_info({:restart_peer, key}, state) do
-    case ensure_peer(state, key) do
-      {:ok, _peer, state} -> {:noreply, state}
-      {:error, state} -> {:noreply, state}
-    end
-  end
+  # A peer set change can remove the key, or turn off its keepalive, before
+  # this message arrives.
+  def handle_info({:restart_peer, key}, state), do: {:noreply, start_with_keepalive(state, key)}
 
   def handle_info(:expire_indices, state) do
     if state.expiry_timer, do: Process.cancel_timer(state.expiry_timer)
@@ -659,7 +777,12 @@ defmodule Wagyu.Interface do
   end
 
   @impl true
-  def format_status(status), do: Wagyu.Redact.format_status(status, [:config, :cookies], &redact_reply/1)
+  def format_status(status),
+    do: Wagyu.Redact.format_status(status, [:config, :cookies], message: &redact_message/1, reply: &redact_reply/1)
+
+  # A new peer set contains preshared keys.
+  defp redact_message({:replace_peers, _peers}), do: {:replace_peers, :redacted}
+  defp redact_message(message), do: message
 
   # The reply to a claim contains the preshared key of the peer.
   defp redact_reply({:ok, peer, %Config.Peer{}}), do: {:ok, peer, :redacted}
@@ -941,11 +1064,15 @@ defmodule Wagyu.Interface do
 
         peer = %{
           pid: pid,
+          monitor: monitor,
           inbound: inbound,
           outbound: outbound,
           staging: staging,
           handoffs: handoffs,
-          credited: {0, 0}
+          credited: {0, 0},
+          filter: args.allowed_ips,
+          # The configure messages sent to this process.
+          configured: 0
         }
 
         {:ok, peer,
@@ -956,39 +1083,158 @@ defmodule Wagyu.Interface do
     end
   end
 
+  # The interface already forgot a released, removed or revoked peer, and a
+  # different process can now hold its key.
+  defp peer_down(state, key, pid) do
+    case state.peers do
+      %{^key => %{pid: ^pid} = peer} ->
+        {:ok, config} = Config.fetch_peer(state.config, key)
+        if config.persistent_keepalive > 0, do: Process.send_after(self(), {:restart_peer, key}, @peer_restart)
+        forget(state, key, peer)
+
+      _forgotten ->
+        state
+    end
+  end
+
   # Some packets were admitted to a peer that did not take them, or that
   # staged them and did not send them. These packets are lost with the
   # peer, and the counts of its queues give their number. All of the credit
   # that the peer held is free again. Its indices become tombstones. Thus
   # messages for them drop here, and the interface does not use them again
   # while the remote party can still send to them.
-  #
-  # The interface already forgot a released peer, and a different process
-  # can now hold its key.
-  defp peer_down(state, key, pid) do
-    case state.peers do
-      %{^key => %{pid: ^pid} = peer} ->
-        {lost_outbound, _bytes} = Admission.usage(peer.outbound)
-        {lost_staged, _bytes} = Admission.usage(peer.staging)
-        {lost_inbound, _bytes} = Admission.usage(peer.inbound)
-        add(state, :egress_peer_dropped, lost_outbound + lost_staged)
-        retire_peer(state, peer)
-        add(state, :inbound_peer_dropped, lost_inbound)
-        indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
-        {:ok, config} = Config.fetch_peer(state.config, key)
-        if config.persistent_keepalive > 0, do: Process.send_after(self(), {:restart_peer, key}, @peer_restart)
-        schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices})
+  defp forget(state, key, peer) do
+    {lost_outbound, _bytes} = Admission.usage(peer.outbound)
+    {lost_staged, _bytes} = Admission.usage(peer.staging)
+    {lost_inbound, _bytes} = Admission.usage(peer.inbound)
+    add(state, :egress_peer_dropped, lost_outbound + lost_staged)
+    retire_peer(state, peer)
+    add(state, :inbound_peer_dropped, lost_inbound)
+    indices = IndexTable.retire_owner(state.indices, {key, peer.pid}, state.clock.())
+    schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices})
+  end
 
-      _released ->
+  # Forgets the running peer of `key`, and stops its process. The interface
+  # does not wait for the exit, and does not see it. A worker that claimed
+  # the old process can still hand it a session. Its indices are already
+  # tombstones, so that session carries no traffic.
+  defp stop_peer(state, key) do
+    case state.peers do
+      %{^key => peer} ->
+        Process.demonitor(peer.monitor, [:flush])
+        Process.exit(peer.pid, :shutdown)
+        forget(%{state | monitors: Map.delete(state.monitors, peer.monitor)}, key, peer)
+
+      _not_running ->
         state
     end
   end
 
-  defp release(state, key, pid, endpoint) do
+  # Starts the peer of `key` if it is configured with a persistent
+  # keepalive. Does nothing if it already runs. If it cannot start, the
+  # interface tries again later, the same as after a failure. For example,
+  # the peer supervisor can still count a stopped peer that has not exited.
+  defp start_with_keepalive(state, key) do
+    with {:ok, %{persistent_keepalive: keepalive}} when keepalive > 0 <- Config.fetch_peer(state.config, key),
+         {:ok, _peer, state} <- ensure_peer(state, key) do
+      state
+    else
+      {:error, %{} = state} ->
+        Process.send_after(self(), {:restart_peer, key}, @peer_restart)
+        state
+
+      _no_keepalive ->
+        state
+    end
+  end
+
+  defp release(state, key, pid) do
     retire_peer(state, Map.fetch!(state.peers, key))
     indices = IndexTable.retire_owner(state.indices, {key, pid}, state.clock.())
-    endpoints = if endpoint, do: Map.put(state.endpoints, key, endpoint), else: state.endpoints
-    schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices, endpoints: endpoints})
+    schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices})
+  end
+
+  # Peer set changes
+
+  defp apply_peers(state, config) do
+    old = state.config
+    state = %{state | config: config}
+
+    state =
+      old.peers
+      |> Map.keys()
+      |> Enum.reject(&is_map_key(config.peers, &1))
+      |> Enum.reduce(state, &remove_peer(&2, &1))
+
+    filters? = config.allowed_ips != old.allowed_ips
+
+    Enum.reduce(config.peers, state, fn {key, peer}, state ->
+      change_peer(state, key, old.peers[key], peer, filters?)
+    end)
+  end
+
+  defp remove_peer(state, key) do
+    state = stop_peer(state, key)
+    state = %{state | endpoints: Map.delete(state.endpoints, key)}
+
+    if is_map_key(state.initiations, key) or is_map_key(state.sent, key),
+      do: keep_timestamps(state, key),
+      else: state
+  end
+
+  defp keep_timestamps(state, key) do
+    removed = :queue.in(key, state.removed)
+
+    if :queue.len(removed) > @removed_keys do
+      {{:value, oldest}, removed} = :queue.out(removed)
+      initiations = Map.delete(state.initiations, oldest)
+      %{state | removed: removed, initiations: initiations, sent: Map.delete(state.sent, oldest)}
+    else
+      %{state | removed: removed}
+    end
+  end
+
+  # An added key uses the timestamps that the interface kept for it.
+  defp change_peer(state, key, nil, _peer, _filters?),
+    do: start_with_keepalive(%{state | removed: :queue.delete(key, state.removed)}, key)
+
+  # A change of the endpoint to nil keeps the current endpoint. If the peer
+  # did not learn an endpoint, that is the old endpoint from the
+  # configuration. The interface keeps it for the next process.
+  defp change_peer(state, key, old, peer, filters?) do
+    endpoints =
+      cond do
+        peer.endpoint == old.endpoint -> state.endpoints
+        peer.endpoint != nil -> Map.delete(state.endpoints, key)
+        true -> Map.put_new(state.endpoints, key, {old.endpoint.address, old.endpoint.port})
+      end
+
+    state = %{state | endpoints: endpoints}
+
+    case state.peers do
+      %{^key => running} ->
+        configure(state, key, running, settings(old) != settings(peer), filters?)
+
+      _not_running when old.persistent_keepalive == 0 ->
+        start_with_keepalive(state, key)
+
+      _not_running ->
+        state
+    end
+  end
+
+  defp settings(peer), do: Map.take(peer, [:endpoint, :preshared_key, :persistent_keepalive])
+
+  defp configure(state, key, running, changed?, filters?) do
+    filter = if filters?, do: AllowedIPs.source_filter(state.config.allowed_ips, key), else: running.filter
+
+    if changed? or filter != running.filter do
+      send(running.pid, {:wg_configure, Map.fetch!(state.config.peers, key), filter})
+      running = %{running | filter: filter, configured: running.configured + 1}
+      %{state | peers: Map.put(state.peers, key, running)}
+    else
+      state
+    end
   end
 
   defp idle?(peer) do

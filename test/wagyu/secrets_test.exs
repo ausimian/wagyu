@@ -19,6 +19,7 @@ defmodule Wagyu.SecretsTest do
 
   setup do
     level = Logger.level()
+    inspect_opts = Application.fetch_env!(:logger, :translator_inspect_opts)
     %{filters: filters} = :logger.get_primary_config()
     {translator, translator_config} = Keyword.fetch!(filters, :logger_translator)
 
@@ -28,6 +29,9 @@ defmodule Wagyu.SecretsTest do
     :ok = :logger.remove_primary_filter(:logger_translator)
     :ok = :logger.add_primary_filter(:logger_translator, {translator, %{translator_config | sasl: true}})
     :ok = Logger.configure(level: :debug)
+    # Reports show complete states and messages. Thus a key cannot hide
+    # behind a truncation.
+    Application.put_env(:logger, :translator_inspect_opts, limit: :infinity, printable_limit: :infinity)
 
     :ok =
       :logger.add_handler(:wagyu_secrets_test, Handler, %{
@@ -39,6 +43,7 @@ defmodule Wagyu.SecretsTest do
     on_exit(fn ->
       :logger.remove_handler(:wagyu_secrets_test)
       Logger.configure(level: level)
+      Application.put_env(:logger, :translator_inspect_opts, inspect_opts)
       :logger.remove_primary_filter(:logger_translator)
       :logger.add_primary_filter(:logger_translator, {translator, translator_config})
     end)
