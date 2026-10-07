@@ -466,7 +466,16 @@ defmodule Wagyu.Interface do
   """
   @spec count_peer_event(:counters.counters_ref(), atom(), non_neg_integer()) :: :ok
   def count_peer_event(counters, name, increment \\ 1) when name in @peer_counters,
-    do: :counters.add(counters, Keyword.fetch!(@counters, name), increment)
+    do: :counters.add(counters, peer_counter(name), increment)
+
+  @doc """
+  Returns the index of the peer counter `name` in the counters that the
+  interface gives to each peer. A process that counts an event for each
+  packet looks up the index one time, and then adds to it with
+  `:counters.add/3`.
+  """
+  @spec peer_counter(atom()) :: pos_integer()
+  def peer_counter(name) when name in @peer_counters, do: Keyword.fetch!(@counters, name)
 
   @doc """
   Tells the interface of `root` that `process` took outbound packets from

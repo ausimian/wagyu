@@ -818,10 +818,11 @@ defmodule Wagyu.Peer do
 
   # A batch from the interface goes out under one key at one moment. Thus
   # the peer reads the clock, and updates the timers, one time for the
-  # batch. The frames of the batch go to the sender as one message, and the
-  # sender releases their packets after it sends them. If the peer dies
-  # during the batch, the interface counts the packets that the sender did
-  # not send.
+  # batch. The frames of the batch go to the sender as one message. The
+  # sender releases the packets in chunks, immediately before it sends each
+  # chunk. If the sender dies during the batch, the interface counts the
+  # packets that the sender did not send. The count can miss only the rest
+  # of the chunk that the sender was sending.
   #
   # Packets that find no usable key go one at a time. The peer releases each
   # of these immediately before it stages or seals it. After the key of a
@@ -830,7 +831,7 @@ defmodule Wagyu.Peer do
   defp send_packets(state, packets) do
     case usable(state) do
       nil -> {Enum.reduce(packets, state, &send_outbound/2), true}
-      key_pair -> seal_batch(state, key_pair, packets, [], 0, 0)
+      key_pair -> seal_batch(state, key_pair, packets, [])
     end
   end
 
@@ -839,26 +840,26 @@ defmodule Wagyu.Peer do
     send_packet(state, packet)
   end
 
-  defp seal_batch(state, key_pair, [], frames, packets, bytes),
-    do: {sent_batch(state, key_pair, frames, packets, bytes), false}
+  # Each frame goes with the size of its packet, which the sender releases.
+  defp seal_batch(state, key_pair, [], frames), do: {sent_batch(state, key_pair, frames), false}
 
-  defp seal_batch(state, key_pair, [packet | rest], frames, packets, bytes) do
+  defp seal_batch(state, key_pair, [packet | rest], frames) do
     case Noise.seal(key_pair.session, key_pair.remote_index, pad(packet, state.identity.stack[:mtu])) do
       {:ok, frame} ->
-        seal_batch(state, key_pair, rest, [frame | frames], packets + 1, bytes + byte_size(packet))
+        seal_batch(state, key_pair, rest, [{frame, byte_size(packet)} | frames])
 
       :error ->
-        state = sent_batch(state, key_pair, frames, packets, bytes)
+        state = sent_batch(state, key_pair, frames)
         {Enum.reduce([packet | rest], state, &send_outbound/2), true}
     end
   end
 
   # Does the work that `transmit/3` and `send_packet/3` do after each
   # packet, one time for the batch.
-  defp sent_batch(state, _key_pair, [], 0, 0), do: state
+  defp sent_batch(state, _key_pair, []), do: state
 
-  defp sent_batch(state, key_pair, frames, packets, bytes) do
-    send_frames(state, Enum.reverse(frames), :transport_sent, {packets, bytes})
+  defp sent_batch(state, key_pair, frames) do
+    send_frames(state, Enum.reverse(frames), :transport_sent)
 
     state
     |> sent_authenticated(:transport_sent)
@@ -958,12 +959,12 @@ defmodule Wagyu.Peer do
   # fails. Thus the peer does not try a failed socket again for each packet.
   # The sender counts `event` when it sends the frame, or `:send_errors`.
   defp transmit(state, frame, event) do
-    send_frames(state, [frame], event, {0, 0})
+    send_frames(state, [{frame, 0}], event)
     sent_authenticated(state, event)
   end
 
-  defp send_frames(%{endpoint: {_address, _port} = endpoint} = state, frames, event, released),
-    do: send(state.sender, {:wg_send, endpoint, frames, event, released})
+  defp send_frames(%{endpoint: {_address, _port} = endpoint} = state, frames, event),
+    do: send(state.sender, {:wg_send, endpoint, frames, event})
 
   # Timer events
 
