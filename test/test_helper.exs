@@ -12,4 +12,8 @@ interop? =
     true -> false
   end
 
-ExUnit.start(exclude: if(interop?, do: [], else: [:interop]))
+# Many tests wait for a process that does a Noise handshake or a key
+# derivation. On a slow CI runner, that can take more than the default of
+# 100 ms. A test that passes returns as soon as its message arrives, so only
+# a test that fails waits longer.
+ExUnit.start(exclude: if(interop?, do: [], else: [:interop]), assert_receive_timeout: 1_000)
