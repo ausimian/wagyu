@@ -469,14 +469,14 @@ defmodule Wagyu.Interface do
     do: :counters.add(counters, Keyword.fetch!(@counters, name), increment)
 
   @doc """
-  Tells the interface of `root` that the peer `peer`, or its sender, took
-  outbound packets from its queue. `peer` is the running peer for
-  `public_key`. The egress credit of these packets is then free again.
+  Tells the interface of `root` that `process` took outbound packets from
+  the queue of the running peer for `public_key`. `process` is that peer or
+  its sender. The egress credit of these packets is then free again.
   """
   @spec outbound_taken(term(), <<_::256>>, pid()) :: :ok
-  def outbound_taken(root, public_key, peer) do
+  def outbound_taken(root, public_key, process) do
     case Wagyu.Registry.lookup(root, :interface) do
-      {:ok, interface, _value} -> send(interface, {:wg_outbound_taken, public_key, peer})
+      {:ok, interface, _value} -> send(interface, {:wg_outbound_taken, public_key, process})
       :error -> :ok
     end
 
@@ -716,6 +716,7 @@ defmodule Wagyu.Interface do
   def handle_info({:wg_outbound_taken, key, pid}, state) do
     case state.peers do
       %{^key => %{pid: ^pid}} -> {:noreply, settle_peer(state, key)}
+      %{^key => %{sender: ^pid}} -> {:noreply, settle_peer(state, key)}
       _not_this_peer -> {:noreply, state}
     end
   end
@@ -1059,7 +1060,7 @@ defmodule Wagyu.Interface do
     }
 
     case PeerSupervisor.start_peer(state.root, args) do
-      {:ok, pid, sender} ->
+      {:ok, _group, %{peer: pid, sender: sender}} ->
         monitor = Process.monitor(pid)
 
         peer = %{

@@ -1,11 +1,12 @@
 defmodule Wagyu.PeerSupervisor do
   @moduledoc false
 
-  # Supervises one temporary process for each active configured peer. Only
-  # the interface starts peers. It starts a peer on demand. It also starts
-  # each peer with a persistent keepalive when this supervisor tells the
-  # interface that the supervisor started. The local key pair goes to the
-  # peers as an extra argument, the same as for the handshake workers.
+  # Supervises one temporary `Wagyu.Peer.Group` for each active configured
+  # peer. The group holds the peer and its sender. Only the interface starts
+  # peers. It starts a peer on demand. It also starts each peer with a
+  # persistent keepalive when this supervisor tells the interface that the
+  # supervisor started. The local key pair goes to the peers as an extra
+  # argument, the same as for the handshake workers.
 
   use DynamicSupervisor
 
@@ -22,7 +23,7 @@ defmodule Wagyu.PeerSupervisor do
   @spec start_peer(pid(), map()) :: DynamicSupervisor.on_start_child() | {:error, :unavailable}
   def start_peer(root, args) do
     case Wagyu.Registry.lookup(root, :peer_supervisor) do
-      {:ok, supervisor, _value} -> DynamicSupervisor.start_child(supervisor, {Wagyu.Peer, args})
+      {:ok, supervisor, _value} -> DynamicSupervisor.start_child(supervisor, {Wagyu.Peer.Group, args})
       :error -> {:error, :unavailable}
     end
   catch

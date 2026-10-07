@@ -9,8 +9,10 @@ defmodule Wagyu.Peer do
   #
   # A peer owns its handshakes, its transport sessions and their key slots,
   # its endpoint and its timers. It seals its own datagrams, and its sender
-  # (`Wagyu.Peer.Sender`) writes them to the interface's UDP socket. Each
-  # message to a peer is admitted against one of the peer's bounds first:
+  # (`Wagyu.Peer.Sender`) writes them to the interface's UDP socket. The peer
+  # and its sender are the children of one `Wagyu.Peer.Group`, and they stop
+  # together. Each message to a peer is admitted against one of the peer's
+  # bounds first:
   #
   #   * `{:wg_outbound, ip_packets}` against `:outbound`. A batch is
   #     admitted packet by packet.
@@ -281,7 +283,6 @@ defmodule Wagyu.Peer do
   alias Wagyu.Noise
   alias Wagyu.Packet
   alias Wagyu.Packet.{CookieReply, Response, Transport}
-  alias Wagyu.Peer.Sender
   alias Wagyu.TAI64N
 
   # WireGuard's timer constants, in milliseconds.
@@ -325,30 +326,16 @@ defmodule Wagyu.Peer do
   # after the other timers.
   @timers [:give_up, :retry, :new_handshake, :keepalive, :persistent_keepalive, :zero]
 
-  # Starts the sender first, so the interface gets both processes from the
-  # peer supervisor. The peer links to the sender in `init/1`.
-  @spec start_link(Config.t(), map()) :: {:ok, pid(), pid()} | {:error, term()}
-  def start_link(%Config{} = identity, %{peer: %Config.Peer{public_key: public_key}} = args) do
-    sender_args = Map.merge(Map.take(args, [:root, :socket, :counters, :outbound]), %{public_key: public_key})
-    {:ok, sender} = Sender.start(sender_args)
-
-    case GenServer.start_link(__MODULE__, {identity, Map.put(args, :sender, sender)}) do
-      {:ok, pid} ->
-        {:ok, pid, sender}
-
-      error ->
-        Process.exit(sender, :kill)
-        error
-    end
-  end
+  # `Wagyu.Peer.Group` starts the peer after its sender, and gives it the
+  # pid of the sender in `args`.
+  @spec start_link(Config.t(), map()) :: GenServer.on_start()
+  def start_link(%Config{} = identity, args), do: GenServer.start_link(__MODULE__, {identity, args})
 
   @impl true
   def init({identity, %{root: root, peer: %Config.Peer{} = peer, counters: counters} = args}) do
     %{inbound: inbound, outbound: outbound, handoffs: handoffs, staging: staging, allowed_ips: allowed_ips} = args
     Process.flag(:sensitive, true)
     %{sender: sender} = args
-    Process.link(sender)
-    send(sender, {:wg_owner, self()})
     clock = fn -> System.monotonic_time(:millisecond) end
 
     state = %{

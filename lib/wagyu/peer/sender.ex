@@ -7,10 +7,8 @@ defmodule Wagyu.Peer.Sender do
   # peer. There is one sender for each peer, so the datagrams of a peer stay
   # in the order that the peer sealed them.
   #
-  # `Wagyu.Peer.start_link/2` starts the sender before the peer, and the peer
-  # links to it. Then the peer sends `{:wg_owner, peer}`. The sender takes no
-  # other message before this one. It monitors the peer and stops when the
-  # peer stops. The link stops it when the peer fails.
+  # The sender and its peer are the children of one `Wagyu.Peer.Group`.
+  # When one of them exits, the group stops the other.
   #
   # The peer sends `{:wg_send, endpoint, frames, event, released}`. The sender
   # sends the frames in order, and counts each frame that it sent as `event`
@@ -26,11 +24,8 @@ defmodule Wagyu.Peer.Sender do
   alias Wagyu.Admission
   alias Wagyu.Interface
 
-  # The time that the sender waits for its peer to start.
-  @owner_timeout 5_000
-
-  @spec start(map()) :: GenServer.on_start()
-  def start(args), do: GenServer.start(__MODULE__, args)
+  @spec start_link(map()) :: GenServer.on_start()
+  def start_link(args), do: GenServer.start_link(__MODULE__, args)
 
   @impl true
   def init(%{root: root, public_key: public_key, socket: socket, counters: counters, outbound: outbound}) do
@@ -39,22 +34,10 @@ defmodule Wagyu.Peer.Sender do
       public_key: public_key,
       socket: socket,
       counters: counters,
-      outbound: outbound,
-      owner: nil
+      outbound: outbound
     }
 
-    {:ok, state, {:continue, :owner}}
-  end
-
-  @impl true
-  def handle_continue(:owner, state) do
-    receive do
-      {:wg_owner, owner} ->
-        Process.monitor(owner)
-        {:noreply, %{state | owner: owner}}
-    after
-      @owner_timeout -> {:stop, :normal, state}
-    end
+    {:ok, state}
   end
 
   @impl true
@@ -69,15 +52,13 @@ defmodule Wagyu.Peer.Sender do
 
     if packets > 0 do
       Admission.release(state.outbound, packets, bytes)
-      Interface.outbound_taken(state.root, state.public_key, state.owner)
+      Interface.outbound_taken(state.root, state.public_key, self())
     end
 
     count(state, event, sent)
     count(state, :send_errors, errors)
     {:noreply, state}
   end
-
-  def handle_info({:DOWN, _monitor, :process, owner, _reason}, %{owner: owner} = state), do: {:stop, :normal, state}
 
   def handle_info(_message, state), do: {:noreply, state}
 

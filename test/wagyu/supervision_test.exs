@@ -33,8 +33,8 @@ defmodule Wagyu.SupervisionTest do
     {:ok, %{counters: %{egress_routed: routed}}} = Wagyu.info(interface)
     send_egress(socket, 1)
     counters(interface, &(&1.egress_routed == routed + 1))
-    [{_id, peer, _type, _modules}] = DynamicSupervisor.which_children(child(interface, :peer_supervisor))
-    peer
+    [{_id, group, _type, _modules}] = DynamicSupervisor.which_children(child(interface, :peer_supervisor))
+    group
   end
 
   defp assert_receives_datagrams(%{interface: interface, client: client, port: port}) do
@@ -62,12 +62,13 @@ defmodule Wagyu.SupervisionTest do
 
   test "a link failure restarts the whole interface and invalidates old sockets", context do
     socket = open_udp(context.stack)
-    peer = start_peer(context.interface, socket)
+    group = start_peer(context.interface, socket)
+    peer = group_peer(group)
 
     kill(context.children.link)
 
     assert_stack_replaced(context, socket)
-    refute Process.alive?(peer)
+    assert eventually(fn -> not Process.alive?(peer) end)
   end
 
   test "stopping the stack with SmolNet.stop_stack/1 restarts the whole interface", context do
@@ -80,48 +81,51 @@ defmodule Wagyu.SupervisionTest do
 
   test "an interface failure keeps the link, the stack and open sockets", context do
     socket = open_udp(context.stack)
-    peer = start_peer(context.interface, socket)
+    group = start_peer(context.interface, socket)
+    peer = group_peer(group)
 
     kill(context.children.interface)
 
     children = restarted(context.interface, context.children, [:interface, :handshake_supervisor, :peer_supervisor])
     assert children.link == context.children.link
     assert Wagyu.stack(context.interface) == {:ok, context.stack}
-    refute Process.alive?(peer)
+    assert eventually(fn -> not Process.alive?(peer) end)
 
     # The socket that opened before the failure still sends through the same
     # link to the new interface. The new interface starts a new peer.
     assert {:ok, _address} = SmolNet.sockname(socket)
-    assert start_peer(context.interface, socket) != peer
+    assert start_peer(context.interface, socket) != group
     assert_receives_datagrams(context)
   end
 
   test "a peer supervisor failure removes its peers and keeps the interface", context do
     socket = open_udp(context.stack)
-    peer = start_peer(context.interface, socket)
+    group = start_peer(context.interface, socket)
+    peer = group_peer(group)
 
     kill(context.children.peer_supervisor)
 
     children = restarted(context.interface, context.children, [:peer_supervisor])
     assert Map.delete(children, :peer_supervisor) == Map.delete(context.children, :peer_supervisor)
-    refute Process.alive?(peer)
+    assert eventually(fn -> not Process.alive?(peer) end)
 
     assert eventually(fn ->
              {:ok, %{peers: [%{running: running}]}} = Wagyu.info(context.interface)
              not running
            end)
 
-    assert start_peer(context.interface, socket) != peer
+    assert start_peer(context.interface, socket) != group
   end
 
   test "a handshake supervisor failure restarts the workers and peers but keeps the interface", context do
     socket = open_udp(context.stack)
-    peer = start_peer(context.interface, socket)
+    group = start_peer(context.interface, socket)
+    peer = group_peer(group)
 
     kill(context.children.handshake_supervisor)
 
     children = restarted(context.interface, context.children, [:handshake_supervisor, :peer_supervisor])
     assert children.interface == context.children.interface
-    refute Process.alive?(peer)
+    assert eventually(fn -> not Process.alive?(peer) end)
   end
 end

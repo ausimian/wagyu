@@ -11,7 +11,8 @@ defmodule WagyuTest do
   defp processes(root) do
     children = children(root)
     {:ok, stack} = Wagyu.stack(root)
-    peers = for {_id, pid, _type, _modules} <- DynamicSupervisor.which_children(children.peer_supervisor), do: pid
+    groups = for {_id, pid, _type, _modules} <- DynamicSupervisor.which_children(children.peer_supervisor), do: pid
+    peers = groups ++ for(group <- groups, {_id, pid, _type, _modules} <- Supervisor.which_children(group), do: pid)
     {[root | Map.values(children)] ++ peers, SmolNet.monitor(stack)}
   end
 
@@ -226,7 +227,8 @@ defmodule WagyuTest do
         assert %{egress_routed: 1} = counters(interface, &(&1.egress_routed == 1))
 
         {pids, stack_monitor} = processes(interface)
-        assert length(pids) == 7
+        # The root, its five children, and the group, peer and sender of one peer.
+        assert length(pids) == 9
 
         assert :ok = Wagyu.stop(interface)
         assert_receive {:DOWN, ^stack_monitor, :process, _object, _reason}

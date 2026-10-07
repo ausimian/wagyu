@@ -107,7 +107,7 @@ defmodule Wagyu.SecretsTest do
     # of the peer.
     :ok = :sys.log(children.interface, true)
     :ok = :gen_udp.send(client, {127, 0, 0, 1}, port, noise_initiation(public_key, initiator, timestamp(1)))
-    peer = only_child(children.peer_supervisor)
+    peer = children.peer_supervisor |> only_child() |> group_peer()
     assert eventually(fn -> :sys.get_state(peer).next end)
     status = inspect(:sys.get_status(children.interface), limit: :infinity, printable_limit: :infinity)
     assert status =~ ~r/\{:ok, #PID<[0-9.]+>, #Wagyu.Config.Peer</
