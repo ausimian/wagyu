@@ -93,8 +93,8 @@ defmodule Wagyu.InteropTest do
   end
 
   defp wagyu_peer(wagyu) do
-    [{_id, pid, _type, _modules}] = DynamicSupervisor.which_children(wagyu.children.peer_supervisor)
-    pid
+    [{_id, group, _type, _modules}] = DynamicSupervisor.which_children(wagyu.children.peer_supervisor)
+    group_peer(group)
   end
 
   test "wgpeer runs a configured wireguard-go device on a real UDP port", context do
@@ -451,7 +451,7 @@ defmodule Wagyu.InteropTest do
       :ok = SmolNet.close(tcp)
 
       assert %{configured: 1} = :sys.get_state(peer)
-      assert [{_id, ^peer, _type, _modules}] = DynamicSupervisor.which_children(wagyu.children.peer_supervisor)
+      assert wagyu_peer(wagyu) == peer
 
       assert %{initiations_sent: 1, responses_accepted: 1, transport_invalid: 0, transport_source_denied: 0} =
                counters(wagyu.interface)

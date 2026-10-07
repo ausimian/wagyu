@@ -97,9 +97,9 @@ defmodule Wagyu.Interface do
   #
   # The interface records the credit that each peer holds: the packets that
   # it admitted to the queue of the peer and did not retire yet. When the
-  # peer takes a batch (`outbound_taken/2`), the interface retires the
-  # packets that the queue no longer holds. When the peer goes, the
-  # interface retires all of the credit of the peer.
+  # peer or its sender takes a batch (`outbound_taken/3`), the interface
+  # retires the packets that the queue no longer holds. When the peer goes,
+  # the interface retires all of the credit of the peer.
   #
   # The peer changes only the count of its queue. Thus the record of the
   # interface is exact, however the peer exits. Each time the interface
@@ -466,17 +466,26 @@ defmodule Wagyu.Interface do
   """
   @spec count_peer_event(:counters.counters_ref(), atom(), non_neg_integer()) :: :ok
   def count_peer_event(counters, name, increment \\ 1) when name in @peer_counters,
-    do: :counters.add(counters, Keyword.fetch!(@counters, name), increment)
+    do: :counters.add(counters, peer_counter(name), increment)
 
   @doc """
-  Tells the interface of `root` that the calling peer took outbound packets
-  from its queue. The calling peer is the running peer for `public_key`.
-  The egress credit of these packets is then free again.
+  Returns the index of the peer counter `name` in the counters that the
+  interface gives to each peer. A process that counts an event for each
+  packet looks up the index one time, and then adds to it with
+  `:counters.add/3`.
   """
-  @spec outbound_taken(term(), <<_::256>>) :: :ok
-  def outbound_taken(root, public_key) do
+  @spec peer_counter(atom()) :: pos_integer()
+  def peer_counter(name) when name in @peer_counters, do: Keyword.fetch!(@counters, name)
+
+  @doc """
+  Tells the interface of `root` that `process` took outbound packets from
+  the queue of the running peer for `public_key`. `process` is that peer or
+  its sender. The egress credit of these packets is then free again.
+  """
+  @spec outbound_taken(term(), <<_::256>>, pid()) :: :ok
+  def outbound_taken(root, public_key, process) do
     case Wagyu.Registry.lookup(root, :interface) do
-      {:ok, interface, _value} -> send(interface, {:wg_outbound_taken, public_key, self()})
+      {:ok, interface, _value} -> send(interface, {:wg_outbound_taken, public_key, process})
       :error -> :ok
     end
 
@@ -716,6 +725,7 @@ defmodule Wagyu.Interface do
   def handle_info({:wg_outbound_taken, key, pid}, state) do
     case state.peers do
       %{^key => %{pid: ^pid}} -> {:noreply, settle_peer(state, key)}
+      %{^key => %{sender: ^pid}} -> {:noreply, settle_peer(state, key)}
       _not_this_peer -> {:noreply, state}
     end
   end
@@ -1059,11 +1069,12 @@ defmodule Wagyu.Interface do
     }
 
     case PeerSupervisor.start_peer(state.root, args) do
-      {:ok, pid} ->
+      {:ok, _group, %{peer: pid, sender: sender}} ->
         monitor = Process.monitor(pid)
 
         peer = %{
           pid: pid,
+          sender: sender,
           monitor: monitor,
           inbound: inbound,
           outbound: outbound,
@@ -1114,15 +1125,18 @@ defmodule Wagyu.Interface do
     schedule_expiry(%{state | peers: Map.delete(state.peers, key), indices: indices})
   end
 
-  # Forgets the running peer of `key`, and stops its process. The interface
-  # does not wait for the exit, and does not see it. A worker that claimed
-  # the old process can still hand it a session. Its indices are already
-  # tombstones, so that session carries no traffic.
+  # Forgets the running peer of `key`, and stops its processes. The
+  # interface sends the exit signal to the peer and to its sender at the
+  # same time, so the sender does not wait for its group to see the exit of
+  # the peer. The group then stops. The interface does not wait for the
+  # exits, and does not see them. A worker that claimed the old process can
+  # still hand it a session. Its indices are already tombstones, so that
+  # session carries no traffic.
   defp stop_peer(state, key) do
     case state.peers do
       %{^key => peer} ->
         Process.demonitor(peer.monitor, [:flush])
-        Process.exit(peer.pid, :shutdown)
+        for pid <- [peer.pid, peer.sender], do: Process.exit(pid, :shutdown)
         forget(%{state | monitors: Map.delete(state.monitors, peer.monitor)}, key, peer)
 
       _not_running ->

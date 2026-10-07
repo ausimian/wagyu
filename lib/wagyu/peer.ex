@@ -8,9 +8,11 @@ defmodule Wagyu.Peer do
   # peer, so a rekey or a retry never starts a second process.
   #
   # A peer owns its handshakes, its transport sessions and their key slots,
-  # its endpoint and its timers. It sends its own datagrams on the
-  # interface's UDP socket with `:gen_udp.send/4`. Each message to a peer is
-  # admitted against one of the peer's bounds first:
+  # its endpoint and its timers. It seals its own datagrams, and its sender
+  # (`Wagyu.Peer.Sender`) writes them to the interface's UDP socket. The peer
+  # and its sender are the children of one `Wagyu.Peer.Group`, and they stop
+  # together. Each message to a peer is admitted against one of the peer's
+  # bounds first:
   #
   #   * `{:wg_outbound, ip_packets}` against `:outbound`. A batch is
   #     admitted packet by packet.
@@ -20,13 +22,14 @@ defmodule Wagyu.Peer do
   # The peer releases each message from its bound at a specific time:
   #
   #   * A handoff, when the peer takes it off the mailbox.
-  #   * An outbound packet, immediately before the peer sends or stages it.
+  #   * An outbound packet, after the sender sends it, or immediately before
+  #     the peer stages it.
   #   * A frame, when the peer is done with it. For a data packet, this is
   #     after the packet goes to the link.
   #
-  # After the peer takes an outbound batch, it tells the interface
-  # (`Wagyu.Interface.outbound_taken/2`). The interface then frees the
-  # link's egress credit for the packets that the queue no longer holds.
+  # After the peer or its sender releases outbound packets, it tells the
+  # interface (`Wagyu.Interface.outbound_taken/3`). The interface then frees
+  # the link's egress credit for the packets that the queue no longer holds.
   #
   # Responding. After the interface authorizes an initiation for this peer,
   # the handshake worker hands over its responder session with
@@ -323,13 +326,16 @@ defmodule Wagyu.Peer do
   # after the other timers.
   @timers [:give_up, :retry, :new_handshake, :keepalive, :persistent_keepalive, :zero]
 
+  # `Wagyu.Peer.Group` starts the peer after its sender, and gives it the
+  # pid of the sender in `args`.
   @spec start_link(Config.t(), map()) :: GenServer.on_start()
   def start_link(%Config{} = identity, args), do: GenServer.start_link(__MODULE__, {identity, args})
 
   @impl true
-  def init({identity, %{root: root, peer: %Config.Peer{} = peer, socket: socket, counters: counters} = args}) do
+  def init({identity, %{root: root, peer: %Config.Peer{} = peer, counters: counters} = args}) do
     %{inbound: inbound, outbound: outbound, handoffs: handoffs, staging: staging, allowed_ips: allowed_ips} = args
     Process.flag(:sensitive, true)
+    %{sender: sender} = args
     clock = fn -> System.monotonic_time(:millisecond) end
 
     state = %{
@@ -338,7 +344,7 @@ defmodule Wagyu.Peer do
       identity: identity,
       peer: peer,
       allowed_ips: allowed_ips,
-      socket: socket,
+      sender: sender,
       counters: counters,
       inbound: inbound,
       outbound: outbound,
@@ -446,9 +452,11 @@ defmodule Wagyu.Peer do
     {:noreply, arm(state)}
   end
 
+  # The sender releases the packets that it sends, and tells the interface.
+  # The peer tells the interface only if it released packets itself.
   defp handle({:wg_outbound, packets}, state) do
-    state = send_packets(state, packets)
-    Interface.outbound_taken(state.root, state.public_key)
+    {state, released} = send_packets(state, packets)
+    if released, do: Interface.outbound_taken(state.root, state.public_key, self())
     {:noreply, arm(state)}
   end
 
@@ -810,18 +818,20 @@ defmodule Wagyu.Peer do
 
   # A batch from the interface goes out under one key at one moment. Thus
   # the peer reads the clock, and updates the timers, one time for the
-  # batch. The peer releases each packet immediately before it sends or
-  # stages it. If the peer dies during the batch, the interface counts the
-  # packets that the peer did not send. The count can miss only the packet
-  # that the peer was about to send.
+  # batch. The frames of the batch go to the sender as one message. The
+  # sender releases the packets in chunks, immediately before it sends each
+  # chunk. If the sender dies during the batch, the interface counts the
+  # packets that the sender did not send. The count can miss only the rest
+  # of the chunk that the sender was sending.
   #
-  # Packets that find no usable key go one at a time. After the key of a
+  # Packets that find no usable key go one at a time. The peer releases each
+  # of these immediately before it stages or seals it. After the key of a
   # batch sends REJECT_AFTER_MESSAGES, the rest of the batch also goes one
-  # at a time.
+  # at a time. Returns the state and whether the peer released packets.
   defp send_packets(state, packets) do
     case usable(state) do
-      nil -> Enum.reduce(packets, state, &send_outbound/2)
-      key_pair -> seal_batch(state, key_pair, packets, 0, 0)
+      nil -> {Enum.reduce(packets, state, &send_outbound/2), true}
+      key_pair -> seal_batch(state, key_pair, packets, [])
     end
   end
 
@@ -830,33 +840,29 @@ defmodule Wagyu.Peer do
     send_packet(state, packet)
   end
 
-  defp seal_batch(state, key_pair, [], sent, errors), do: sent_batch(state, key_pair, sent, errors)
+  # Each frame goes with the size of its packet, which the sender releases.
+  defp seal_batch(state, key_pair, [], frames), do: {sent_batch(state, key_pair, frames), false}
 
-  defp seal_batch(state, key_pair, [packet | rest], sent, errors) do
-    Admission.release(state.outbound, 1, byte_size(packet))
-
+  defp seal_batch(state, key_pair, [packet | rest], frames) do
     case Noise.seal(key_pair.session, key_pair.remote_index, pad(packet, state.identity.stack[:mtu])) do
       {:ok, frame} ->
-        case send_frame(state, frame) do
-          :ok -> seal_batch(state, key_pair, rest, sent + 1, errors)
-          :error -> seal_batch(state, key_pair, rest, sent, errors + 1)
-        end
+        seal_batch(state, key_pair, rest, [{frame, byte_size(packet)} | frames])
 
       :error ->
-        state = state |> sent_batch(key_pair, sent, errors) |> send_packet(packet)
-        Enum.reduce(rest, state, &send_outbound/2)
+        state = sent_batch(state, key_pair, frames)
+        {Enum.reduce([packet | rest], state, &send_outbound/2), true}
     end
   end
 
   # Does the work that `transmit/3` and `send_packet/3` do after each
   # packet, one time for the batch.
-  defp sent_batch(state, _key_pair, 0, 0), do: state
+  defp sent_batch(state, _key_pair, []), do: state
 
-  defp sent_batch(state, key_pair, sent, errors) do
+  defp sent_batch(state, key_pair, frames) do
+    send_frames(state, Enum.reverse(frames), :transport_sent)
+
     state
     |> sent_authenticated(:transport_sent)
-    |> count(:transport_sent, sent)
-    |> count(:send_errors, errors)
     |> rekey_after_sending(key_pair)
   end
 
@@ -951,21 +957,14 @@ defmodule Wagyu.Peer do
 
   # A handshake message starts the REKEY_TIMEOUT wait, also if the send
   # fails. Thus the peer does not try a failed socket again for each packet.
+  # The sender counts `event` when it sends the frame, or `:send_errors`.
   defp transmit(state, frame, event) do
-    state = sent_authenticated(state, event)
-
-    case send_frame(state, frame) do
-      :ok -> count(state, event)
-      :error -> count(state, :send_errors)
-    end
+    send_frames(state, [{frame, 0}], event)
+    sent_authenticated(state, event)
   end
 
-  defp send_frame(%{endpoint: {address, port}} = state, frame) do
-    case :gen_udp.send(state.socket, address, port, frame) do
-      :ok -> :ok
-      {:error, _reason} -> :error
-    end
-  end
+  defp send_frames(%{endpoint: {_address, _port} = endpoint} = state, frames, event),
+    do: send(state.sender, {:wg_send, endpoint, frames, event})
 
   # Timer events
 

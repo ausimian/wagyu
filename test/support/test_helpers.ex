@@ -274,6 +274,12 @@ defmodule Wagyu.TestHelpers do
     clock
   end
 
+  @doc "Returns the peer process in a `Wagyu.Peer.Group`."
+  def group_peer(group) do
+    [peer] = for {Wagyu.Peer, pid, _type, _modules} <- Supervisor.which_children(group), do: pid
+    peer
+  end
+
   @doc "Moves a fake clock forward by `milliseconds`."
   def advance(clock, milliseconds), do: :atomics.add(clock, 1, milliseconds)
 
