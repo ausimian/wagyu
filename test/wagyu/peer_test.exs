@@ -197,6 +197,157 @@ defmodule Wagyu.PeerTest do
       refute_datagram(context)
     end
 
+    test "a report from the sealer about a key that the peer replaced starts no handshake", context do
+      demand(context)
+      initiation = receive_datagram(context)
+      {peer, _clock} = started_peer(context)
+      sealer = sealer(peer)
+      assert eventually(fn -> length(staged(peer)) == 1 end)
+
+      # The sealer is busy. A second packet waits for it, and the key that
+      # the handshake makes arrives after that packet.
+      :ok = :sys.suspend(sealer)
+      demand(context)
+      assert eventually(fn -> Process.info(sealer, :message_queue_len) == {:message_queue_len, 1} end)
+      {response, _session, _sent} = respond_to(initiation, context.remote, 99)
+      to_wagyu(context, response)
+      assert eventually(fn -> match?(%{current: %{split: true}}, :sys.get_state(peer)) end)
+      :ok = :sys.resume(sealer)
+
+      # The sealer stages the second packet and reports a demand for a key.
+      # Then it takes the key and sends both packets.
+      for counter <- [0, 1] do
+        assert <<4, 0, 0, 0, 99::little-32, ^counter::little-64, _rest::binary>> = receive_datagram(context)
+      end
+
+      # The report is about a key that the peer already replaced. Thus the
+      # peer starts no handshake.
+      _sealer = :sys.get_state(sealer)
+      state = :sys.get_state(peer)
+      refute Map.has_key?(state.timers, :retry) or Map.has_key?(state.timers, :give_up)
+      assert %{initiations_sent: 1} = counters(context.interface)
+    end
+
+    test "a staged packet stays admitted until the sender sends it", context do
+      demand(context)
+      initiation = receive_datagram(context)
+      {peer, _clock} = started_peer(context)
+      assert eventually(fn -> length(staged(peer)) == 1 end)
+      %{staging: staging} = :sys.get_state(sealer(peer))
+      assert {1, _bytes} = Admission.usage(staging)
+
+      # The handshake completes. The sealer gives the frame of the staged
+      # packet to the sender, which waits.
+      sender = :sys.get_state(peer).sender
+      :ok = :sys.suspend(sender)
+      {response, session, _sent} = respond_to(initiation, context.remote, 99)
+      to_wagyu(context, response)
+      assert eventually(fn -> staged(peer) == [] end)
+      assert {1, _bytes} = Admission.usage(staging)
+
+      :ok = :sys.resume(sender)
+      assert {:ok, _plaintext} = open_transport(session, receive_datagram(context))
+      assert eventually(fn -> Admission.usage(staging) == {0, 0} end)
+    end
+
+    test "a packet that the sealer stages while an attempt gives up starts a new attempt", context do
+      demand(context)
+      _initiation = receive_datagram(context)
+      {peer, clock} = started_peer(context)
+      sealer = sealer(peer)
+      assert eventually(fn -> length(staged(peer)) == 1 end)
+      %{timers: %{give_up: give_up}} = :sys.get_state(peer)
+
+      # The attempt runs out, and the timer message waits for the peer. A
+      # new packet reaches the sealer after it, and the sealer reports it.
+      :ok = :sys.suspend(peer)
+      advance_to(clock, give_up)
+      send(peer, {:wg_timer, make_ref()})
+      demand(context)
+      assert eventually(fn -> :queue.len(:sys.get_state(sealer).staged) == 2 end)
+      :ok = :sys.resume(peer)
+
+      # The peer drops only the packet of the attempt that gave up. The new
+      # packet stays, and its report starts a new attempt.
+      state = :sys.get_state(peer)
+      assert Map.has_key?(state.timers, :give_up)
+      assert [_new] = staged(peer)
+      assert %{staged_dropped: 1, handshakes_abandoned: 1} = counters(context.interface)
+    end
+
+    test "a demand about a key that expired while the sealer was busy starts a handshake", context do
+      {peer, clock, session, index} = initiated(context)
+      remote_keepalive(context, peer, session, index)
+      sealer = sealer(peer)
+
+      # A packet waits for the sealer. Then the key expires, and the peer
+      # discards it. The discard reaches the sealer after the packet.
+      :ok = :sys.suspend(sealer)
+      demand(context)
+      assert eventually(fn -> Process.info(sealer, :message_queue_len) == {:message_queue_len, 1} end)
+      advance(clock, 180_000)
+      assert %{current: nil} = run_timers(peer)
+      :ok = :sys.resume(sealer)
+
+      # The sealer stages the packet under the expired key, and reports a
+      # demand with the index of that key. The peer has no key, so it starts
+      # a handshake for the packet.
+      assert <<1, 0, 0, 0, _rest::binary>> = receive_datagram(context)
+      assert [_staged] = staged(peer)
+    end
+
+    test "a key that the sealer cannot accept is discarded, and the peer starts a handshake", context do
+      {peer, clock, _session, index} = initiated(context)
+
+      # The ticket for the outbound half is not valid, as after it expires.
+      send(sealer(peer), {:wg_key, :expired, %{local_index: index}, false})
+
+      assert eventually(fn -> match?(%{current: nil}, :sys.get_state(peer)) end)
+      assert lookup(context, index) == :retired
+      assert %{key: nil} = :sys.get_state(sealer(peer))
+
+      # The handshake goes out when REKEY_TIMEOUT has passed.
+      advance(clock, 5_333)
+      run_timers(peer)
+      assert <<1, 0, 0, 0, _rest::binary>> = receive_datagram(context)
+    end
+
+    test "a lost key that is no longer current changes nothing", context do
+      {peer, _clock, _session, index} = initiated(context)
+      before = :sys.get_state(peer)
+
+      # The notice is about a key that the peer replaced while the sealer
+      # was stalled.
+      send(peer, {:wg_key_lost, index + 1})
+
+      assert %{current: %{local_index: ^index}} = state = :sys.get_state(peer)
+      assert state.timers == before.timers
+      assert lookup(context, index) == {:active, {context.remote_key, peer}}
+    end
+
+    test "a send that the peer learns of after an earlier authenticated packet still arms the new-handshake timer",
+         context do
+      {peer, clock, session, index} = initiated(context)
+      refute Map.has_key?(remote_keepalive(context, peer, session, index).timers, :new_handshake)
+
+      # A keepalive from the remote party arrives first, and waits for the
+      # peer. Then the sealer sends data and reports it.
+      :ok = :sys.suspend(peer)
+      %{inbound_routed: routed} = counters(context.interface)
+      to_wagyu(context, transport_frame(session, index))
+      counters(context.interface, &(&1.inbound_routed == routed + 1))
+      demand(context)
+      assert <<4, 0, 0, 0, _rest::binary>> = receive_datagram(context)
+      _sealer = :sys.get_state(sealer(peer))
+      advance(clock, 1)
+      :ok = :sys.resume(peer)
+
+      # The data went out after the keepalive arrived. Thus the report arms
+      # the timer, also though the peer took the keepalive later than the
+      # sealer sent the data.
+      assert Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
+    end
+
     test "a response with the wrong index, MAC1 or authentication changes nothing", context do
       demand(context)
       initiation = receive_datagram(context)
@@ -400,7 +551,7 @@ defmodule Wagyu.PeerTest do
       # key. After its response, the peer waits for REKEY_TIMEOUT plus jitter.
       # Then it initiates to the endpoint that it learned.
       demand(context)
-      assert eventually(fn -> :queue.len(:sys.get_state(peer).staged) == 2 end)
+      assert eventually(fn -> length(staged(peer)) == 2 end)
       refute_datagram(context)
 
       advance(clock, 5_333)
@@ -629,7 +780,7 @@ defmodule Wagyu.PeerTest do
       assert Enum.all?(indices, &(lookup(context, &1) == :retired))
       state = :sys.get_state(peer)
       assert %{initiation: nil, timers: %{zero: zero} = timers} = state
-      assert :queue.is_empty(state.staged)
+      assert staged(peer) == []
       refute Map.has_key?(timers, :retry) or Map.has_key?(timers, :give_up)
       assert zero == now(clock) + 540_000
 
@@ -669,7 +820,7 @@ defmodule Wagyu.PeerTest do
       assert eventually(fn -> :sys.get_state(peer).timers.give_up == extended end)
 
       # A packet that has no space to wait does not extend the attempt.
-      %{staging: staging} = :sys.get_state(peer)
+      %{staging: staging} = :sys.get_state(sealer(peer))
       {packets, bytes} = Admission.usage(staging)
       free = staging.max_packets - packets
       :ok = Admission.admit(staging, free, 0)
@@ -852,7 +1003,7 @@ defmodule Wagyu.PeerTest do
       assert {:ok, _packet} = open_transport(session, receive_datagram(context))
       refute_datagram(context)
 
-      in_process(peer, fn %{current: key_pair} -> Decibel.set_nonce(key_pair.session, :out, 2 ** 60 - 1) end)
+      in_process(sealer(peer), fn %{key: key} -> Decibel.set_nonce(key.session, :out, 2 ** 60 - 1) end)
       demand(context)
       assert <<4, 0, 0, 0, 1::little-32, counter::little-64, _rest::binary>> = receive_datagram(context)
       assert counter == 2 ** 60 - 1
@@ -878,8 +1029,8 @@ defmodule Wagyu.PeerTest do
       remote_keepalive(context, peer, session, index)
       reject_after_messages = 2 ** 64 - 2 ** 13 - 1
 
-      in_process(peer, fn %{current: key_pair} ->
-        Decibel.set_nonce(key_pair.session, :out, reject_after_messages - 1)
+      in_process(sealer(peer), fn %{key: key} ->
+        Decibel.set_nonce(key.session, :out, reject_after_messages - 1)
       end)
 
       demand(context)
@@ -888,7 +1039,7 @@ defmodule Wagyu.PeerTest do
 
       # The next packet waits for a new key.
       demand(context)
-      assert eventually(fn -> :queue.len(:sys.get_state(peer).staged) == 1 end)
+      assert eventually(fn -> length(staged(peer)) == 1 end)
       assert %{transport_sent: 2} = counters(context.interface)
     end
   end

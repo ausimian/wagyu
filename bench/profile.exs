@@ -43,7 +43,9 @@ defmodule Wagyu.Bench.Profile do
     peers =
       Enum.flat_map(state.peers, fn {_key, peer} ->
         [{"Wagyu.Peer", peer.pid}] ++
-          for(sender when is_pid(sender) <- [Map.get(peer, :sender)], do: {"Wagyu.Peer.Sender", sender})
+          for {field, name} <- [sealer: "Wagyu.Peer.Sealer", sender: "Wagyu.Peer.Sender"],
+              pid = Map.get(peer, field),
+              do: {name, pid}
       end)
 
     labelled =

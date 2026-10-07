@@ -294,7 +294,7 @@ defmodule Wagyu.PeerSetTest do
 
       # Packets wait in the queue of the peer, and hold egress credit.
       {socket, _port} = smolnet_udp(context)
-      :ok = :sys.suspend(key.peer)
+      :ok = :sys.suspend(sealer(key.peer))
       for _n <- 1..3, do: to_host(socket, @a_host)
       %{outbound: outbound} = interface_state(context).peers[a.key]
       assert eventually(fn -> match?({3, _bytes}, Admission.usage(outbound)) end)
@@ -421,13 +421,13 @@ defmodule Wagyu.PeerSetTest do
       to_host(socket, @b_host)
       assert <<1, 0, 0, 0, _rest::binary-144>> = receive_datagram(context, b.socket)
       peer = eventually(fn -> peer(context, b) end)
-      assert eventually(fn -> :queue.len(:sys.get_state(peer).staged) == 1 end)
+      assert eventually(fn -> length(staged(peer)) == 1 end)
       %{timers: timers, initiation: initiation} = :sys.get_state(peer)
 
       :ok = Wagyu.replace_peers(context.interface, [a.config, %{b.config | allowed_ips: [{{10, 13, 5, 0}, 25}]}])
 
-      assert %{configured: 1, timers: ^timers, initiation: ^initiation} = state = :sys.get_state(peer)
-      assert :queue.len(state.staged) == 1
+      assert %{configured: 1, timers: ^timers, initiation: ^initiation} = :sys.get_state(peer)
+      assert length(staged(peer)) == 1
       assert peer(context, b) == peer
       refute_datagram(b.socket)
       assert %{initiations_sent: 1} = counters(context.interface)
@@ -443,19 +443,51 @@ defmodule Wagyu.PeerSetTest do
       moved = udp_socket()
       {:ok, moved_port} = :inet.port(moved)
       moved_config = %{a.config | endpoint: %{address: {127, 0, 0, 1}, port: moved_port}}
-      :ok = Wagyu.replace_peers(context.interface, [moved_config, b.config])
 
-      assert :sys.get_state(key.peer).endpoint == {{127, 0, 0, 1}, moved_port}
-      assert eventually(fn -> interface_state(context).endpoints[a.key] == {{127, 0, 0, 1}, moved_port} end)
+      # Egress after the change goes to the new endpoint, also while the
+      # peer has not taken the change. The sealer gets the endpoint from the
+      # interface, in sequence with the egress.
+      :ok = :sys.suspend(key.peer)
+      :ok = Wagyu.replace_peers(context.interface, [moved_config, b.config])
       {socket, _port} = smolnet_udp(context)
       to_host(socket, @a_host, "moved")
       assert receive_payload(context, moved, key) == "moved"
+      :ok = :sys.resume(key.peer)
+
+      assert :sys.get_state(key.peer).endpoint == {{127, 0, 0, 1}, moved_port}
+      assert eventually(fn -> interface_state(context).endpoints[a.key] == {{127, 0, 0, 1}, moved_port} end)
 
       # A change to nil keeps the current endpoint.
       :ok = Wagyu.replace_peers(context.interface, [%{a.config | endpoint: nil}, b.config])
       assert :sys.get_state(key.peer).endpoint == {{127, 0, 0, 1}, moved_port}
       to_host(socket, @a_host, "still moved")
       assert receive_payload(context, moved, key) == "still moved"
+    end
+
+    test "an endpoint that the peer learned before a change does not replace the new endpoint in the sealer",
+         context do
+      %{a: a, b: b} = context
+      key = handshake(context, a)
+      moved = udp_socket()
+      {:ok, moved_port} = :inet.port(moved)
+      moved_config = %{a.config | endpoint: %{address: {127, 0, 0, 1}, port: moved_port}}
+      :ok = Wagyu.replace_peers(context.interface, [moved_config, b.config])
+      assert :sys.get_state(key.peer).endpoint == {{127, 0, 0, 1}, moved_port}
+
+      # The peer learned another endpoint from a frame that it took before
+      # the change, and its report reaches the sealer late.
+      stale = udp_socket()
+      {:ok, stale_port} = :inet.port(stale)
+      send(sealer(key.peer), {:wg_endpoint, {{127, 0, 0, 1}, stale_port}, 0})
+
+      {socket, _port} = smolnet_udp(context)
+      to_host(socket, @a_host, "moved")
+      assert receive_payload(context, moved, key) == "moved"
+
+      # An endpoint that the peer learns after the change replaces it.
+      send(sealer(key.peer), {:wg_endpoint, {{127, 0, 0, 1}, stale_port}, 1})
+      to_host(socket, @a_host, "learned")
+      assert receive_payload(context, stale, key) == "learned"
     end
 
     test "a change of the endpoint to nil keeps the configured endpoint for the next process", context do
@@ -614,7 +646,7 @@ defmodule Wagyu.PeerSetTest do
       roamed = udp_socket()
       key = handshake(context, a, 1, roamed)
       {socket, _port} = smolnet_udp(context)
-      :ok = :sys.suspend(key.peer)
+      :ok = :sys.suspend(sealer(key.peer))
       for _n <- 1..2, do: to_host(socket, @a_host)
       %{outbound: outbound} = interface_state(context).peers[a.key]
       assert eventually(fn -> match?({2, _bytes}, Admission.usage(outbound)) end)
@@ -623,18 +655,19 @@ defmodule Wagyu.PeerSetTest do
       stored = config(context)
 
       # The group of the peer cannot see the exit of the peer. Thus only the
-      # interface can stop the sender, which holds frames that the peer
-      # sealed before the call.
-      %{sender: sender} = before.peers[a.key]
+      # interface can stop the sealer, which holds an outbound session, and
+      # the sender, which holds frames that the sealer sealed before the
+      # call.
+      %{sender: sender, sealer: sealer} = before.peers[a.key]
       {:dictionary, dictionary} = Process.info(sender, :dictionary)
       {:"$ancestors", [group | _ancestors]} = List.keyfind(dictionary, :"$ancestors", 0)
       :ok = :sys.suspend(group)
-      sender_exited = monitor_exit(sender)
+      helpers_exited = Enum.map([sealer, sender], &monitor_exit/1)
 
       assert :ok = Wagyu.revoke_sessions(context.interface, a.key)
 
       exited.(:shutdown)
-      sender_exited.(:shutdown)
+      for helper_exited <- helpers_exited, do: helper_exited.(:shutdown)
       :ok = :sys.resume(group)
       state = interface_state(context)
       assert state.config == before.config

@@ -237,24 +237,24 @@ defmodule Wagyu.InterfaceTest do
       socket = open_udp(context.stack)
       send_egress(socket, 1)
       counters(context.interface, &(&1.egress_routed == 1))
-      %{pid: peer, outbound: outbound} = peer(context.interface, context.peer_key)
+      %{sealer: sealer, outbound: outbound} = peer(context.interface, context.peer_key)
       assert eventually(fn -> Admission.usage(outbound) == {0, 0} end)
       assert eventually(fn -> EgressCredit.outstanding(credit) == {0, 0} end)
 
       # The stack sends only the quantity that the credit of the link allows.
-      # That quantity fits in the queue of the peer. The remaining data waits
-      # in the socket.
-      :ok = :sys.suspend(peer)
+      # That quantity fits in the queue of the sealer. The remaining data
+      # waits in the socket.
+      :ok = :sys.suspend(sealer)
       sender = Task.async(fn -> send_egress(socket, 200) end)
       assert eventually(fn -> match?({128, _bytes}, Admission.usage(outbound)) end)
       assert {128, _bytes} = EgressCredit.outstanding(credit)
       assert {:ok, %{egress: 129, egress_dropped: 0}} = Wagyu.Link.counters(context.interface)
       assert %{egress_routed: 129, egress_peer_dropped: 0} = counters(context.interface)
 
-      # The peer has no key. Thus it stages the packets that it takes, in the
-      # limit of its own bound. Each packet that it takes releases credit for
-      # the next packet.
-      :ok = :sys.resume(peer)
+      # The peer has no key. Thus the sealer stages the packets that it takes,
+      # in the limit of its own bound. Each packet that it takes releases
+      # credit for the next packet.
+      :ok = :sys.resume(sealer)
       assert :ok = Task.await(sender)
 
       assert %{egress_routed: 201, egress_peer_dropped: 0, staged_dropped: 73} =
@@ -270,10 +270,10 @@ defmodule Wagyu.InterfaceTest do
       socket = open_udp(context.stack)
       send_egress(socket, 1)
       counters(context.interface, &(&1.egress_routed == 1))
-      %{pid: peer, outbound: outbound} = peer(context.interface, context.peer_key)
+      %{pid: peer, sealer: sealer, outbound: outbound} = peer(context.interface, context.peer_key)
       assert eventually(fn -> Admission.usage(outbound) == {0, 0} end)
 
-      :ok = :sys.suspend(peer)
+      :ok = :sys.suspend(sealer)
       send_egress(socket, 10)
       assert eventually(fn -> match?({10, _bytes}, Admission.usage(outbound)) end)
 
@@ -337,6 +337,7 @@ defmodule Wagyu.InterfaceTest do
     @tag :capture_log
     test "the stack gets back the credit of egress lost with an interface", context do
       interface = child(context.interface, :interface)
+      peer_supervisor = child(context.interface, :peer_supervisor)
       socket = open_udp(context.stack)
 
       # The suspended interface holds all the credit when the test kills it.
@@ -356,7 +357,11 @@ defmodule Wagyu.InterfaceTest do
                )
              end)
 
-      assert eventually(fn -> child(context.interface, :interface) != interface end)
+      # The interface restarts first, then the supervisors after it. Until the
+      # peer supervisor runs again, the interface cannot start a peer, and
+      # drops egress.
+      assert eventually(fn -> child(context.interface, :interface) not in [nil, interface] end)
+      assert eventually(fn -> child(context.interface, :peer_supervisor) not in [nil, peer_supervisor] end)
       send_egress(socket, 1)
       assert counters(context.interface, &(&1.egress_routed >= 1))
     end
