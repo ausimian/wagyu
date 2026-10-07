@@ -18,12 +18,14 @@ defmodule Wagyu.Peer.Sender do
   # them. Thus the bound covers the queue of the sender, and the egress
   # credit of the link goes back only after the send.
   #
-  # The sender sends the frames in order, in chunks of 8. It releases the
-  # packets of a chunk immediately before it sends the chunk. It then counts
-  # each frame that it sent as `event` and each frame that it could not send
-  # as `:send_errors`. Thus, if the sender stops during a batch, the
-  # interface counts only the packets of later chunks as dropped, and can
-  # miss at most the rest of the current chunk. A release for each frame
+  # The sender sends the frames in order, in chunks of 8. Immediately before
+  # it sends a chunk, it releases the packets of the chunk and counts each
+  # frame as `event`. It then moves each frame that it could not send from
+  # `event` to `:send_errors`. Thus a frame is counted before it can reach
+  # the network, and `Wagyu.info/1` is never behind what the remote party
+  # received. If the sender stops during a batch, the interface counts only
+  # the packets of later chunks as dropped. It can miss, or count as sent,
+  # at most the rest of the current chunk. A release for each frame
   # costs 2–4% of loopback throughput, because the interface updates the
   # same counters at the same time. After the batch, the sender tells the
   # interface that it released packets (`Wagyu.Interface.outbound_taken/3`).
@@ -64,9 +66,8 @@ defmodule Wagyu.Peer.Sender do
 
   def handle_info(_message, state), do: {:noreply, state}
 
-  # Sends the frames in chunks of `@chunk`. The sender releases the packets
-  # of a chunk immediately before it sends the chunk, and counts the chunk
-  # after it. Returns whether the sender released packets.
+  # Sends the frames in chunks of `@chunk`. Returns whether the sender
+  # released packets.
   defp send_chunks(_state, _endpoint, [], _counters, released), do: released
 
   defp send_chunks(state, {address, port} = endpoint, frames, {sent_index, errors_index} = counters, released) do
@@ -76,17 +77,18 @@ defmodule Wagyu.Peer.Sender do
       Enum.reduce(chunk, {0, 0}, fn {_frame, size}, {n, b} -> if size > 0, do: {n + 1, b + size}, else: {n, b} end)
 
     if packets > 0, do: Admission.release(state.outbound, packets, bytes)
+    :counters.add(state.counters, sent_index, length(chunk))
 
-    {sent, errors} =
-      Enum.reduce(chunk, {0, 0}, fn {frame, _size}, {sent, errors} ->
-        case :gen_udp.send(state.socket, address, port, frame) do
-          :ok -> {sent + 1, errors}
-          {:error, _reason} -> {sent, errors + 1}
-        end
+    errors =
+      Enum.count(chunk, fn {frame, _size} ->
+        match?({:error, _reason}, :gen_udp.send(state.socket, address, port, frame))
       end)
 
-    if sent > 0, do: :counters.add(state.counters, sent_index, sent)
-    if errors > 0, do: :counters.add(state.counters, errors_index, errors)
+    if errors > 0 do
+      :counters.sub(state.counters, sent_index, errors)
+      :counters.add(state.counters, errors_index, errors)
+    end
+
     send_chunks(state, endpoint, rest, counters, released or packets > 0)
   end
 end
