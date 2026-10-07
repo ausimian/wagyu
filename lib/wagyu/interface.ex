@@ -97,9 +97,9 @@ defmodule Wagyu.Interface do
   #
   # The interface records the credit that each peer holds: the packets that
   # it admitted to the queue of the peer and did not retire yet. When the
-  # peer takes a batch (`outbound_taken/2`), the interface retires the
-  # packets that the queue no longer holds. When the peer goes, the
-  # interface retires all of the credit of the peer.
+  # peer or its sender takes a batch (`outbound_taken/3`), the interface
+  # retires the packets that the queue no longer holds. When the peer goes,
+  # the interface retires all of the credit of the peer.
   #
   # The peer changes only the count of its queue. Thus the record of the
   # interface is exact, however the peer exits. Each time the interface
@@ -469,14 +469,14 @@ defmodule Wagyu.Interface do
     do: :counters.add(counters, Keyword.fetch!(@counters, name), increment)
 
   @doc """
-  Tells the interface of `root` that the calling peer took outbound packets
-  from its queue. The calling peer is the running peer for `public_key`.
-  The egress credit of these packets is then free again.
+  Tells the interface of `root` that the peer `peer`, or its sender, took
+  outbound packets from its queue. `peer` is the running peer for
+  `public_key`. The egress credit of these packets is then free again.
   """
-  @spec outbound_taken(term(), <<_::256>>) :: :ok
-  def outbound_taken(root, public_key) do
+  @spec outbound_taken(term(), <<_::256>>, pid()) :: :ok
+  def outbound_taken(root, public_key, peer) do
     case Wagyu.Registry.lookup(root, :interface) do
-      {:ok, interface, _value} -> send(interface, {:wg_outbound_taken, public_key, self()})
+      {:ok, interface, _value} -> send(interface, {:wg_outbound_taken, public_key, peer})
       :error -> :ok
     end
 
@@ -1059,11 +1059,12 @@ defmodule Wagyu.Interface do
     }
 
     case PeerSupervisor.start_peer(state.root, args) do
-      {:ok, pid} ->
+      {:ok, pid, sender} ->
         monitor = Process.monitor(pid)
 
         peer = %{
           pid: pid,
+          sender: sender,
           monitor: monitor,
           inbound: inbound,
           outbound: outbound,
