@@ -1,11 +1,12 @@
 ### Changed
 
-- Each peer now writes its datagrams to the UDP socket from a separate sender
-  process, so the send no longer runs in the process that encrypts. Bulk TCP
-  uploads through a tunnel are faster: about 15–20% over gigabit Ethernet from
-  macOS, where the send itself is the limit, and about 55–75% on Linux. The
-  sender and the peer run under one supervisor for each peer, and they stop
-  together.
+- Each peer now runs as three processes. The peer runs the handshakes and the
+  timers, and decrypts inbound packets. A sealer encrypts outbound packets. A
+  sender writes the datagrams to the UDP socket. The three processes run under
+  one supervisor for each peer, and they stop together. Bulk TCP through a
+  tunnel is faster: on Linux, with a kernel WireGuard peer, about 30–50% for
+  downloads and 40–90% for uploads. Over gigabit Ethernet from macOS, where
+  the UDP send itself is the limit, uploads are about 15–20% faster.
 - Each peer now queues up to 512 inbound packets or 1 MiB, not 128 packets or
   256 KiB. A kernel WireGuard peer sends in bursts that the smaller queue could
   not hold. During a bulk download, the interface refused up to 1.5% of the

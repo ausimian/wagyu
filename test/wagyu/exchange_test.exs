@@ -89,8 +89,8 @@ defmodule Wagyu.ExchangeTest do
   # packet.
   defp transport_to(from, to) do
     frame =
-      in_process(peer(from), fn %{current: key_pair} ->
-        {:ok, frame} = Noise.seal(key_pair.session, key_pair.remote_index, "data")
+      in_process(sealer(peer(from)), fn %{key: key} ->
+        {:ok, frame} = Noise.seal(key.session, key.remote_index, "data")
         frame
       end)
 

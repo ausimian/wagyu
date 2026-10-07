@@ -227,8 +227,9 @@ defmodule WagyuTest do
         assert %{egress_routed: 1} = counters(interface, &(&1.egress_routed == 1))
 
         {pids, stack_monitor} = processes(interface)
-        # The root, its five children, and the group, peer and sender of one peer.
-        assert length(pids) == 9
+        # The root, its five children, and the group, peer, sealer and sender
+        # of one peer.
+        assert length(pids) == 10
 
         assert :ok = Wagyu.stop(interface)
         assert_receive {:DOWN, ^stack_monitor, :process, _object, _reason}

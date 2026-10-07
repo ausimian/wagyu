@@ -9,6 +9,8 @@ defmodule Wagyu.DataPathTest do
   import Wagyu.TestHelpers
 
   alias Wagyu.Admission
+  alias Wagyu.EgressCredit
+  alias Wagyu.IndexTable
   alias Wagyu.IP
 
   @local {10, 13, 0, 2}
@@ -157,8 +159,6 @@ defmodule Wagyu.DataPathTest do
   end
 
   defp message_queue_len(pid), do: elem(Process.info(pid, :message_queue_len), 1)
-
-  defp staged(peer), do: peer |> :sys.get_state() |> Map.fetch!(:staged) |> :queue.to_list()
 
   describe "inbound" do
     test "authenticated packets from the peer's own AllowedIPs reach SmolNet sockets, trimmed", context do
@@ -443,8 +443,9 @@ defmodule Wagyu.DataPathTest do
     test "each peer gets its share of an egress batch as one message, in order, admitted up to its bound", context do
       a = handshake(context, context.a)
       b = handshake(context, context.b)
-      :ok = :sys.suspend(a.peer)
-      :ok = :sys.suspend(b.peer)
+      {a_sealer, b_sealer} = {sealer(a.peer), sealer(b.peer)}
+      :ok = :sys.suspend(a_sealer)
+      :ok = :sys.suspend(b_sealer)
 
       # One batch from the link. The packets of B are mixed with the packets of
       # A. There are more packets for A than its queue can hold.
@@ -454,15 +455,15 @@ defmodule Wagyu.DataPathTest do
       assert {0, {_interface, egress, _credit}} = Wagyu.Interface.deliver(context.interface, batch)
       assert eventually(fn -> Admission.usage(egress) == {0, 0} end)
 
-      assert message_queue_len(a.peer) == 1
-      assert message_queue_len(b.peer) == 1
+      assert message_queue_len(a_sealer) == 1
+      assert message_queue_len(b_sealer) == 1
       assert %{egress_routed: 131, egress_peer_dropped: 2} = counters(context.interface)
       peers = :sys.get_state(context.children.interface).peers
       assert {128, _bytes} = Admission.usage(peers[context.a.key].outbound)
       assert {3, _bytes} = Admission.usage(peers[context.b.key].outbound)
 
-      :ok = :sys.resume(a.peer)
-      :ok = :sys.resume(b.peer)
+      :ok = :sys.resume(a_sealer)
+      :ok = :sys.resume(b_sealer)
       assert for(_n <- 1..128, do: receive_payload(context, context.a, a)) == Enum.map(1..128, &"a #{&1}")
       assert for(_n <- 1..3, do: receive_payload(context, context.b, b)) == ["b 1", "b 2", "b 3"]
       assert %{transport_sent: 131} = counters(context.interface, &(&1.transport_sent == 131))
@@ -483,19 +484,21 @@ defmodule Wagyu.DataPathTest do
       peer = eventually(fn -> peer(context, context.a) end)
       assert %{staged_dropped: 1} = counters(context.interface, &(&1.staged_dropped == 1))
       assert length(staged(peer)) == 16
-      assert Admission.usage(:sys.get_state(peer).staging) == {16, 256_448}
+      assert Admission.usage(:sys.get_state(sealer(peer)).staging) == {16, 256_448}
     end
 
     # When the test kills the peer, the peer logs its exit.
     @tag :capture_log
-    test "staged packets never show in the peer's status, and count as dropped if it exits", context do
+    test "staged packets never show in the sealer's status, and count as dropped if the peer exits", context do
       {udp, _port} = smolnet_udp(context, :inet)
       send_egress(udp, 3, @a_host)
       peer = eventually(fn -> peer(context, context.a) end)
       assert eventually(fn -> length(staged(peer)) == 3 end)
 
-      {:status, ^peer, _module, [_pdict, _status, _parent, _debug, [_header, _data, {:data, [{~c"State", state}]}]]} =
-        :sys.get_status(peer)
+      sealer = sealer(peer)
+
+      {:status, ^sealer, _module, [_pdict, _status, _parent, _debug, [_header, _data, {:data, [{~c"State", state}]}]]} =
+        :sys.get_status(sealer)
 
       assert state.staged == :redacted
 
@@ -503,6 +506,33 @@ defmodule Wagyu.DataPathTest do
       Process.exit(peer, :kill)
       assert_receive {:DOWN, ^monitor, :process, ^peer, :killed}
       assert %{egress_peer_dropped: 3} = counters(context.interface, &(&1.egress_peer_dropped == 3))
+    end
+  end
+
+  describe "peer group" do
+    # When the test kills the sender, the group logs the exit.
+    @tag :capture_log
+    test "a sender that fails stops its group, and its queued packets count as dropped", context do
+      key = handshake(context, context.a)
+      interface = context.children.interface
+      %{sender: sender, outbound: outbound} = :sys.get_state(interface).peers[context.a.key]
+      %{credit: credit} = :sys.get_state(interface)
+
+      # The sealer seals the batch, and the frames wait for the sender. Their
+      # packets stay admitted.
+      :ok = :sys.suspend(sender)
+      batch = for n <- 1..3, do: outbound(@a_host, "queued #{n}")
+      assert {0, _admitted} = Wagyu.Interface.deliver(context.interface, batch)
+      assert eventually(fn -> match?({3, _bytes}, Admission.usage(outbound)) end)
+      %{egress_peer_dropped: dropped} = counters(context.interface)
+
+      monitor = Process.monitor(key.peer)
+      Process.exit(sender, :kill)
+      assert_receive {:DOWN, ^monitor, :process, _peer, :shutdown}
+
+      assert counters(context.interface, &(&1.egress_peer_dropped == dropped + 3))
+      assert eventually(fn -> EgressCredit.outstanding(credit) == {0, 0} end)
+      assert IndexTable.lookup(:sys.get_state(interface).indices, key.index) == :retired
     end
   end
 
@@ -522,8 +552,8 @@ defmodule Wagyu.DataPathTest do
       to_wagyu(context, response, context.a.socket)
       assert <<1, _rest::binary>> = receive_datagram(context, context.a)
       refute_datagram(context.a.socket)
-      assert %{current: %{remote_index: 7}} = state = :sys.get_state(peer)
-      assert [_waiting] = :queue.to_list(state.staged)
+      assert %{current: %{remote_index: 7}} = :sys.get_state(peer)
+      assert [_waiting] = staged(peer)
       assert %{responses_accepted: 1, transport_sent: 0, initiations_sent: 2} = counters(context.interface)
     end
 
@@ -552,6 +582,39 @@ defmodule Wagyu.DataPathTest do
       assert %{transport_sent: 1, initiations_sent: 1} = counters(context.interface)
     end
 
+    test "a batch that reaches REJECT_AFTER_MESSAGES sends what it can and stages the rest in order", context do
+      key = handshake(context, context.a)
+      %{handshake_sent_at: sent_at} = :sys.get_state(key.peer)
+      advance(fake_clock(key.peer, sent_at), 5_000)
+      sealer = sealer(key.peer)
+
+      :ok =
+        in_process(sealer, fn %{key: sealer_key} ->
+          Decibel.set_nonce(sealer_key.session, :out, @reject_after_messages - 2)
+        end)
+
+      # One batch of four packets. The key can seal only two of them.
+      :ok = :sys.suspend(sealer)
+      batch = for n <- 1..4, do: outbound(@a_host, "packet #{n}")
+      assert {0, _admitted} = Wagyu.Interface.deliver(context.interface, batch)
+      assert eventually(fn -> message_queue_len(sealer) == 1 end)
+      :ok = :sys.resume(sealer)
+
+      for counter <- [@reject_after_messages - 2, @reject_after_messages - 1] do
+        assert <<4, 0, 0, 0, _index::little-32, ^counter::little-64, _rest::binary>> =
+                 receive_datagram(context, context.a)
+      end
+
+      assert <<1, _rest::binary>> = receive_datagram(context, context.a)
+      refute_datagram(context.a.socket)
+      assert staged(key.peer) == Enum.drop(batch, 2)
+
+      %{outbound: outbound, staging: staging} = :sys.get_state(context.children.interface).peers[context.a.key]
+      assert eventually(fn -> Admission.usage(outbound) == {0, 0} end)
+      assert {2, _bytes} = Admission.usage(staging)
+      assert %{transport_sent: 2, initiations_sent: 1} = counters(context.interface)
+    end
+
     test "a key sends nothing at REJECT_AFTER_MESSAGES, and the packet waits for a new handshake", context do
       key = handshake(context, context.a)
       {udp, _port} = smolnet_udp(context, :inet)
@@ -561,8 +624,8 @@ defmodule Wagyu.DataPathTest do
       advance(fake_clock(key.peer, sent_at), 5_000)
 
       :ok =
-        in_process(key.peer, fn %{current: key_pair} ->
-          Decibel.set_nonce(key_pair.session, :out, @reject_after_messages - 1)
+        in_process(sealer(key.peer), fn %{key: key} ->
+          Decibel.set_nonce(key.session, :out, @reject_after_messages - 1)
         end)
 
       for payload <- ["last", "one too many"] do

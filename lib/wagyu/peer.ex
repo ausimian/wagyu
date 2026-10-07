@@ -7,27 +7,35 @@ defmodule Wagyu.Peer do
   # interface starts. The same process carries every handshake with its
   # peer, so a rekey or a retry never starts a second process.
   #
-  # A peer owns its handshakes, its transport sessions and their key slots,
-  # its endpoint and its timers. It seals its own datagrams, and its sender
-  # (`Wagyu.Peer.Sender`) writes them to the interface's UDP socket. The peer
-  # and its sender are the children of one `Wagyu.Peer.Group`, and they stop
-  # together. Each message to a peer is admitted against one of the peer's
+  # A peer owns its handshakes, its key slots, its endpoint and its timers.
+  # It has two helper processes. The three processes are the children of one
+  # `Wagyu.Peer.Group`, and they start and stop together:
+  #
+  #   * The sealer (`Wagyu.Peer.Sealer`) takes the outbound packets from the
+  #     interface, and seals them under the outbound half of the `:current`
+  #     key pair. It also holds the packets that wait for a key.
+  #   * The sender (`Wagyu.Peer.Sender`) writes the datagrams of the sealer
+  #     and the handshake messages of the peer to the interface's UDP socket.
+  #
+  # The peer opens the inbound frames with the inbound half of each key
+  # pair. Thus sealing, opening and the UDP send each have a process. Each
+  # message to a peer or its sealer is admitted against one of the peer's
   # bounds first:
   #
-  #   * `{:wg_outbound, ip_packets}` against `:outbound`. A batch is
-  #     admitted packet by packet.
+  #   * `{:wg_outbound, ip_packets}` to the sealer, against `:outbound`. A
+  #     batch is admitted packet by packet.
   #   * `{:wg_frame, local_index, frame, source}` against `:inbound`.
   #   * The handoff against `:handoffs`, which counts messages only.
   #
-  # The peer releases each message from its bound at a specific time:
+  # Each message is released from its bound at a specific time:
   #
   #   * A handoff, when the peer takes it off the mailbox.
-  #   * An outbound packet, after the sender sends it, or immediately before
-  #     the peer stages it.
+  #   * An outbound packet, when the sender sends it, or after the sealer
+  #     admits it to the staging bound.
   #   * A frame, when the peer is done with it. For a data packet, this is
   #     after the packet goes to the link.
   #
-  # After the peer or its sender releases outbound packets, it tells the
+  # After the sealer or the sender releases outbound packets, it tells the
   # interface (`Wagyu.Interface.outbound_taken/3`). The interface then frees
   # the link's egress credit for the packets that the queue no longer holds.
   #
@@ -93,7 +101,9 @@ defmodule Wagyu.Peer do
   # An attempt ends when a handshake completes. This peer can be the
   # initiator, or the responder after the initiator confirms the key. If the
   # attempt runs out first, the peer discards the initiation. It drops the
-  # packets that wait for a key, and counts them.
+  # packets that wait for a key, and counts them. It drops only the packets
+  # that the sealer reported before: a packet that the sealer staged after
+  # its last report stays, and its report starts a new attempt.
   #
   # Cookies. When a remote party is under load, it answers a handshake
   # message that has no valid MAC2 with a cookie reply. The reply goes to
@@ -114,10 +124,10 @@ defmodule Wagyu.Peer do
   #   * A handshake that this peer initiated becomes `:current` immediately.
   #     Usually the old `:current` becomes `:previous`. If a newer,
   #     unconfirmed `:next` waits, `:next` becomes `:previous` and the old
-  #     `:current` leaves the slots. The peer then sends the packets that it
-  #     staged while it had no key. If it staged none, it sends a keepalive,
-  #     which is an empty transport message. Each of these confirms the key
-  #     to the responder.
+  #     `:current` leaves the slots. The sealer then sends the packets that
+  #     it staged while it had no key. If it staged none, it sends a
+  #     keepalive, which is an empty transport message. Each of these
+  #     confirms the key to the responder.
   #   * A handshake that this peer responded to becomes `:next`. It replaces
   #     any earlier `:next`, and `:previous` leaves the slots. `:current`
   #     stays the key that the peer sends with. The responder does not send
@@ -133,16 +143,21 @@ defmodule Wagyu.Peer do
   # which makes it a tombstone. The key pairs that are in the slots when the
   # peer exits go with the process.
   #
-  # Sending data. The peer sends an outbound packet under `:current` while
-  # that key is less than REJECT_AFTER_TIME (180 seconds) old and below
-  # REJECT_AFTER_MESSAGES. The peer pads the plaintext with zeros to a
+  # Sending data. When a key pair becomes `:current`, the peer moves the
+  # outbound half of its session to the sealer (`Decibel.split/3`) and keeps
+  # the inbound half. The sealer sends an outbound packet under `:current`
+  # while that key is less than REJECT_AFTER_TIME (180 seconds) old and
+  # below REJECT_AFTER_MESSAGES. It pads the plaintext with zeros to a
   # multiple of 16 bytes, but never past the MTU. The packet's counter is
   # the session's next nonce, which Decibel never uses again.
   #
-  # If there is no usable key, the peer stages the packet and initiates.
-  # Staged packets have their own bound of 128 packets and 256 KiB. The peer
-  # sends staged packets in order under the next key that it gets. It drops
-  # and counts the packets that do not fit.
+  # If there is no usable key, the sealer stages the packet and the peer
+  # initiates. Staged packets have their own bound of 128 packets and 256
+  # KiB. The sealer sends staged packets in order under the next key that
+  # it gets. It drops and counts the packets that do not fit. The sealer
+  # reports its sends and its need for a handshake to the peer once for
+  # each message that it takes (`{:wg_sealed, events, trigger, index,
+  # number}`).
   #
   # Receiving data. The peer refuses a transport message before any
   # cryptography if one of these conditions is true:
@@ -167,10 +182,10 @@ defmodule Wagyu.Peer do
   # these checks, becomes the endpoint. The source of an authenticated
   # handshake message also becomes the endpoint.
   #
-  # Batching. The interface sends a peer its part of each egress batch as
-  # one message. The peer sends the batch under one key at one moment. Thus
-  # it reads the clock, and updates and arms the timers, one time for the
-  # batch.
+  # Batching. The interface sends a peer's sealer its part of each egress
+  # batch as one message. The sealer sends the batch under one key at one
+  # moment, and reports it to the peer one time. Thus the peer updates and
+  # arms the timers one time for the batch.
   #
   # Decrypted packets wait in `state.plaintext` while more frames are in the
   # queue. They go to the link together when one of these occurs:
@@ -283,12 +298,12 @@ defmodule Wagyu.Peer do
   alias Wagyu.Noise
   alias Wagyu.Packet
   alias Wagyu.Packet.{CookieReply, Response, Transport}
+  alias Wagyu.Peer.Sealer
   alias Wagyu.TAI64N
 
   # WireGuard's timer constants, in milliseconds.
   @rekey_timeout 5_000
   @keepalive_timeout 10_000
-  @rekey_after_time 120_000
   @rekey_attempt_time 90_000
   @reject_after_time 180_000
   # The key age at which an initiator that receives under the key initiates
@@ -299,9 +314,6 @@ defmodule Wagyu.Peer do
   # The maximum random jitter that the peer adds to a retry or a new
   # handshake.
   @max_jitter 333
-  # REKEY_AFTER_MESSAGES: the peer replaces a key that sent this many
-  # messages.
-  @rekey_after_messages 0x1000000000000000
   # The number of counters that a key pair remembers behind the highest
   # counter that it accepted, as in wireguard-go and Linux.
   @replay_window 8128
@@ -326,16 +338,20 @@ defmodule Wagyu.Peer do
   # after the other timers.
   @timers [:give_up, :retry, :new_handshake, :keepalive, :persistent_keepalive, :zero]
 
-  # `Wagyu.Peer.Group` starts the peer after its sender, and gives it the
-  # pid of the sender in `args`.
+  # `Wagyu.Peer.Group` starts the peer after its sender and its sealer, and
+  # gives it their pids in `args`.
   @spec start_link(Config.t(), map()) :: GenServer.on_start()
   def start_link(%Config{} = identity, args), do: GenServer.start_link(__MODULE__, {identity, args})
 
   @impl true
   def init({identity, %{root: root, peer: %Config.Peer{} = peer, counters: counters} = args}) do
-    %{inbound: inbound, outbound: outbound, handoffs: handoffs, staging: staging, allowed_ips: allowed_ips} = args
+    %{inbound: inbound, handoffs: handoffs, allowed_ips: allowed_ips, sender: sender, sealer: sealer} = args
     Process.flag(:sensitive, true)
-    %{sender: sender} = args
+
+    # The sealer reports to the peer. It takes no other message before it
+    # knows the peer.
+    send(sealer, {:wg_owner, self()})
+
     clock = fn -> System.monotonic_time(:millisecond) end
 
     state = %{
@@ -345,11 +361,10 @@ defmodule Wagyu.Peer do
       peer: peer,
       allowed_ips: allowed_ips,
       sender: sender,
+      sealer: sealer,
       counters: counters,
       inbound: inbound,
-      outbound: outbound,
       handoffs: handoffs,
-      staging: staging,
       mac1_key: Packet.mac1_key(peer.public_key),
       cookie_key: Cookie.key(peer.public_key),
       cookie: nil,
@@ -361,10 +376,12 @@ defmodule Wagyu.Peer do
       next: nil,
       current: nil,
       previous: nil,
-      staged: :queue.new(),
       plaintext: @no_plaintext,
+      # The sequence number of the last packet that the sealer staged, as
+      # its last report gave it. The peer drops staged packets only up to
+      # this number.
+      staged_seen: 0,
       link: nil,
-      outbound_dropped: 0,
       inbound_dropped: 0,
       persistent_keepalive: peer.persistent_keepalive * 1_000,
       configured: 0,
@@ -377,6 +394,7 @@ defmodule Wagyu.Peer do
     # A peer with a persistent keepalive sends one immediately when it
     # starts.
     state = if state.persistent_keepalive > 0, do: set_timer(state, :persistent_keepalive, clock.()), else: state
+    if state.endpoint, do: send(sealer, {:wg_endpoint, state.endpoint, 0})
     {:ok, arm(state)}
   end
 
@@ -408,12 +426,33 @@ defmodule Wagyu.Peer do
     end
   end
 
+  # The events of the sealer do not end a run of frames. They change only
+  # the timers, and they can start a handshake.
+  def handle_info({:wg_sealed, events, trigger, index, staged}, state) do
+    state = Enum.reduce(events, %{state | staged_seen: staged}, &sent_authenticated(&2, &1))
+    state = if trigger && not replaced?(state, trigger, index), do: initiate(state, trigger), else: state
+    if state.plaintext.count == 0, do: {:noreply, arm(state)}, else: {:noreply, state, 0}
+  end
+
   # Any other message ends a run of frames, so their packets go first.
   def handle_info(message, state), do: handle(message, settle(state))
 
+  # A trigger from the sealer is about the key that the sealer had. If the
+  # peer gave the sealer a newer key after that, the sealer sends with the
+  # newer key, and the trigger is out of date. For example, the sealer can
+  # stage a packet and report a demand for a key just before it takes the
+  # key of a completed handshake.
+  #
+  # If the peer has no key, a demand always starts a handshake: the packet
+  # waits for a key, whichever key the sealer had when it staged the packet.
+  # A rekey about a key that the peer discarded is out of date.
+  defp replaced?(%{current: %{split: true, local_index: current}}, _trigger, index), do: index != current
+  defp replaced?(%{current: nil}, :rekey, index), do: index != nil
+  defp replaced?(_state, _trigger, _index), do: false
+
   @impl true
   def format_status(status),
-    do: Wagyu.Redact.format_status(status, [:identity, :peer, :staged, :plaintext], message: &redact_message/1)
+    do: Wagyu.Redact.format_status(status, [:identity, :peer, :plaintext], message: &redact_message/1)
 
   # The configuration in a configure message holds the preshared key.
   defp redact_message({:wg_configure, %Config.Peer{}, filter}), do: {:wg_configure, :redacted, filter}
@@ -452,14 +491,6 @@ defmodule Wagyu.Peer do
     {:noreply, arm(state)}
   end
 
-  # The sender releases the packets that it sends, and tells the interface.
-  # The peer tells the interface only if it released packets itself.
-  defp handle({:wg_outbound, packets}, state) do
-    {state, released} = send_packets(state, packets)
-    if released, do: Interface.outbound_taken(state.root, state.public_key, self())
-    {:noreply, arm(state)}
-  end
-
   # The message comes from the armed process timer, or from a timer that
   # the peer replaced after it armed it. In both cases, only the timers that
   # are already due run.
@@ -475,6 +506,16 @@ defmodule Wagyu.Peer do
   # A rekey of the same kind that the timers start. Tests send this message
   # to start a rekey without a wait.
   defp handle(:wg_initiate, state), do: {:noreply, state |> initiate(:rekey) |> arm()}
+
+  # The sealer could not accept the outbound half of a key. That half is
+  # gone, so the key pair cannot send. If it is still the current key pair,
+  # the peer discards it, and starts a handshake for a new key. A key pair
+  # that is no longer current does not send, and its inbound half still
+  # opens frames that were delayed, so the peer keeps it.
+  defp handle({:wg_key_lost, index}, %{current: %{local_index: index}} = state),
+    do: {:noreply, state |> discard([:current]) |> initiate(:rekey) |> arm()}
+
+  defp handle({:wg_key_lost, _index}, state), do: {:noreply, state}
 
   # The mailbox became empty while packets waited for the link. `settle/1`
   # already sent them to the link.
@@ -668,9 +709,9 @@ defmodule Wagyu.Peer do
       state = received_authenticated(state)
       state = if slot == :next, do: state |> confirm() |> handshake_complete(), else: state
       state = receive_plaintext(state, plaintext, source)
-      # Staged packets go out only now, so they go to the endpoint that this
-      # message can set.
-      state = if slot == :next, do: send_staged(state), else: state
+      # The sealer gets the key only now. Thus its staged packets go to the
+      # endpoint that this message can set.
+      state = if slot == :next, do: hand_over(state, false), else: state
       last_minute_rekey(state)
     else
       {:fresh, false} -> state |> count(:transport_expired) |> dropped()
@@ -760,7 +801,9 @@ defmodule Wagyu.Peer do
       remote_index: remote_index,
       created_at: created_at,
       initiator: initiator,
-      replay: ReplayWindow.new(@replay_window)
+      replay: ReplayWindow.new(@replay_window),
+      # True after the sealer has the outbound half of the session.
+      split: false
     }
   end
 
@@ -792,11 +835,16 @@ defmodule Wagyu.Peer do
 
         key_pair ->
           :ok = Decibel.close(key_pair.session)
+          discard_outbound(state, key_pair)
           :ok = Interface.retire_index(state.root, key_pair.local_index)
           Map.put(state, slot, nil)
       end
     end)
   end
+
+  # The sealer closes the outbound half of a key pair that it holds.
+  defp discard_outbound(state, %{split: true, local_index: index}), do: send(state.sealer, {:wg_discard, index})
+  defp discard_outbound(_state, _key_pair), do: :ok
 
   # Key pairs older than REJECT_AFTER_TIME cannot accept more messages.
   defp discard_expired(state), do: discard(state, Enum.filter(@slots, &expired?(state, &1)))
@@ -810,93 +858,26 @@ defmodule Wagyu.Peer do
 
   # Sending
 
-  # The initiator's first transport message under a new key confirms the
-  # key. This message is staged data if there is any, or a keepalive.
-  defp confirm_to_responder(state) do
-    if :queue.is_empty(state.staged), do: send_keepalive(state), else: send_staged(state)
+  # The sealer sends the outbound packets under `:current`. It gets the
+  # outbound half of each key pair that becomes `:current`, and the peer
+  # keeps the inbound half. After this, the sealer sends its staged packets.
+  # A key that this peer initiated is confirmed by the first transport
+  # message under it, so `confirm` makes the sealer send a keepalive if it
+  # has no staged packet.
+  defp hand_over(%{current: key_pair} = state, confirm) do
+    ticket = Decibel.split(key_pair.session, :out, state.sealer)
+    key = Map.take(key_pair, [:local_index, :remote_index, :created_at, :initiator])
+    send(state.sealer, {:wg_key, ticket, key, confirm})
+    %{state | current: %{key_pair | split: true}}
   end
 
-  # A batch from the interface goes out under one key at one moment. Thus
-  # the peer reads the clock, and updates the timers, one time for the
-  # batch. The frames of the batch go to the sender as one message. The
-  # sender releases the packets in chunks, immediately before it sends each
-  # chunk. If the sender dies during the batch, the interface counts the
-  # packets that the sender did not send. The count can miss only the rest
-  # of the chunk that the sender was sending.
-  #
-  # Packets that find no usable key go one at a time. The peer releases each
-  # of these immediately before it stages or seals it. After the key of a
-  # batch sends REJECT_AFTER_MESSAGES, the rest of the batch also goes one
-  # at a time. Returns the state and whether the peer released packets.
-  defp send_packets(state, packets) do
-    case usable(state) do
-      nil -> {Enum.reduce(packets, state, &send_outbound/2), true}
-      key_pair -> seal_batch(state, key_pair, packets, [])
-    end
-  end
+  defp confirm_to_responder(state), do: hand_over(state, true)
 
-  defp send_outbound(packet, state) do
-    Admission.release(state.outbound, 1, byte_size(packet))
-    send_packet(state, packet)
-  end
-
-  # Each frame goes with the size of its packet, which the sender releases.
-  defp seal_batch(state, key_pair, [], frames), do: {sent_batch(state, key_pair, frames), false}
-
-  defp seal_batch(state, key_pair, [packet | rest], frames) do
-    case Noise.seal(key_pair.session, key_pair.remote_index, pad(packet, state.identity.stack[:mtu])) do
-      {:ok, frame} ->
-        seal_batch(state, key_pair, rest, [{frame, byte_size(packet)} | frames])
-
-      :error ->
-        state = sent_batch(state, key_pair, frames)
-        {Enum.reduce([packet | rest], state, &send_outbound/2), true}
-    end
-  end
-
-  # Does the work that `transmit/3` and `send_packet/3` do after each
-  # packet, one time for the batch.
-  defp sent_batch(state, _key_pair, []), do: state
-
-  defp sent_batch(state, key_pair, frames) do
-    send_frames(state, Enum.reverse(frames), :transport_sent)
-
-    state
-    |> sent_authenticated(:transport_sent)
-    |> rekey_after_sending(key_pair)
-  end
-
-  # `demand` is false for a packet that already waited for a key. Thus,
-  # when the peer stages it again, the handshake attempt does not extend. A
-  # packet that the peer drops because the staging queue is full also does
-  # not extend the attempt.
-  defp send_packet(state, packet, demand \\ true) do
-    with %{} = key_pair <- usable(state),
-         {:ok, frame} <- Noise.seal(key_pair.session, key_pair.remote_index, pad(packet, state.identity.stack[:mtu])) do
-      state |> transmit(frame, :transport_sent) |> rekey_after_sending(key_pair)
-    else
-      # There is no key, the key is older than REJECT_AFTER_TIME, or it sent
-      # REJECT_AFTER_MESSAGES. The packet waits for a new handshake.
-      _no_usable_key -> stage_and_initiate(state, packet, demand)
-    end
-  end
-
-  defp stage_and_initiate(state, packet, demand) do
-    case stage(state, packet) do
-      {:staged, state} when demand -> initiate(state, :demand)
-      {_staged_or_dropped, state} -> initiate(state, :rekey)
-    end
-  end
-
-  # Sends a keepalive, which is an empty transport message, if there is a
-  # usable key.
+  # The sealer sends a keepalive, which is an empty transport message, if
+  # there is a usable key.
   defp send_keepalive(state) do
-    with %{} = key_pair <- usable(state),
-         {:ok, frame} <- Noise.seal(key_pair.session, key_pair.remote_index, "") do
-      state |> transmit(frame, :keepalives_sent) |> rekey_after_sending(key_pair)
-    else
-      _no_usable_key -> state
-    end
+    if usable(state), do: send(state.sealer, :wg_keepalive)
+    state
   end
 
   # The current key pair while it is younger than REJECT_AFTER_TIME, or nil.
@@ -904,55 +885,12 @@ defmodule Wagyu.Peer do
     if key_pair && fresh?(state, key_pair), do: key_pair
   end
 
-  # REKEY_AFTER_MESSAGES applies to all keys. REKEY_AFTER_TIME applies only
-  # to a key that this peer initiated.
-  defp rekey_after_sending(state, key_pair) do
-    if Decibel.nonce(key_pair.session, :out) >= @rekey_after_messages or
-         (key_pair.initiator and state.clock.() - key_pair.created_at >= @rekey_after_time),
-       do: initiate(state, :rekey),
-       else: state
-  end
-
-  # Zero padding to a multiple of 16 bytes, but not more than the MTU.
-  defp pad(packet, mtu) do
-    size = byte_size(packet)
-    padded = min(size + rem(16 - rem(size, 16), 16), mtu)
-    if padded > size, do: [packet, <<0::size((padded - size) * 8)>>], else: packet
-  end
-
-  # Staged packets are admitted against `state.staging`. The interface also
-  # holds this bound, so it counts packets that still wait when this
-  # process exits as dropped.
-  defp stage(state, packet) do
-    case Admission.admit(state.staging, 1, byte_size(packet)) do
-      :ok -> {:staged, %{state | staged: :queue.in(packet, state.staged)}}
-      :full -> {:dropped, state |> count(:staged_dropped) |> Map.update!(:outbound_dropped, &(&1 + 1))}
-    end
-  end
-
-  # Sends the staged packets in order. If the key becomes unusable during
-  # the sends, the peer stages the remaining packets again, in the same
-  # order. Each packet stays admitted until immediately before the peer
-  # sends it. The peer releases it first, so it fits if the peer stages it
-  # again. If the peer dies during the sends, the interface counts the
-  # packets that it did not send, and misses at most one.
-  defp send_staged(state) do
-    state.staged
-    |> :queue.to_list()
-    |> Enum.reduce(%{state | staged: :queue.new()}, fn packet, state ->
-      Admission.release(state.staging, 1, byte_size(packet))
-      send_packet(state, packet, false)
-    end)
-  end
-
-  # Drops every staged packet, and counts each one.
+  # Drops the staged packets that the peer knows of. The sealer counts each
+  # one. A packet that the sealer staged after its last report stays: its
+  # report, which is on the way, starts a new handshake attempt for it.
   defp drop_staged(state) do
-    packets = :queue.to_list(state.staged)
-    Admission.release(state.staging, length(packets), Admission.bytes(packets))
-
-    %{state | staged: :queue.new()}
-    |> count(:staged_dropped, length(packets))
-    |> Map.update!(:outbound_dropped, &(&1 + length(packets)))
+    :ok = Sealer.drop_staged(state.sealer, state.staged_seen)
+    state
   end
 
   # A handshake message starts the REKEY_TIMEOUT wait, also if the send
@@ -964,7 +902,14 @@ defmodule Wagyu.Peer do
   end
 
   defp send_frames(%{endpoint: {_address, _port} = endpoint} = state, frames, event),
-    do: send(state.sender, {:wg_send, endpoint, frames, event})
+    do: send(state.sender, {:wg_send, endpoint, frames, event, :outbound})
+
+  # The sealer sends to the endpoint that the peer last gave it.
+  defp report_endpoint(state) do
+    send(state.sealer, {:wg_endpoint, state.endpoint, state.configured})
+    :ok = Interface.endpoint_learned(state.root, state.public_key, state.configured, state.endpoint)
+    state
+  end
 
   # Timer events
 
@@ -1103,11 +1048,6 @@ defmodule Wagyu.Peer do
   defp learn_endpoint(%{endpoint: endpoint} = state, endpoint), do: state
 
   defp learn_endpoint(state, endpoint), do: report_endpoint(%{state | endpoint: endpoint})
-
-  defp report_endpoint(state) do
-    :ok = Interface.endpoint_learned(state.root, state.public_key, state.configured, state.endpoint)
-    state
-  end
 
   defp close(session) do
     :ok = Decibel.close(session)
