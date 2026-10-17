@@ -123,7 +123,7 @@ defmodule Wagyu.PresharedKeyTest do
         # a handshake that the peer starts. That handshake is not due less
         # than 5 seconds after the response of the peer.
         :ok = SmolNet.sendto(context.udp, "hello", %{family: :inet, addr: remote.destination, port: 9})
-        assert eventually(fn -> :queue.len(peer_state(context, remote).staged) == 1 end)
+        assert eventually(fn -> :queue.len(:sys.get_state(peer_state(context, remote).sealer).staged) == 1 end)
         assert {:error, :timeout} = :gen_udp.recv(remote.socket, 0, 50)
       end
 

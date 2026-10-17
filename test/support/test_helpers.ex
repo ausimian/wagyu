@@ -264,13 +264,16 @@ defmodule Wagyu.TestHelpers do
   def timestamp(n), do: <<0x400000000000000A + 1_700_000_000::64, n * 0x1000000::32>>
 
   @doc """
-  Replaces the clock of an interface with a fake clock. The fake clock starts
-  at `start`, and only `advance/2` moves it. Returns the clock.
+  Replaces the clock of an interface or a peer with a fake clock. The fake
+  clock starts at `start`, and only `advance/2` moves it. A peer's sealer
+  gets the same clock. Returns the clock.
   """
-  def fake_clock(interface, start \\ 1_000_000) do
+  def fake_clock(process, start \\ 1_000_000) do
     clock = :atomics.new(1, signed: true)
     :atomics.put(clock, 1, start)
-    :sys.replace_state(interface, &%{&1 | clock: fn -> :atomics.get(clock, 1) end})
+    fake = fn -> :atomics.get(clock, 1) end
+    state = :sys.replace_state(process, &%{&1 | clock: fake})
+    if is_map_key(state, :sealer), do: :sys.replace_state(state.sealer, &%{&1 | clock: fake})
     clock
   end
 
@@ -278,6 +281,14 @@ defmodule Wagyu.TestHelpers do
   def group_peer(group) do
     [peer] = for {Wagyu.Peer, pid, _type, _modules} <- Supervisor.which_children(group), do: pid
     peer
+  end
+
+  @doc "Returns the sealer of a peer."
+  def sealer(peer), do: :sys.get_state(peer).sealer
+
+  @doc "Returns the packets that wait for a key in the sealer of a peer, in order."
+  def staged(peer) do
+    peer |> sealer() |> :sys.get_state() |> Map.fetch!(:staged) |> :queue.to_list() |> Enum.map(&elem(&1, 1))
   end
 
   @doc "Moves a fake clock forward by `milliseconds`."

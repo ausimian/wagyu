@@ -97,9 +97,9 @@ defmodule Wagyu.Interface do
   #
   # The interface records the credit that each peer holds: the packets that
   # it admitted to the queue of the peer and did not retire yet. When the
-  # peer or its sender takes a batch (`outbound_taken/3`), the interface
-  # retires the packets that the queue no longer holds. When the peer goes,
-  # the interface retires all of the credit of the peer.
+  # sealer or the sender of the peer takes a batch (`outbound_taken/3`),
+  # the interface retires the packets that the queue no longer holds. When
+  # the peer goes, the interface retires all of the credit of the peer.
   #
   # The peer changes only the count of its queue. Thus the record of the
   # interface is exact, however the peer exits. Each time the interface
@@ -486,8 +486,9 @@ defmodule Wagyu.Interface do
 
   @doc """
   Tells the interface of `root` that `process` took outbound packets from
-  the queue of the running peer for `public_key`. `process` is that peer or
-  its sender. The egress credit of these packets is then free again.
+  the queue of the running peer for `public_key`. `process` is the sealer
+  or the sender of that peer. The egress credit of these packets is then
+  free again.
   """
   @spec outbound_taken(term(), <<_::256>>, pid()) :: :ok
   def outbound_taken(root, public_key, process) do
@@ -733,6 +734,7 @@ defmodule Wagyu.Interface do
     case state.peers do
       %{^key => %{pid: ^pid}} -> {:noreply, settle_peer(state, key)}
       %{^key => %{sender: ^pid}} -> {:noreply, settle_peer(state, key)}
+      %{^key => %{sealer: ^pid}} -> {:noreply, settle_peer(state, key)}
       _not_this_peer -> {:noreply, state}
     end
   end
@@ -1003,7 +1005,7 @@ defmodule Wagyu.Interface do
       case ensure_peer(state, key) do
         {:ok, peer, state} ->
           {admitted, _refused} = Admission.admit_prefix(peer.outbound, packets)
-          if admitted != [], do: send(peer.pid, {:wg_outbound, admitted})
+          if admitted != [], do: send(peer.sealer, {:wg_outbound, admitted})
           {credited_packets, credited_bytes} = peer.credited
           credited = {credited_packets + length(admitted), credited_bytes + Admission.bytes(admitted)}
           {length(admitted), put_in(state.peers[key].credited, credited)}
@@ -1076,12 +1078,13 @@ defmodule Wagyu.Interface do
     }
 
     case PeerSupervisor.start_peer(state.root, args) do
-      {:ok, _group, %{peer: pid, sender: sender}} ->
+      {:ok, _group, %{peer: pid, sender: sender, sealer: sealer}} ->
         monitor = Process.monitor(pid)
 
         peer = %{
           pid: pid,
           sender: sender,
+          sealer: sealer,
           monitor: monitor,
           inbound: inbound,
           outbound: outbound,
@@ -1133,17 +1136,22 @@ defmodule Wagyu.Interface do
   end
 
   # Forgets the running peer of `key`, and stops its processes. The
-  # interface sends the exit signal to the peer and to its sender at the
-  # same time, so the sender does not wait for its group to see the exit of
-  # the peer. The group then stops. The interface does not wait for the
-  # exits, and does not see them. A worker that claimed the old process can
-  # still hand it a session. Its indices are already tombstones, so that
-  # session carries no traffic.
+  # interface sends the exit signal to the peer, its sealer and its sender
+  # at the same time, so the sealer and the sender do not wait for their
+  # group to see the exit of the peer. The group then stops. The interface
+  # does not wait for the exits, and does not see them. A worker that
+  # claimed the old process can still hand it a session. Its indices are
+  # already tombstones, so that session carries no traffic.
+  #
+  # The interface counts the lost packets while the processes can still
+  # run. If the sealer is moving a packet from outbound to staging at that
+  # moment, the packet is counted in both bounds. The count can be one too
+  # high for each such packet.
   defp stop_peer(state, key) do
     case state.peers do
       %{^key => peer} ->
         Process.demonitor(peer.monitor, [:flush])
-        for pid <- [peer.pid, peer.sender], do: Process.exit(pid, :shutdown)
+        for pid <- [peer.pid, peer.sealer, peer.sender], do: Process.exit(pid, :shutdown)
         forget(%{state | monitors: Map.delete(state.monitors, peer.monitor)}, key, peer)
 
       _not_running ->
@@ -1234,6 +1242,15 @@ defmodule Wagyu.Interface do
 
     case state.peers do
       %{^key => running} ->
+        # Egress goes to the sealer, not through the peer. Thus the sealer
+        # gets a new endpoint from the interface, in sequence with the
+        # egress that the interface forwards after the change. A changed
+        # endpoint always comes with a configure message (`configure/5`), so
+        # the update carries the configure number that the peer has after
+        # it takes that message.
+        if peer.endpoint != nil and peer.endpoint != old.endpoint,
+          do: send(running.sealer, {:wg_endpoint, {peer.endpoint.address, peer.endpoint.port}, running.configured + 1})
+
         configure(state, key, running, settings(old) != settings(peer), filters?)
 
       _not_running when old.persistent_keepalive == 0 ->
@@ -1258,6 +1275,10 @@ defmodule Wagyu.Interface do
     end
   end
 
+  # The bounds are read in this order on purpose. The sealer admits a packet
+  # to staging before it releases the packet from outbound
+  # (`Wagyu.Peer.Sealer`). Thus, if this reads outbound at zero after that
+  # release, it then reads staging above zero.
   defp idle?(peer) do
     Enum.all?([peer.inbound, peer.outbound, peer.staging, peer.handoffs], &match?({0, _bytes}, Admission.usage(&1)))
   end
