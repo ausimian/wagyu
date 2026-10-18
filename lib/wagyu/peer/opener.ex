@@ -73,7 +73,7 @@ defmodule Wagyu.Peer.Opener do
   # receives, and the endpoint of the peer follows the source of its
   # traffic. When the opener sends packets to the link, or when it took a
   # frame and no packet waits, it sends the peer one `{:wg_opened, events,
-  # source, confirmed, configured, authenticated_at}` if it has something
+  # source, confirmed, configured, authenticated}` if it has something
   # to report:
   #
   #   * `events` holds `:authenticated` if a message authenticated, and
@@ -88,21 +88,21 @@ defmodule Wagyu.Peer.Opener do
   #     number. The peer does not learn `source` from a report with a lower
   #     number than its own: the interface admitted those frames before a
   #     change to the configuration.
-  #   * `authenticated_at` is the time on `state.clock` at which the last
-  #     message of the report authenticated.
+  #   * `authenticated` is the marker of the last message of the report
+  #     that authenticated: an `:erlang.unique_integer([:monotonic])` that
+  #     the opener takes when the message authenticates.
   #
   # A report can reach the peer after a report of the sealer about a later
   # send. The peer arms its new-handshake timer when it learns of a send,
-  # and cancels it when it learns that a message authenticated after that.
-  # Thus it cancels the timer only for a report whose `authenticated_at` is
-  # not before the time at which it armed the timer. The sealer does not
-  # compare the time of a send with the time of the last frame, because
-  # during a download most reports would look old (see
-  # `Wagyu.Peer.Sealer`). This comparison is different: during a download,
-  # a message authenticates within milliseconds after the peer arms the
-  # timer, so the peer still cancels it. A late send report costs at most
-  # one extra handshake, as in wireguard-go. A late receive report must not
-  # cancel the timer, because then the peer can lose its retry.
+  # and takes a marker at that time. It cancels the timer only for a report
+  # whose marker is greater. The markers increase strictly across all the
+  # processes of the node. Thus a message that authenticated before the
+  # peer armed the timer never cancels it, and a late receive report cannot
+  # make the peer lose its retry. A message that authenticates after the
+  # send, but before the peer takes the report of the sealer, does not
+  # cancel the timer either. This costs at most one extra handshake, the
+  # same as a late send report, as in wireguard-go. Thus an error can add a
+  # handshake, but never lose one.
   #
   # The opener, the sealer, the sender and the peer are the children of one
   # `Wagyu.Peer.Group`, and they stop together. The group starts the peer
@@ -141,7 +141,7 @@ defmodule Wagyu.Peer.Opener do
   # after the first packet started to wait.
   @no_plaintext %{packets: [], count: 0, frame_bytes: 0, frames: 0}
   # The events that the opener has not reported to the peer yet.
-  # `authenticated` is the time at which the last message authenticated, or
+  # `authenticated` is the marker of the last message that authenticated, or
   # nil.
   @no_events %{authenticated: nil, data: false, source: nil, confirmed: []}
 
@@ -262,7 +262,7 @@ defmodule Wagyu.Peer.Opener do
          {:replay, :ok} <- {:replay, ReplayWindow.check(key.replay, counter)},
          {:ok, plaintext} <- Noise.open(key.session, transport) do
       state = put_in(state.keys[index], %{key | replay: ReplayWindow.commit(key.replay, counter), pending: false})
-      state = %{state | events: %{state.events | authenticated: state.clock.()}}
+      state = %{state | events: %{state.events | authenticated: :erlang.unique_integer([:monotonic])}}
       state = if key.pending, do: update_in(state.events.confirmed, &[index | &1]), else: state
       receive_plaintext(state, plaintext, source)
     else

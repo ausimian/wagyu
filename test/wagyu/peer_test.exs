@@ -374,16 +374,16 @@ defmodule Wagyu.PeerTest do
       # The staged packet that confirms the key arms the timer.
       {peer, _clock, _session, _index} = initiated(context)
       _sealer = :sys.get_state(sealer(peer))
-      %{new_handshake_armed_at: armed_at, configured: configured} = state = :sys.get_state(peer)
+      %{new_handshake_marker: armed, configured: configured} = state = :sys.get_state(peer)
       assert Map.has_key?(state.timers, :new_handshake)
 
       # The opener reports a message that authenticated before the send. Its
       # report arrives after the report of the sealer.
-      send(peer, {:wg_opened, [:authenticated], nil, [], configured, armed_at - 1})
+      send(peer, {:wg_opened, [:authenticated], nil, [], configured, armed - 1})
       assert Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
 
       # A message that authenticated after the send answers it.
-      send(peer, {:wg_opened, [:authenticated], nil, [], configured, armed_at})
+      send(peer, {:wg_opened, [:authenticated], nil, [], configured, armed + 1})
       refute Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
     end
 
