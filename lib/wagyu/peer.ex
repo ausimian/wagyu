@@ -201,10 +201,9 @@ defmodule Wagyu.Peer do
   #   * New handshake. The peer initiates KEEPALIVE_TIMEOUT plus
   #     REKEY_TIMEOUT (15 seconds), plus jitter, after it sends data, if it
   #     received no authenticated packet after that. The cause is that its
-  #     key can be stale on the other side. A report of the opener cancels
-  #     this timer only if its message authenticated after the peer armed
-  #     the timer. Markers from `:erlang.unique_integer/1` give this order
-  #     (see `Wagyu.Peer.Opener`).
+  #     key can be stale on the other side. Only an authenticated packet
+  #     that is newer than the send cancels this timer (see "Order"
+  #     below).
   #   * Persistent keepalive. If one is configured, the peer sends a
   #     keepalive when that number of seconds passes with no authenticated
   #     packet sent or received. It also sends one when it starts. If it has
@@ -230,15 +229,41 @@ defmodule Wagyu.Peer do
   # The deadlines are in the process, so they go with the process when it
   # crashes. The interface's supervisor stops peers with the interface.
   #
+  # Order. The events that the peer acts on come from several processes:
+  # frames from the interface, through the opener or directly, reports
+  # from the sealer, handoffs from workers and configure messages from the
+  # interface. Each sender gives each event an order marker from
+  # `:erlang.unique_integer([:monotonic])` when it sends it. These markers
+  # increase strictly across all processes of the node. The opener delays
+  # frames, so it reports the markers that the interface gave them, and not
+  # markers of its own.
+  #
+  # Thus the peer can order events that do not come through its mailbox,
+  # and the result is the same as when it took them all from one mailbox:
+  #
+  #   * The new-handshake timer records the marker of the sealer report
+  #     that armed it. Only an authenticated message with a greater marker
+  #     cancels it.
+  #   * The endpoint records the marker of the event that set it: a
+  #     response, a handoff, a configure message with a new endpoint, or a
+  #     report of the opener. Only an event with a greater marker changes
+  #     the endpoint.
+  #
+  # One action cannot wait for a delayed report: a new key pair that
+  # displaces a pending `:next`. Before that, the peer asks the opener
+  # whether a message already authenticated under `:next`
+  # (`Wagyu.Peer.Opener.confirmed?/2`). If one did, the peer promotes it
+  # first, as when it took that message itself.
+  #
   # Endpoint. Each time the endpoint changes, the peer tells the interface
   # (`Wagyu.Interface.endpoint_learned/4`). The interface starts the next
   # process of the key with the last endpoint. Thus the endpoint stays when
   # the process exits.
   #
   # Configuration. When the peer set of the interface changes, the peer can
-  # get `{:wg_configure, peer}`. The message has the new configuration of
-  # this peer. The peer keeps its key pairs, replay windows, timers and
-  # staged packets:
+  # get `{:wg_configure, peer, marker}`. The message has the new
+  # configuration of this peer. The peer keeps its key pairs, replay
+  # windows, timers and staged packets:
   #
   #   * New handshakes use the new preshared key. The key pairs that the
   #     peer has stay valid until they expire.
@@ -275,7 +300,7 @@ defmodule Wagyu.Peer do
   alias Wagyu.Noise
   alias Wagyu.Packet
   alias Wagyu.Packet.{CookieReply, Response}
-  alias Wagyu.Peer.Sealer
+  alias Wagyu.Peer.{Opener, Sealer}
   alias Wagyu.TAI64N
 
   # WireGuard's timer constants, in milliseconds.
@@ -348,8 +373,10 @@ defmodule Wagyu.Peer do
       staged_seen: 0,
       inbound_dropped: 0,
       persistent_keepalive: peer.persistent_keepalive * 1_000,
-      # The marker that the peer took when it armed the new-handshake timer.
+      # The order marker of the event that armed the new-handshake timer, and
+      # of the event that set the endpoint, or nil (see "Order" above).
       new_handshake_marker: nil,
+      endpoint_marker: nil,
       configured: 0,
       last_minute_rekey: false,
       timers: %{},
@@ -366,16 +393,16 @@ defmodule Wagyu.Peer do
 
   # The interface sends only responses and cookie replies to the peer.
   @impl true
-  def handle_info({:wg_frame, index, frame, source}, state) do
-    state = receive_frame(state, index, frame, source)
+  def handle_info({:wg_frame, index, frame, source, marker}, state) do
+    state = receive_frame(state, index, frame, source, marker)
     Admission.release(state.inbound, 1, byte_size(frame))
     {:noreply, arm(state)}
   end
 
   # The events of the sealer change the timers, and they can start a
   # handshake.
-  def handle_info({:wg_sealed, events, trigger, index, staged}, state) do
-    state = Enum.reduce(events, %{state | staged_seen: staged}, &sent_authenticated(&2, &1))
+  def handle_info({:wg_sealed, events, trigger, index, staged, marker}, state) do
+    state = Enum.reduce(events, %{state | staged_seen: staged}, &sent_authenticated(&2, &1, marker))
     state = if trigger && not replaced?(state, trigger, index), do: initiate(state, trigger), else: state
     {:noreply, arm(state)}
   end
@@ -383,15 +410,15 @@ defmodule Wagyu.Peer do
   # The events of the opener change the timers and the endpoint, and they
   # can confirm a key. The endpoint goes to the sealer before the promotion.
   # Thus the staged packets go to the endpoint that the confirming message
-  # can set.
-  #
-  # The interface admitted the frames of a report with a lower configure
-  # number than the peer's before the latest configure message. Their
-  # source is older than the configuration, so the peer does not learn it.
-  # The opener reports the source of each batch, so a source that is still
-  # current comes again with the next one.
-  def handle_info({:wg_opened, events, source, confirmed, configured, authenticated}, state) do
-    state = if source && configured >= state.configured, do: learn_endpoint(state, source), else: state
+  # can set. `source` and `authenticated` carry the order markers of their
+  # frames.
+  def handle_info({:wg_opened, events, source, confirmed, authenticated}, state) do
+    state =
+      case source do
+        {endpoint, marker} -> learn_endpoint(state, endpoint, marker)
+        nil -> state
+      end
+
     state = received_authenticated(state, authenticated)
     state = if :data in events, do: received_data(state), else: state
     state = Enum.reduce(confirmed, state, &promote(&2, &1))
@@ -418,7 +445,7 @@ defmodule Wagyu.Peer do
     do: Wagyu.Redact.format_status(status, [:identity, :peer], message: &redact_message/1)
 
   # The configuration in a configure message holds the preshared key.
-  defp redact_message({:wg_configure, %Config.Peer{}}), do: {:wg_configure, :redacted}
+  defp redact_message({:wg_configure, %Config.Peer{}, marker}), do: {:wg_configure, :redacted, marker}
   defp redact_message(message), do: message
 
   defp handle({:wg_handoff, ticket, metadata}, state) do
@@ -431,13 +458,13 @@ defmodule Wagyu.Peer do
     {:noreply, state}
   end
 
-  defp handle({:wg_configure, %Config.Peer{} = peer}, state) do
+  defp handle({:wg_configure, %Config.Peer{} = peer, marker}, state) do
     old = state.peer
     state = %{state | peer: peer, configured: state.configured + 1}
 
     state =
       if peer.endpoint != nil and peer.endpoint != old.endpoint,
-        do: %{state | endpoint: endpoint(peer.endpoint)},
+        do: %{state | endpoint: endpoint(peer.endpoint), endpoint_marker: marker},
         else: state
 
     # The interface ignores the endpoints that the peer reported before
@@ -520,7 +547,7 @@ defmodule Wagyu.Peer do
     end
   end
 
-  defp respond(state, session, index, %{sender_index: remote_index, timestamp: timestamp, source: source}) do
+  defp respond(state, session, index, %{sender_index: remote_index, timestamp: timestamp, source: source} = metadata) do
     case Noise.write_response(session, index, remote_index, state.mac1_key, cookie(state)) do
       {:ok, frame} ->
         key_pair = key_pair(index, remote_index, state.clock.(), false)
@@ -528,12 +555,13 @@ defmodule Wagyu.Peer do
         state =
           state
           |> sent_mac1(frame)
-          |> received_authenticated()
+          |> received_authenticated(metadata.marker)
           |> install_next(key_pair)
           |> split(session, key_pair, :next)
           |> new_key_pair()
 
-        transmit(%{learn_endpoint(state, source) | received: timestamp}, frame, :responses_sent)
+        state = learn_endpoint(state, source, metadata.marker)
+        transmit(%{state | received: timestamp}, frame, :responses_sent)
 
       :error ->
         :ok = Decibel.close(session)
@@ -609,9 +637,9 @@ defmodule Wagyu.Peer do
   # Inbound frames
 
   # The interface sends transport messages to the opener.
-  defp receive_frame(state, index, frame, source) do
+  defp receive_frame(state, index, frame, source, marker) do
     case Packet.decode(frame) do
-      {:ok, %Response{} = response} -> response(state, index, response, source)
+      {:ok, %Response{} = response} -> response(state, index, response, source, marker)
       {:ok, %CookieReply{} = reply} -> cookie_reply(state, reply)
       _unexpected -> dropped(state)
     end
@@ -641,7 +669,7 @@ defmodule Wagyu.Peer do
     %{state | last_mac1: mac1}
   end
 
-  defp response(state, index, response, source) do
+  defp response(state, index, response, source, marker) do
     with %{local_index: ^index, session: session, sent_at: sent_at} <- state.initiation,
          :ok <- Noise.read_response(session, response) do
       # The initiator's key is as old as its initiation. The responder's key
@@ -652,8 +680,8 @@ defmodule Wagyu.Peer do
 
       # The sealer sends a keepalive if it has no staged packet. This
       # confirms the key to the responder.
-      %{learn_endpoint(state, source) | initiation: nil}
-      |> received_authenticated()
+      %{learn_endpoint(state, source, marker) | initiation: nil}
+      |> received_authenticated(marker)
       |> install_current(key_pair)
       |> split(session, key_pair, true)
       |> new_key_pair()
@@ -694,14 +722,30 @@ defmodule Wagyu.Peer do
   # REJECT_AFTER_TIME: a key that is this old does not send or receive.
   defp fresh?(state, key_pair), do: state.clock.() - key_pair.created_at < @reject_after_time
 
-  defp install_next(state, key_pair), do: %{discard(state, [:next, :previous]) | next: key_pair}
+  defp install_next(state, key_pair) do
+    state = confirm_pending(state)
+    %{discard(state, [:next, :previous]) | next: key_pair}
+  end
 
-  defp install_current(%{next: nil} = state, key_pair) do
+  defp install_current(state, key_pair), do: state |> confirm_pending() |> replace_current(key_pair)
+
+  # A pending `:next` can be confirmed already by a frame that waits in the
+  # batch of the opener. The peer asks the opener before a new key pair
+  # displaces it. The opener answers after all the frames that the
+  # interface admitted before the call, so the answer is the same as when
+  # the peer took those frames itself (see "Order" above).
+  defp confirm_pending(%{next: %{local_index: index}} = state) do
+    if Opener.confirmed?(state.opener, index), do: promote(state, index), else: state
+  end
+
+  defp confirm_pending(state), do: state
+
+  defp replace_current(%{next: nil} = state, key_pair) do
     state = discard(state, [:previous])
     %{state | previous: state.current, current: key_pair}
   end
 
-  defp install_current(state, key_pair) do
+  defp replace_current(state, key_pair) do
     state = discard(state, [:previous, :current])
     %{state | previous: state.next, next: nil, current: key_pair}
   end
@@ -809,35 +853,38 @@ defmodule Wagyu.Peer do
 
   # Timer events
 
-  defp sent_authenticated(state, event) when event in [:initiations_sent, :responses_sent],
+  # `marker` is the order marker of the send. A handshake message that the
+  # peer sends itself has none.
+  defp sent_authenticated(state, event, marker \\ nil)
+
+  defp sent_authenticated(state, event, _marker) when event in [:initiations_sent, :responses_sent],
     do: %{state | handshake_sent_at: state.clock.()} |> cancel_timer(:keepalive) |> persistent_keepalive()
 
-  defp sent_authenticated(state, event) do
+  defp sent_authenticated(state, event, marker) do
     state = state |> cancel_timer(:keepalive) |> persistent_keepalive()
 
-    if event == :transport_sent, do: arm_new_handshake(state), else: state
+    if event == :transport_sent, do: arm_new_handshake(state, marker), else: state
   end
 
   # The timer runs from the first send that has no answer. Thus a later send
   # does not move it.
-  defp arm_new_handshake(state) do
+  defp arm_new_handshake(state, marker) do
     if pending?(state, :new_handshake) do
       state
     else
       state = set_timer(state, :new_handshake, state.clock.() + @keepalive_timeout + @rekey_timeout + jitter())
-      %{state | new_handshake_marker: :erlang.unique_integer([:monotonic])}
+      %{state | new_handshake_marker: marker}
     end
   end
 
-  # `marker` is the marker of a transport message that the opener reported
-  # (see `Wagyu.Peer.Opener`). A message that authenticated before the peer
-  # armed the new-handshake timer does not answer the send that armed it. A
-  # handshake message that the peer takes itself always answers it.
-  defp received_authenticated(state, marker \\ :always) do
+  # `marker` is the order marker of the authenticated message. A message
+  # that the interface admitted before the sealer reported the send that
+  # armed the new-handshake timer does not answer that send.
+  defp received_authenticated(state, marker) do
     state =
-      if marker == :always or not pending?(state, :new_handshake) or marker > state.new_handshake_marker,
-        do: cancel_timer(state, :new_handshake),
-        else: state
+      if pending?(state, :new_handshake) and marker < state.new_handshake_marker,
+        do: state,
+        else: cancel_timer(state, :new_handshake)
 
     persistent_keepalive(state)
   end
@@ -961,9 +1008,15 @@ defmodule Wagyu.Peer do
   defp endpoint(nil), do: nil
   defp endpoint(%{address: address, port: port}), do: {address, port}
 
-  defp learn_endpoint(%{endpoint: endpoint} = state, endpoint), do: state
+  # The peer learns an endpoint only from an event that is newer than the
+  # event that set the current endpoint.
+  defp learn_endpoint(%{endpoint_marker: last} = state, _endpoint, marker) when last != nil and marker < last,
+    do: state
 
-  defp learn_endpoint(state, endpoint), do: report_endpoint(%{state | endpoint: endpoint})
+  defp learn_endpoint(%{endpoint: endpoint} = state, endpoint, marker), do: %{state | endpoint_marker: marker}
+
+  defp learn_endpoint(state, endpoint, marker),
+    do: report_endpoint(%{state | endpoint: endpoint, endpoint_marker: marker})
 
   defp close(session) do
     :ok = Decibel.close(session)

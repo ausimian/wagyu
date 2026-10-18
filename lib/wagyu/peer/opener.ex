@@ -7,7 +7,7 @@ defmodule Wagyu.Peer.Opener do
   # slots and the timers.
   #
   # The interface sends each transport message for an index of the peer to
-  # the opener as `{:wg_frame, local_index, frame, source}`, admitted
+  # the opener as `{:wg_frame, local_index, frame, source, marker}`, admitted
   # against the peer's `:inbound` bound. Responses and cookie replies go to
   # the peer, against the same bound.
   #
@@ -46,13 +46,10 @@ defmodule Wagyu.Peer.Opener do
   # it to the link (`Wagyu.Link.deliver_to/2`). It counts and drops all
   # other plaintext.
   #
-  # Configuration. When the interface sends the peer a configure message,
-  # it sends the opener `{:wg_configured, configured, filter}` itself. The
-  # message holds the source filter, and the number of configure messages
-  # that the peer has after it takes its message. Frames that the interface
-  # admitted before the change are in the mailbox before the message. Thus
-  # the old filter applies to them, and the opener reports their source
-  # with the old number.
+  # Source filter. When the filter of the peer changes, the interface sends
+  # `{:wg_filter, filter}` to the opener itself. Frames that the interface
+  # admitted before the change are in the mailbox before the message, so
+  # the old filter applies to them.
   #
   # Batching. Decrypted packets wait in `state.plaintext` while more frames
   # are in the queue. They go to the link together when one of these
@@ -73,36 +70,27 @@ defmodule Wagyu.Peer.Opener do
   # receives, and the endpoint of the peer follows the source of its
   # traffic. When the opener sends packets to the link, or when it took a
   # frame and no packet waits, it sends the peer one `{:wg_opened, events,
-  # source, confirmed, configured, authenticated}` if it has something
-  # to report:
+  # source, confirmed, authenticated}` if it has something to report:
   #
   #   * `events` holds `:authenticated` if a message authenticated, and
   #     `:data` if a message carried a plaintext that was not empty.
-  #   * `source` is the source of the last keepalive, or of the last data
-  #     packet that passed the checks above, or nil.
+  #   * `source` is `{endpoint, marker}` for the last keepalive, or for the
+  #     last data packet that passed the checks above, or nil.
   #   * `confirmed` holds the local index of each pending key under which a
   #     message authenticated for the first time. The peer then promotes the
   #     key pair from `:next` to `:current`.
-  #   * `configured` is the configure number of the last configured message.
-  #     Any other message ends a batch, so all frames of a report have this
-  #     number. The peer does not learn `source` from a report with a lower
-  #     number than its own: the interface admitted those frames before a
-  #     change to the configuration.
-  #   * `authenticated` is the marker of the last message of the report
-  #     that authenticated: an `:erlang.unique_integer([:monotonic])` that
-  #     the opener takes when the message authenticates.
+  #   * `authenticated` is the marker of the last message of the report that
+  #     authenticated.
   #
-  # A report can reach the peer after a report of the sealer about a later
-  # send. The peer arms its new-handshake timer when it learns of a send,
-  # and takes a marker at that time. It cancels the timer only for a report
-  # whose marker is greater. The markers increase strictly across all the
-  # processes of the node. Thus a message that authenticated before the
-  # peer armed the timer never cancels it, and a late receive report cannot
-  # make the peer lose its retry. A message that authenticates after the
-  # send, but before the peer takes the report of the sealer, does not
-  # cancel the timer either. This costs at most one extra handshake, the
-  # same as a late send report, as in wireguard-go. Thus an error can add a
-  # handshake, but never lose one.
+  # Each marker is the order marker that the interface gave the frame when
+  # it admitted it (see `Wagyu.Peer`). The opener only delays the frames.
+  # Thus the peer orders the events of a report by these markers, the same
+  # as if it had taken the frames from its own mailbox.
+  #
+  # Confirmation. Before a new key pair displaces a pending `:next`, the
+  # peer asks the opener whether a message authenticated under it
+  # (`confirmed?/2`). The opener takes the call after all the frames that
+  # the interface admitted before it, so its answer covers them.
   #
   # The opener, the sealer, the sender and the peer are the children of one
   # `Wagyu.Peer.Group`, and they stop together. The group starts the peer
@@ -141,8 +129,8 @@ defmodule Wagyu.Peer.Opener do
   # after the first packet started to wait.
   @no_plaintext %{packets: [], count: 0, frame_bytes: 0, frames: 0}
   # The events that the opener has not reported to the peer yet.
-  # `authenticated` is the marker of the last message that authenticated, or
-  # nil.
+  # `authenticated` is the order marker of the last message that
+  # authenticated, or nil. `source` is `{endpoint, marker}`, or nil.
   @no_events %{authenticated: nil, data: false, source: nil, confirmed: []}
 
   @spec start_link(map()) :: GenServer.on_start()
@@ -158,8 +146,6 @@ defmodule Wagyu.Peer.Opener do
       counters: counters,
       inbound: inbound,
       allowed_ips: allowed_ips,
-      # The configure number of the last `{:wg_configured, ...}`.
-      configured: 0,
       owner: nil,
       keys: %{},
       plaintext: @no_plaintext,
@@ -179,10 +165,23 @@ defmodule Wagyu.Peer.Opener do
     end
   end
 
+  @doc """
+  Returns true if a message authenticated under the pending key of
+  `local_index`. The opener answers after it took all the frames that came
+  before the call. Returns false if the opener does not run.
+  """
+  @spec confirmed?(pid(), non_neg_integer()) :: boolean()
+  def confirmed?(opener, local_index) do
+    GenServer.call(opener, {:wg_confirmed?, local_index}, :infinity)
+  catch
+    # The group stops the opener with the peer.
+    :exit, _reason -> false
+  end
+
   @impl true
-  def handle_info({:wg_frame, index, frame, source}, state) do
+  def handle_info({:wg_frame, index, frame, source, marker}, state) do
     waiting = state.plaintext.count
-    state = receive_frame(state, index, frame, source)
+    state = receive_frame(state, index, frame, source, marker)
 
     # If the packet of a frame now waits for the link, the opener releases
     # the frame with the packet.
@@ -211,6 +210,14 @@ defmodule Wagyu.Peer.Opener do
   # Any other message ends a run of frames, so their packets go first.
   def handle_info(message, state), do: handle(message, settle(state))
 
+  # A key is confirmed when a message authenticated under it, also if the
+  # opener has not reported that message yet.
+  @impl true
+  def handle_call({:wg_confirmed?, index}, _from, state) do
+    state = settle(state)
+    {:reply, match?(%{^index => %{pending: false}}, state.keys), state}
+  end
+
   @impl true
   # The keys hold session handles and replay windows. Neither holds Noise
   # state.
@@ -231,8 +238,7 @@ defmodule Wagyu.Peer.Opener do
 
   defp handle({:wg_discard, index}, state), do: {:noreply, close_key(state, index)}
 
-  defp handle({:wg_configured, configured, filter}, state),
-    do: {:noreply, %{state | configured: configured, allowed_ips: filter}}
+  defp handle({:wg_filter, filter}, state), do: {:noreply, %{state | allowed_ips: filter}}
 
   # The mailbox became empty while packets waited for the link. `settle/1`
   # already sent them to the link.
@@ -246,9 +252,9 @@ defmodule Wagyu.Peer.Opener do
   # Inbound frames
 
   # The interface sends only transport messages to the opener.
-  defp receive_frame(state, index, frame, source) do
+  defp receive_frame(state, index, frame, source, marker) do
     case Packet.decode(frame) do
-      {:ok, %Transport{} = transport} -> transport(state, index, transport, source)
+      {:ok, %Transport{} = transport} -> transport(state, index, transport, {source, marker})
       _unexpected -> dropped(state)
     end
   end
@@ -262,7 +268,8 @@ defmodule Wagyu.Peer.Opener do
          {:replay, :ok} <- {:replay, ReplayWindow.check(key.replay, counter)},
          {:ok, plaintext} <- Noise.open(key.session, transport) do
       state = put_in(state.keys[index], %{key | replay: ReplayWindow.commit(key.replay, counter), pending: false})
-      state = %{state | events: %{state.events | authenticated: :erlang.unique_integer([:monotonic])}}
+      {_endpoint, marker} = source
+      state = %{state | events: %{state.events | authenticated: marker}}
       state = if key.pending, do: update_in(state.events.confirmed, &[index | &1]), else: state
       receive_plaintext(state, plaintext, source)
     else
@@ -333,10 +340,7 @@ defmodule Wagyu.Peer.Opener do
   defp report(%{events: events} = state) do
     confirmed = Enum.reverse(events.confirmed)
 
-    send(
-      state.owner,
-      {:wg_opened, events_list(events), events.source, confirmed, state.configured, events.authenticated}
-    )
+    send(state.owner, {:wg_opened, events_list(events), events.source, confirmed, events.authenticated})
 
     %{state | events: @no_events}
   end

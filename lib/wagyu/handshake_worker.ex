@@ -154,7 +154,8 @@ defmodule Wagyu.HandshakeWorker do
   defp hand_off({:ok, session}, peer, metadata) do
     case handoff(session, peer) do
       {:ok, ticket} ->
-        send(peer, {:wg_handoff, ticket, metadata})
+        # The order marker of the handoff (see `Wagyu.Peer`).
+        send(peer, {:wg_handoff, ticket, Map.put(metadata, :marker, :erlang.unique_integer([:monotonic]))})
         {:ok, peer}
 
       {:error, _reason} = error ->

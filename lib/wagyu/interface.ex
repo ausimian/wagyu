@@ -129,22 +129,22 @@ defmodule Wagyu.Interface do
   #     its process with `:shutdown`. It does not wait for the exit, and it
   #     ignores the exit when it arrives. It also discards the learned
   #     endpoint of the key.
-  #   * It sends `{:wg_configure, peer}` to a running peer whose endpoint,
-  #     preshared key, persistent keepalive or source filter changed. With
-  #     each configure message, it sends the opener of the peer
-  #     `{:wg_configured, configured, filter}`: the number of configure
-  #     messages that the peer has after it takes this one, and the source
-  #     filter. A change to the AllowedIPs of one peer can change the filter
-  #     of a different peer, because prefixes can nest. Thus the interface
-  #     computes the filter of each running peer again.
+  #   * It sends `{:wg_configure, peer, marker}` to a running peer whose
+  #     endpoint, preshared key, persistent keepalive or source filter
+  #     changed. `marker` is an order marker (see `Wagyu.Peer`). It sends a
+  #     changed source filter to the opener of the peer as `{:wg_filter,
+  #     filter}`. A change to the AllowedIPs of one peer can change the
+  #     filter of a different peer, because prefixes can nest. Thus the
+  #     interface computes the filter of each running peer again.
   #   * It starts an added peer, or a peer whose persistent keepalive
   #     changes from 0, if that peer has a persistent keepalive.
   #
   # Frames that the interface admitted to an opener before the change are
-  # in the mailbox of the opener before the configured message. Thus the
-  # opener checks them against the filter that was in force when they were
-  # admitted, and reports their source with the configure number of that
-  # time. Egress routes immediately with the new table.
+  # in the mailbox of the opener before the filter message. Thus the opener
+  # checks them against the filter that was in force when they were
+  # admitted. Their order markers are lower than the marker of the
+  # configure message, so a source from them does not replace a new
+  # endpoint. Egress routes immediately with the new table.
   #
   # A peer can learn an endpoint before it takes a configure message. The
   # interface counts the configure messages that it sends to each process,
@@ -903,7 +903,9 @@ defmodule Wagyu.Interface do
          %{^key => %{pid: ^pid} = peer} <- state.peers do
       case Admission.admit(peer.inbound, 1, byte_size(frame)) do
         :ok ->
-          send(Map.fetch!(peer, target), {:wg_frame, index, frame, source})
+          # The order marker of the frame (see `Wagyu.Peer`).
+          marker = :erlang.unique_integer([:monotonic])
+          send(Map.fetch!(peer, target), {:wg_frame, index, frame, source, marker})
           count(state, :inbound_routed, state)
 
         :full ->
@@ -1289,8 +1291,8 @@ defmodule Wagyu.Interface do
     filter = if filters?, do: AllowedIPs.source_filter(state.config.allowed_ips, key), else: running.filter
 
     if changed? or filter != running.filter do
-      send(running.opener, {:wg_configured, running.configured + 1, filter})
-      send(running.pid, {:wg_configure, Map.fetch!(state.config.peers, key)})
+      if filter != running.filter, do: send(running.opener, {:wg_filter, filter})
+      send(running.pid, {:wg_configure, Map.fetch!(state.config.peers, key), :erlang.unique_integer([:monotonic])})
       running = %{running | filter: filter, configured: running.configured + 1}
       %{state | peers: Map.put(state.peers, key, running)}
     else

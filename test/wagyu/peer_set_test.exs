@@ -983,8 +983,8 @@ defmodule Wagyu.PeerSetTest do
       assert %{message: {:"$gen_call", _from, {:put, :redacted}}} =
                Wagyu.ConfigStore.format_status(%{message: {:"$gen_call", {self(), make_ref()}, {:put, config}}})
 
-      assert %{message: {:wg_configure, :redacted}} =
-               Wagyu.Peer.format_status(%{message: {:wg_configure, config.peers[context.a.key]}})
+      assert %{message: {:wg_configure, :redacted, 1}} =
+               Wagyu.Peer.format_status(%{message: {:wg_configure, config.peers[context.a.key], 1}})
     end
   end
 end

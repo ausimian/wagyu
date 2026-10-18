@@ -311,7 +311,9 @@ defmodule Wagyu.HandshakeTest do
     assert %{initiations_unavailable: 1, initiations_accepted: 3} = settled(context)
 
     # After the peer takes its handoffs, the interface accepts the same
-    # initiation.
+    # initiation. Before a handoff displaces the pending key of the first
+    # handshake, the peer asks the opener about it.
+    :ok = :sys.resume(opener(peer))
     :ok = :sys.resume(peer)
     assert %{peer: ^peer} = responded(context, timestamp(3))
     assert Admission.usage(handoffs) == {0, 0}

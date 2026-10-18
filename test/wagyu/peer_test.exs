@@ -144,12 +144,21 @@ defmodule Wagyu.PeerTest do
   end
 
   # The remote party sends a keepalive. Returns the state of the peer after
-  # the peer takes the keepalive.
+  # the peer takes the report of the opener about the keepalive.
   defp remote_keepalive(context, peer, session, index) do
     %{keepalives_received: received} = counters(context.interface)
     to_wagyu(context, transport_frame(session, index))
     counters(context.interface, &(&1.keepalives_received == received + 1))
+    _opener = :sys.get_state(opener(peer))
     :sys.get_state(peer)
+  end
+
+  # Sends a frame from the remote party, and waits until the interface
+  # routes it.
+  defp routed(context, frame, from \\ nil) do
+    %{inbound_routed: routed} = counters(context.interface)
+    to_wagyu(context, frame, from)
+    counters(context.interface, &(&1.inbound_routed == routed + 1))
   end
 
   defp strictly_increasing?(timestamps),
@@ -370,21 +379,54 @@ defmodule Wagyu.PeerTest do
       assert Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
     end
 
-    test "a receive report about a message before the send does not cancel the new-handshake timer", context do
-      # The staged packet that confirms the key arms the timer.
-      {peer, _clock, _session, _index} = initiated(context)
-      _sealer = :sys.get_state(sealer(peer))
-      %{new_handshake_marker: armed, configured: configured} = state = :sys.get_state(peer)
-      assert Map.has_key?(state.timers, :new_handshake)
+    test "a frame that arrives before a send does not answer it, also if the opener takes it later", context do
+      {peer, _clock, session, index} = initiated(context)
+      refute Map.has_key?(remote_keepalive(context, peer, session, index).timers, :new_handshake)
 
-      # The opener reports a message that authenticated before the send. Its
-      # report arrives after the report of the sealer.
-      send(peer, {:wg_opened, [:authenticated], nil, [], configured, armed - 1})
+      # A keepalive from the remote party waits for the opener. Then the
+      # sealer sends data, and its report arms the timer.
+      opener = opener(peer)
+      :ok = :sys.suspend(opener)
+      routed(context, transport_frame(session, index))
+      demand(context)
+      assert <<4, 0, 0, 0, _rest::binary>> = receive_datagram(context)
+      _sealer = :sys.get_state(sealer(peer))
       assert Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
 
-      # A message that authenticated after the send answers it.
-      send(peer, {:wg_opened, [:authenticated], nil, [], configured, armed + 1})
-      refute Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
+      # The opener reports the keepalive after the peer armed the timer. The
+      # keepalive arrived before the send, so the timer stays.
+      :ok = :sys.resume(opener)
+      _opener = :sys.get_state(opener)
+      assert %{keepalives_received: 2} = counters(context.interface)
+      assert Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
+    end
+
+    test "a frame that arrives before a response from a new address does not replace that endpoint", context do
+      {peer, clock, session, index} = initiated(context)
+      {:ok, old} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+      {:ok, moved} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+      {:ok, moved_port} = :inet.port(moved)
+
+      # A keepalive under the current key, from another address, waits for
+      # the opener.
+      opener = opener(peer)
+      :ok = :sys.suspend(opener)
+      routed(context, transport_frame(session, index), old)
+
+      # The peer rekeys, and the response comes from a new address.
+      advance(clock, 5_000)
+      send(peer, :wg_initiate)
+      {response, _session, _sent} = respond_to(receive_datagram(context), context.remote, 100)
+      to_wagyu(context, response, moved)
+      assert eventually(fn -> :sys.get_state(peer).endpoint == {{127, 0, 0, 1}, moved_port} end)
+
+      # The opener reports the keepalive after the response. The keepalive
+      # arrived first, so its address does not become the endpoint.
+      :ok = :sys.resume(opener)
+      _opener = :sys.get_state(opener)
+      assert %{keepalives_received: 1} = counters(context.interface)
+      assert %{endpoint: endpoint, previous: %{local_index: ^index}} = :sys.get_state(peer)
+      assert endpoint == {{127, 0, 0, 1}, moved_port}
     end
 
     test "a response with the wrong index, MAC1 or authentication changes nothing", context do
@@ -668,6 +710,29 @@ defmodule Wagyu.PeerTest do
       assert peer(context) == peer
       assert [_one] = DynamicSupervisor.which_children(context.children.peer_supervisor)
       assert %{responses_sent: 3} = counters(context.interface)
+    end
+
+    test "a key that a waiting frame confirmed is promoted before a newer handshake displaces it", context do
+      {first, first_index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+
+      # The initiator sends under the new key, and its frame waits for the
+      # opener. Then a newer handshake reaches the peer, which asks the
+      # opener about the pending key before it responds.
+      opener = opener(peer)
+      :ok = :sys.suspend(opener)
+      routed(context, transport_frame(first, first_index))
+      advance(context.clock, 20)
+      {initiation, _session} = initiate_to(context.public_key, context.remote, timestamp(2), 2)
+      to_wagyu(context, initiation)
+      assert eventually(fn -> Process.info(opener, :message_queue_len) == {:message_queue_len, 2} end)
+
+      # The opener takes the frame before the question. Thus the first key
+      # is confirmed, and the newer handshake becomes `:next`.
+      :ok = :sys.resume(opener)
+      assert <<2, 0, 0, 0, second_index::little-32, 2::little-32, _rest::binary>> = receive_datagram(context)
+      assert slots(peer) == %{next: second_index, current: first_index, previous: nil}
+      assert %{keys_confirmed: 1} = counters(context.interface)
     end
 
     test "an unconfirmed key is replaced by a newer handshake, and kept when the peer initiates", context do

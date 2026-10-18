@@ -47,8 +47,8 @@ defmodule Wagyu.Peer.Sealer do
   #
   # Events for the peer. The timers of the peer depend on what the sealer
   # sends, and the sealer can need a handshake. After each message, the
-  # sealer sends the peer one `{:wg_sealed, events, trigger, index, number}`
-  # if it has something to report:
+  # sealer sends the peer one `{:wg_sealed, events, trigger, index, number,
+  # marker}` if it has something to report:
   #
   #   * `events` holds `:transport_sent` if the sealer sent data and
   #     `:keepalives_sent` if it sent a keepalive.
@@ -61,6 +61,10 @@ defmodule Wagyu.Peer.Sealer do
   #   * `number` is the sequence number of the last packet that the sealer
   #     staged. When a handshake attempt fails, or the keys expire, the peer
   #     drops only the staged packets up to the last number that it saw.
+  #   * `marker` is the order marker (see `Wagyu.Peer`) that the sealer took
+  #     before it gave the first frame of the message to the sender, or nil
+  #     if it sent nothing. Thus each answer to the frames has a greater
+  #     marker.
   #
   # The peer applies the events in the order of its mailbox. Local messages
   # join the mailbox when they are sent, and the sealer sends its report in
@@ -133,6 +137,8 @@ defmodule Wagyu.Peer.Sealer do
       staged_number: 0,
       events: [],
       trigger: nil,
+      # The order marker of the first send of this message, or nil.
+      marker: nil,
       clock: fn -> System.monotonic_time(:millisecond) end
     }
 
@@ -237,8 +243,9 @@ defmodule Wagyu.Peer.Sealer do
   defp report(%{events: [], trigger: nil} = state), do: state
 
   defp report(state) do
-    send(state.owner, {:wg_sealed, Enum.uniq(state.events), state.trigger, key_index(state), state.staged_number})
-    %{state | events: [], trigger: nil}
+    report = {:wg_sealed, Enum.uniq(state.events), state.trigger, key_index(state), state.staged_number, state.marker}
+    send(state.owner, report)
+    %{state | events: [], trigger: nil, marker: nil}
   end
 
   defp key_index(%{key: nil}), do: nil
@@ -370,6 +377,7 @@ defmodule Wagyu.Peer.Sealer do
   # learns the endpoint of a handshake before it moves a key to the sealer.
   # Thus the endpoint is never nil here.
   defp transmit(%{endpoint: {_address, _port} = endpoint} = state, frames, event, bound \\ :outbound) do
+    state = if state.marker, do: state, else: %{state | marker: :erlang.unique_integer([:monotonic])}
     send(state.sender, {:wg_send, endpoint, frames, event, bound})
     event(state, event)
   end
