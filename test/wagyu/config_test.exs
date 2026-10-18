@@ -83,6 +83,7 @@ defmodule Wagyu.ConfigTest do
       assert {:ok, config} = Config.new(private_key: private_key)
       assert config.name == nil
       assert config.listen == %{address: {0, 0, 0, 0}, port: 0}
+      assert config.receive_buffer == nil
       assert config.stack == [addresses: [], routes: [], mtu: 1420, sockets: 64]
       assert config.peers == %{}
       assert AllowedIPs.to_list(config.allowed_ips) == []
@@ -130,6 +131,20 @@ defmodule Wagyu.ConfigTest do
       assert Config.new([{"private_key", options[:private_key]}]) == invalid([], :invalid)
       assert Config.new(options ++ [mtu: 1420]) == invalid([:mtu], :unknown)
       assert Config.new(options ++ [peers: []]) == invalid([:peers], :duplicate)
+    end
+
+    test "limit the receive buffer to 65536..2147483647" do
+      for size <- [65_536, 4_194_304, 2_147_483_647] do
+        assert {:ok, %Config{receive_buffer: ^size}} = Config.new(options(receive_buffer: size))
+      end
+
+      for size <- [-1, 0, 65_535, 2_147_483_648] do
+        assert Config.new(options(receive_buffer: size)) == invalid([:receive_buffer], :out_of_range)
+      end
+
+      for size <- [65_536.0, nil, :max] do
+        assert Config.new(options(receive_buffer: size)) == invalid([:receive_buffer], :invalid)
+      end
     end
 
     test "reject invalid names" do

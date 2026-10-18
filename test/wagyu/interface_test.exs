@@ -30,6 +30,26 @@ defmodule Wagyu.InterfaceTest do
     :ok
   end
 
+  # Starts a second interface, and returns it with the log of its start.
+  # Other tests run at the same time. Thus a test finds the messages of this
+  # interface by its port.
+  defp start_logged(options) do
+    with_log(fn -> start_supervised!(Supervisor.child_spec({Wagyu, options}, id: :logged)) end)
+  end
+
+  # The largest receive buffer that the OS gives, as the OS reports it.
+  # Linux reports double its limit.
+  defp max_receive_buffer do
+    case :os.type() do
+      {:unix, :linux} ->
+        2 * ("/proc/sys/net/core/rmem_max" |> File.read!() |> String.trim() |> String.to_integer())
+
+      {:unix, :darwin} ->
+        {limit, 0} = System.cmd("sysctl", ["-n", "kern.ipc.maxsockbuf"])
+        limit |> String.trim() |> String.to_integer()
+    end
+  end
+
   defp running_peers(interface) do
     {:ok, %{peers: peers}} = Wagyu.info(interface)
     for %{running: true, public_key: key} <- peers, do: key
@@ -180,23 +200,29 @@ defmodule Wagyu.InterfaceTest do
       assert options[:recbuf] >= 65_536
     end
 
-    # The OS sets the size of the buffer. Thus a host with a small limit
-    # (Linux with the default net.core.rmem_max) tests the warning, and a
-    # host with a large limit (macOS) tests that no warning occurs.
-    test "warns if the receive buffer of its socket is smaller than the request" do
-      {interface, log} = with_log(fn -> start_supervised!(Supervisor.child_spec({Wagyu, options()}, id: :recbuf)) end)
-      %{socket: socket, port: port} = :sys.get_state(child(interface, :interface))
+    test "by default, gets the largest receive buffer that the OS allows", context do
+      %{socket: socket} = :sys.get_state(child(context.interface, :interface))
       {:ok, [recbuf: recbuf]} = :inet.getopts(socket, [:recbuf])
-      # Other tests run at the same time. The port identifies the warning
-      # of this interface.
-      warning = "UDP socket on 127.0.0.1 port #{port} has a receive buffer of #{recbuf} bytes"
 
-      if recbuf < 1_048_576 do
-        assert log =~ warning
-        assert log =~ "net.core.rmem_max"
-      else
-        refute log =~ "port #{port} has a receive buffer"
-      end
+      assert {:ok, %{receive_buffer: ^recbuf}} = Wagyu.info(context.interface)
+      assert recbuf == max_receive_buffer()
+    end
+
+    test "requests the configured receive buffer" do
+      {interface, log} = start_logged(options(receive_buffer: 65_536))
+      {:ok, %{listen: %{port: port}, receive_buffer: recbuf}} = Wagyu.info(interface)
+
+      # Linux reports double the size.
+      assert recbuf in [65_536, 131_072]
+      refute log =~ "port #{port} has a receive buffer"
+    end
+
+    test "warns if the OS gives less than the configured receive buffer" do
+      {interface, log} = start_logged(options(receive_buffer: 2_147_483_647))
+      {:ok, %{listen: %{port: port}, receive_buffer: recbuf}} = Wagyu.info(interface)
+
+      assert recbuf == max_receive_buffer()
+      assert log =~ "port #{port} has a receive buffer of #{recbuf} bytes"
     end
 
     test "stops when its socket closes", context do

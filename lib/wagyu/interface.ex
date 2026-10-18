@@ -221,21 +221,16 @@ defmodule Wagyu.Interface do
   # OTP 27 gives a UDP socket an 8 KiB receive buffer. A burst of small
   # datagrams can overflow it while the interface is busy. OTP 28 uses the
   # OS default. The interface sets the size explicitly, to get the same
-  # behavior on both.
-  #
-  # The kernel can give a smaller buffer than the request. Linux limits the
-  # request to `net.core.rmem_max`, which is 212,992 bytes on Debian. Then a
-  # burst from a kernel WireGuard peer overflows the buffer, and the kernel
-  # drops datagrams that the interface does not count (#65). Thus the
-  # interface logs a warning if the buffer that the OS reports is smaller
-  # than the request. Linux doubles the limited value for its overhead, and
-  # reports the doubled value. Thus the warning starts only when `rmem_max`
-  # is less than half of the request.
-  #
+  # behavior on both. If the `:receive_buffer` option is not set, the
+  # interface requests this size, the largest that `setsockopt` accepts.
+  # Linux and macOS limit a larger request to their maximum without an
+  # error. Thus the socket gets the largest buffer that the OS allows. With
+  # a smaller buffer, a burst from a kernel WireGuard peer overflowed it, and
+  # the kernel dropped datagrams that the interface does not count (#65).
+  @max_recbuf 2_147_483_647
   # The buffer of the backend must hold the largest datagram completely. A
   # transport message is up to the MTU plus 32 bytes, and the MTU can be up
   # to 65,475.
-  @recbuf 1_048_576
   @buffer 65_535
   # The socket backend sends from the calling process through the socket
   # NIF. For each datagram, it is about 25% faster than the inet driver.
@@ -573,15 +568,15 @@ defmodule Wagyu.Interface do
     Process.flag(:trap_exit, true)
 
     with {:config, {:ok, config}} <- {:config, ConfigStore.fetch(root)},
-         {:ok, socket, port} <- open_socket(config.listen) do
-      start(root, config, socket, port)
+         {:ok, socket, port, recbuf} <- open_socket(config) do
+      start(root, config, socket, port, recbuf)
     else
       {:config, :error} -> {:stop, :config_unavailable}
       {:error, reason} -> {:stop, reason}
     end
   end
 
-  defp start(root, config, socket, port) do
+  defp start(root, config, socket, port, recbuf) do
     egress = Admission.new(@egress_packets, @egress_bytes)
     credit = EgressCredit.new()
     :ok = Wagyu.Registry.register(root, :interface, %{egress: egress, credit: credit})
@@ -595,6 +590,7 @@ defmodule Wagyu.Interface do
        # monitor reports that it closed.
        socket_monitor: :inet.monitor(socket),
        port: port,
+       recbuf: recbuf,
        mac1_key: Packet.mac1_key(config.public_key),
        egress: egress,
        credit: credit,
@@ -623,6 +619,7 @@ defmodule Wagyu.Interface do
     info = %{
       public_key: state.config.public_key,
       listen: %{state.config.listen | port: state.port},
+      receive_buffer: state.recbuf,
       counters: Map.new(@counters, fn {name, index} -> {name, :counters.get(state.counters, index)} end),
       peers:
         state.config.peers
@@ -1314,15 +1311,14 @@ defmodule Wagyu.Interface do
 
   # Socket
 
-  defp open_socket(%{address: address, port: port}) do
+  defp open_socket(%Config{listen: %{address: address, port: port}} = config) do
     family = if tuple_size(address) == 4, do: [:inet], else: [:inet6, ipv6_v6only: true]
     # The backend option must come first.
     options = [{:inet_backend, inet_backend(address)}, :binary, ip: address, active: @active]
-    options = options ++ [recbuf: @recbuf, buffer: @buffer] ++ family
+    options = options ++ [buffer: @buffer] ++ family
 
     with {:ok, socket, bound} <- open_socket(port, options, @bind_attempts) do
-      check_recbuf(socket, address, bound)
-      {:ok, socket, bound}
+      {:ok, socket, bound, set_recbuf(socket, config.receive_buffer, {address, bound})}
     end
   end
 
@@ -1348,21 +1344,35 @@ defmodule Wagyu.Interface do
     end
   end
 
-  # The check only gives information. If the OS does not report the size,
-  # the interface continues without a warning.
-  defp check_recbuf(socket, address, port) do
-    case :inet.getopts(socket, [:recbuf]) do
-      {:ok, [recbuf: recbuf]} when recbuf < @recbuf ->
+  # The interface sets the size after it opens the socket. Thus a size that
+  # the OS refuses cannot stop the interface. It gets the buffer that the OS
+  # reports, and a warning. The OS can give less than the request. Without
+  # the option, the request is above each limit, so this is not an error.
+  # Linux doubles the size for its overhead, and reports the doubled value.
+  defp set_recbuf(socket, configured, {address, port}) do
+    result = :inet.setopts(socket, recbuf: configured || @max_recbuf)
+    {:ok, [recbuf: recbuf]} = :inet.getopts(socket, [:recbuf])
+    socket_name = "the UDP socket on #{:inet.ntoa(address)} port #{port}"
+
+    case result do
+      {:error, reason} ->
         Logger.warning(
-          "Wagyu: the UDP socket on #{:inet.ntoa(address)} port #{port} has a receive buffer of " <>
-            "#{recbuf} bytes, but the interface requested #{@recbuf} bytes. " <>
-            "The kernel can drop inbound datagrams during a burst. " <>
-            "On Linux, raise net.core.rmem_max, for example to 4194304."
+          "Wagyu: the OS refused the receive buffer of #{socket_name} (#{inspect(reason)}). " <>
+            "The socket has a receive buffer of #{recbuf} bytes."
         )
 
-      _other ->
+      :ok when configured != nil and recbuf < configured ->
+        Logger.warning(
+          "Wagyu: #{socket_name} has a receive buffer of #{recbuf} bytes, " <>
+            "less than the :receive_buffer option of #{configured} bytes. " <>
+            "The kernel can drop inbound datagrams during a burst. On Linux, raise net.core.rmem_max."
+        )
+
+      :ok ->
         :ok
     end
+
+    recbuf
   end
 
   defp count(state, name, result \\ :ok) do

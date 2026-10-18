@@ -283,15 +283,20 @@ defmodule Wagyu do
 
   ### Receive buffer of the UDP socket
 
-  The interface requests a receive buffer of 1 MiB for its UDP socket. The
-  OS can give a smaller buffer. If the buffer is full, the kernel drops
-  inbound datagrams. `info/1` does not count these drops. A sender sends
-  the lost data again, but TCP through the tunnel stalls until it does.
+  If the receive buffer of the UDP socket is full, the kernel drops inbound
+  datagrams. `info/1` does not count these drops. A sender sends the lost
+  data again, but TCP through the tunnel stalls until it does.
 
-  On Linux, `net.core.rmem_max` limits the buffer. The default is 212,992
-  bytes on many distributions, for example Debian. Thus the interface gets
-  less than it requests. To get the full buffer, raise the limit, for
-  example to 4 MiB:
+  By default, the interface requests the largest buffer that the OS allows.
+  `info/1` gives the size that the OS reports, as `:receive_buffer`. The
+  `:receive_buffer` option of `Wagyu.Config` requests a specific size. If
+  the OS gives a smaller buffer than the option, the interface logs a
+  warning.
+
+  On Linux, `net.core.rmem_max` sets the largest buffer. The default is
+  212,992 bytes on many distributions, for example Debian. A burst from a
+  kernel WireGuard peer can overflow a buffer of this size. To allow a
+  larger buffer, raise the limit, for example to 4 MiB:
 
   ```sh
   sysctl -w net.core.rmem_max=4194304
@@ -301,13 +306,18 @@ defmodule Wagyu do
   setting to a file in `/etc/sysctl.d`. The kernel counts the drops in
   `UdpRcvbufErrors`, for example in the output of `nstat -az UdpRcvbufErrors`.
 
-  On macOS, `kern.ipc.maxsockbuf` limits the buffer. Its default of 8 MiB
-  allows the full buffer.
+  Linux doubles the size for its overhead, and reports the doubled value.
+  Thus, with the default limit, `info/1` gives 425,984 bytes. For the same
+  reason, on Linux the interface logs no warning for the option if
+  `net.core.rmem_max` is at least half of the option.
 
-  If the OS reports a buffer that is smaller than the request, the interface
-  logs a warning when it opens the socket. Linux doubles the limited value
-  for its overhead, and reports the doubled value. Thus Linux gives no
-  warning if `net.core.rmem_max` is at least 512 KiB.
+  On macOS, `kern.ipc.maxsockbuf` sets the largest buffer. The default is
+  8 MiB.
+
+  A larger buffer holds a longer burst. But while the interface reads more
+  slowly than datagrams arrive, a full buffer also delays each datagram for
+  longer. To use a smaller buffer than the limit of the OS, set the
+  `:receive_buffer` option.
   """
 
   alias Wagyu.Config
@@ -321,6 +331,9 @@ defmodule Wagyu do
     * `:public_key` - the interface's public key
     * `:listen` - the address and port of the UDP socket. If the configured
       port is `0`, this is the port that the OS selected.
+    * `:receive_buffer` - the size in bytes of the receive buffer of the UDP
+      socket, as the OS reports it. See
+      [Receive buffer of the UDP socket](#module-receive-buffer-of-the-udp-socket).
     * `:peers` - for each configured peer, its public key, configured
       endpoint and AllowedIPs, and whether its process is `:running`. The
       list is sorted by public key. The process of a peer starts when
@@ -428,6 +441,7 @@ defmodule Wagyu do
   @type info :: %{
           public_key: <<_::256>>,
           listen: %{address: :inet.ip_address(), port: :inet.port_number()},
+          receive_buffer: pos_integer(),
           peers: [
             %{
               public_key: <<_::256>>,
