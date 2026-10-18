@@ -87,10 +87,11 @@ defmodule Wagyu.Peer.Opener do
   # Thus the peer orders the events of a report by these markers, the same
   # as if it had taken the frames from its own mailbox.
   #
-  # Confirmation. Before a new key pair displaces a pending `:next`, the
-  # peer asks the opener whether a message authenticated under it
-  # (`confirmed?/2`). The opener takes the call after all the frames that
-  # the interface admitted before it, so its answer covers them.
+  # Confirmation. Before the peer acts on a pending `:next`, it asks the
+  # opener whether a message authenticated under it before the event that
+  # makes the peer act (`confirmed?/3`). The opener takes the call after all
+  # the frames that the interface admitted before it, so its answer covers
+  # them.
   #
   # The opener, the sealer, the sender and the peer are the children of one
   # `Wagyu.Peer.Group`, and they stop together. The group starts the peer
@@ -166,13 +167,14 @@ defmodule Wagyu.Peer.Opener do
   end
 
   @doc """
-  Returns true if a message authenticated under the pending key of
-  `local_index`. The opener answers after it took all the frames that came
-  before the call. Returns false if the opener does not run.
+  Returns true if a message that is older than the order marker `before`
+  authenticated under the pending key of `local_index`. The opener answers
+  after it took all the frames that came before the call. Returns false if
+  the opener does not run.
   """
-  @spec confirmed?(pid(), non_neg_integer()) :: boolean()
-  def confirmed?(opener, local_index) do
-    GenServer.call(opener, {:wg_confirmed?, local_index}, :infinity)
+  @spec confirmed?(pid(), non_neg_integer(), integer()) :: boolean()
+  def confirmed?(opener, local_index, before) do
+    GenServer.call(opener, {:wg_confirmed?, local_index, before}, :infinity)
   catch
     # The group stops the opener with the peer.
     :exit, _reason -> false
@@ -211,11 +213,16 @@ defmodule Wagyu.Peer.Opener do
   def handle_info(message, state), do: handle(message, settle(state))
 
   # A key is confirmed when a message authenticated under it, also if the
-  # opener has not reported that message yet.
+  # opener has not reported that message yet. A message that is newer than
+  # `before` does not count: the peer took the event of `before` first.
   @impl true
-  def handle_call({:wg_confirmed?, index}, _from, state) do
+  def handle_call({:wg_confirmed?, index, before}, _from, state) do
     state = settle(state)
-    {:reply, match?(%{^index => %{pending: false}}, state.keys), state}
+
+    case state.keys do
+      %{^index => %{confirmed: marker}} when marker != nil -> {:reply, marker < before, state}
+      _not_confirmed -> {:reply, false, state}
+    end
   end
 
   @impl true
@@ -227,7 +234,9 @@ defmodule Wagyu.Peer.Opener do
     case accept(ticket) do
       {:ok, session} ->
         state = close_key(state, index)
-        key = Map.merge(key, %{session: session, replay: ReplayWindow.new(@replay_window)})
+        # `confirmed` is the order marker of the first message that
+        # authenticated under the key, or nil.
+        key = Map.merge(key, %{session: session, replay: ReplayWindow.new(@replay_window), confirmed: nil})
         {:noreply, put_in(state.keys[index], key)}
 
       :error ->
@@ -267,10 +276,11 @@ defmodule Wagyu.Peer.Opener do
          {:fresh, true} <- {:fresh, fresh?(state, key)},
          {:replay, :ok} <- {:replay, ReplayWindow.check(key.replay, counter)},
          {:ok, plaintext} <- Noise.open(key.session, transport) do
-      state = put_in(state.keys[index], %{key | replay: ReplayWindow.commit(key.replay, counter), pending: false})
       {_endpoint, marker} = source
-      state = %{state | events: %{state.events | authenticated: marker}}
-      state = if key.pending, do: update_in(state.events.confirmed, &[index | &1]), else: state
+      confirms? = key.pending and key.confirmed == nil
+      key = %{key | replay: ReplayWindow.commit(key.replay, counter), confirmed: key.confirmed || marker}
+      state = %{put_in(state.keys[index], key) | events: %{state.events | authenticated: marker}}
+      state = if confirms?, do: update_in(state.events.confirmed, &[index | &1]), else: state
       receive_plaintext(state, plaintext, source)
     else
       {:fresh, false} -> state |> count(:transport_expired) |> dropped()

@@ -238,8 +238,13 @@ defmodule Wagyu.Peer do
   # frames, so it reports the markers that the interface gave them, and not
   # markers of its own.
   #
-  # Thus the peer can order events that do not come through its mailbox,
-  # and the result is the same as when it took them all from one mailbox:
+  # Thus the peer can order events that do not come through its mailbox.
+  # Processes that send at about the same time have no defined order, here
+  # or with one mailbox: the first message to arrive goes first. The markers
+  # give an order that one mailbox could also give, and that agrees with
+  # cause and effect: an event that another event causes is sent after the
+  # marker of that event. The peer acts as if it took all its events from
+  # one mailbox in this order:
   #
   #   * The new-handshake timer records the marker of the sealer report
   #     that armed it. Only an authenticated message with a greater marker
@@ -249,11 +254,23 @@ defmodule Wagyu.Peer do
   #     report of the opener. Only an event with a greater marker changes
   #     the endpoint.
   #
-  # One action cannot wait for a delayed report: a new key pair that
-  # displaces a pending `:next`. Before that, the peer asks the opener
-  # whether a message already authenticated under `:next`
-  # (`Wagyu.Peer.Opener.confirmed?/2`). If one did, the peer promotes it
-  # first, as when it took that message itself.
+  # A late report can change only one decision that the peer cannot undo
+  # later: the confirmation of a pending `:next`. Each other late effect
+  # costs at most one extra keepalive or handshake. Thus the peer asks the
+  # opener whether a message older than the event authenticated under
+  # `:next` (`Wagyu.Peer.Opener.confirmed?/3`) at each place that acts on
+  # `:next`:
+  #
+  #   * a handoff that installs a new `:next`
+  #   * a response that installs a new `:current`
+  #   * the end of a handshake attempt (`:give_up`), which drops the staged
+  #     packets
+  #
+  # If one did, the peer promotes the key pair first, as when it took that
+  # message itself. When the peer discards keys (`:zero`, or a key older
+  # than REJECT_AFTER_TIME), its `{:wg_discard, local_index}` reaches the
+  # opener after the frames that are already in its mailbox. Thus the opener
+  # still opens them first.
   #
   # Endpoint. Each time the endpoint changes, the peer tells the interface
   # (`Wagyu.Interface.endpoint_learned/4`). The interface starts the next
@@ -556,7 +573,7 @@ defmodule Wagyu.Peer do
           state
           |> sent_mac1(frame)
           |> received_authenticated(metadata.marker)
-          |> install_next(key_pair)
+          |> install_next(key_pair, metadata.marker)
           |> split(session, key_pair, :next)
           |> new_key_pair()
 
@@ -682,7 +699,7 @@ defmodule Wagyu.Peer do
       # confirms the key to the responder.
       %{learn_endpoint(state, source, marker) | initiation: nil}
       |> received_authenticated(marker)
-      |> install_current(key_pair)
+      |> install_current(key_pair, marker)
       |> split(session, key_pair, true)
       |> new_key_pair()
       |> handshake_complete()
@@ -722,23 +739,22 @@ defmodule Wagyu.Peer do
   # REJECT_AFTER_TIME: a key that is this old does not send or receive.
   defp fresh?(state, key_pair), do: state.clock.() - key_pair.created_at < @reject_after_time
 
-  defp install_next(state, key_pair) do
-    state = confirm_pending(state)
+  # `marker` is the order marker of the handoff or the response.
+  defp install_next(state, key_pair, marker) do
+    state = confirm_pending(state, marker)
     %{discard(state, [:next, :previous]) | next: key_pair}
   end
 
-  defp install_current(state, key_pair), do: state |> confirm_pending() |> replace_current(key_pair)
+  defp install_current(state, key_pair, marker), do: state |> confirm_pending(marker) |> replace_current(key_pair)
 
   # A pending `:next` can be confirmed already by a frame that waits in the
-  # batch of the opener. The peer asks the opener before a new key pair
-  # displaces it. The opener answers after all the frames that the
-  # interface admitted before the call, so the answer is the same as when
-  # the peer took those frames itself (see "Order" above).
-  defp confirm_pending(%{next: %{local_index: index}} = state) do
-    if Opener.confirmed?(state.opener, index), do: promote(state, index), else: state
+  # opener. The peer asks the opener before it acts on `:next`, and counts
+  # only a frame that is older than the event `marker` (see "Order" above).
+  defp confirm_pending(%{next: %{local_index: index}} = state, marker) do
+    if Opener.confirmed?(state.opener, index, marker), do: promote(state, index), else: state
   end
 
-  defp confirm_pending(state), do: state
+  defp confirm_pending(state, _marker), do: state
 
   defp replace_current(%{next: nil} = state, key_pair) do
     state = discard(state, [:previous])
@@ -927,16 +943,18 @@ defmodule Wagyu.Peer do
     end
   end
 
-  defp fire(:retry, state), do: initiate(state, :retry)
-
-  defp fire(:give_up, state) do
-    state
-    |> cancel_timer(:retry)
-    |> discard_initiation()
-    |> drop_staged()
-    |> count(:handshakes_abandoned)
-    |> set_timer_unless_pending(:zero, @zero_after)
+  # A frame that confirmed a pending `:next` before the attempt ran out
+  # completes a handshake. Then the peer does not give up.
+  defp fire(:give_up, %{next: %{}} = state) do
+    case confirm_pending(state, :erlang.unique_integer([:monotonic])) do
+      %{next: nil} = state -> state
+      state -> give_up(state)
+    end
   end
+
+  defp fire(:give_up, state), do: give_up(state)
+
+  defp fire(:retry, state), do: initiate(state, :retry)
 
   # If the key expired after the data arrived, the peer starts a handshake.
   defp fire(:keepalive, state), do: if(usable(state), do: send_keepalive(state), else: initiate(state, :rekey))
@@ -956,6 +974,15 @@ defmodule Wagyu.Peer do
       state.persistent_keepalive > 0 -> state |> discard_initiation() |> drop_staged()
       true -> state |> discard_initiation() |> drop_staged() |> exit_if_idle()
     end
+  end
+
+  defp give_up(state) do
+    state
+    |> cancel_timer(:retry)
+    |> discard_initiation()
+    |> drop_staged()
+    |> count(:handshakes_abandoned)
+    |> set_timer_unless_pending(:zero, @zero_after)
   end
 
   # The interface refuses while it has messages admitted for this process.

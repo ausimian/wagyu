@@ -153,6 +153,15 @@ defmodule Wagyu.PeerTest do
     :sys.get_state(peer)
   end
 
+  # Returns the next transport message that the remote party receives. It
+  # skips initiations, which a retry can send first.
+  defp receive_transport(context) do
+    case receive_datagram(context) do
+      <<1, _rest::binary>> -> receive_transport(context)
+      frame -> frame
+    end
+  end
+
   # Sends a frame from the remote party, and waits until the interface
   # routes it.
   defp routed(context, frame, from \\ nil) do
@@ -733,6 +742,58 @@ defmodule Wagyu.PeerTest do
       assert <<2, 0, 0, 0, second_index::little-32, 2::little-32, _rest::binary>> = receive_datagram(context)
       assert slots(peer) == %{next: second_index, current: first_index, previous: nil}
       assert %{keys_confirmed: 1} = counters(context.interface)
+    end
+
+    test "a frame that arrives after a newer handshake does not keep the key that the handshake displaces",
+         context do
+      {first, first_index} = remote_handshake(context, 1, 1)
+      peer = eventually(fn -> peer(context) end)
+
+      # The handoff of a newer handshake waits for the peer. Then the
+      # initiator sends under the first key, and the opener takes that frame.
+      :ok = :sys.suspend(peer)
+      advance(context.clock, 20)
+      {initiation, _session} = initiate_to(context.public_key, context.remote, timestamp(2), 2)
+      to_wagyu(context, initiation)
+      assert eventually(fn -> Process.info(peer, :message_queue_len) == {:message_queue_len, 1} end)
+      %{keepalives_received: received} = counters(context.interface)
+      to_wagyu(context, transport_frame(first, first_index))
+      counters(context.interface, &(&1.keepalives_received == received + 1))
+
+      # The handoff came first. Thus the newer handshake displaces the first
+      # key, which is not confirmed at that time.
+      :ok = :sys.resume(peer)
+      assert <<2, 0, 0, 0, second_index::little-32, 2::little-32, _rest::binary>> = receive_datagram(context)
+      assert slots(peer) == %{next: second_index, current: nil, previous: nil}
+      assert %{keys_confirmed: 0} = counters(context.interface)
+    end
+
+    test "a frame that confirmed a pending key before an attempt ran out completes the handshake", context do
+      demand(context)
+      _initiation = receive_datagram(context)
+      {peer, clock} = started_peer(context)
+      %{timers: %{give_up: give_up}} = :sys.get_state(peer)
+
+      # The remote party initiates too, and its key waits for confirmation.
+      {first, first_index} = remote_handshake(context, 1, 1)
+      assert %{next: %{local_index: ^first_index}} = :sys.get_state(peer)
+
+      # The initiator confirms the key, but its frame waits for the opener
+      # while the attempt runs out.
+      opener = opener(peer)
+      :ok = :sys.suspend(opener)
+      routed(context, transport_frame(first, first_index))
+      advance_to(clock, give_up)
+      send(peer, {:wg_timer, make_ref()})
+      assert eventually(fn -> Process.info(opener, :message_queue_len) == {:message_queue_len, 2} end)
+      :ok = :sys.resume(opener)
+
+      # The peer promotes the key and does not give up. The staged packet
+      # goes out under the key. A retry can go out first.
+      assert <<4, 0, 0, 0, 1::little-32, _rest::binary>> = receive_transport(context)
+      assert %{current: %{local_index: ^first_index}, timers: timers} = :sys.get_state(peer)
+      refute Map.has_key?(timers, :give_up)
+      assert %{handshakes_abandoned: 0, staged_dropped: 0, keys_confirmed: 1} = counters(context.interface)
     end
 
     test "an unconfirmed key is replaced by a newer handshake, and kept when the peer initiates", context do
