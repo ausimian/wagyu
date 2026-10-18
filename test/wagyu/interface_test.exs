@@ -1,6 +1,7 @@
 defmodule Wagyu.InterfaceTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
   import Wagyu.TestHelpers
 
   alias Wagyu.Admission
@@ -177,6 +178,25 @@ defmodule Wagyu.InterfaceTest do
 
       assert options[:buffer] >= 65_507
       assert options[:recbuf] >= 65_536
+    end
+
+    # The OS sets the size of the buffer. Thus a host with a small limit
+    # (Linux with the default net.core.rmem_max) tests the warning, and a
+    # host with a large limit (macOS) tests that no warning occurs.
+    test "warns if the receive buffer of its socket is smaller than the request" do
+      {interface, log} = with_log(fn -> start_supervised!(Supervisor.child_spec({Wagyu, options()}, id: :recbuf)) end)
+      %{socket: socket, port: port} = :sys.get_state(child(interface, :interface))
+      {:ok, [recbuf: recbuf]} = :inet.getopts(socket, [:recbuf])
+      # Other tests run at the same time. The port identifies the warning
+      # of this interface.
+      warning = "UDP socket on 127.0.0.1 port #{port} has a receive buffer of #{recbuf} bytes"
+
+      if recbuf < 1_048_576 do
+        assert log =~ warning
+        assert log =~ "net.core.rmem_max"
+      else
+        refute log =~ "port #{port} has a receive buffer"
+      end
     end
 
     test "stops when its socket closes", context do

@@ -1,3 +1,12 @@
+### Added
+
+- The interface logs a warning if the OS gives its UDP socket a smaller
+  receive buffer than the 1 MiB that it requests. When this buffer is full,
+  the kernel drops inbound datagrams, and `Wagyu.info/1` does not count
+  them. On Linux, `net.core.rmem_max` limits the buffer, and its default
+  (212,992 bytes) is too small. The `Wagyu` module documentation tells how
+  to raise it.
+
 ### Changed
 
 - Each peer now runs as three processes. The peer runs the handshakes and the

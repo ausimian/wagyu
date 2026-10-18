@@ -184,6 +184,8 @@ defmodule Wagyu.Interface do
   alias Wagyu.RateLimiter
   alias Wagyu.TAI64N
 
+  require Logger
+
   # The number of datagrams that the socket delivers before the interface
   # must arm it again.
   @active 32
@@ -219,7 +221,16 @@ defmodule Wagyu.Interface do
   # OTP 27 gives a UDP socket an 8 KiB receive buffer. A burst of small
   # datagrams can overflow it while the interface is busy. OTP 28 uses the
   # OS default. The interface sets the size explicitly, to get the same
-  # behavior on both. The kernel can set a lower limit.
+  # behavior on both.
+  #
+  # The kernel can give a smaller buffer than the request. Linux limits the
+  # request to `net.core.rmem_max`, which is 212,992 bytes on Debian. Then a
+  # burst from a kernel WireGuard peer overflows the buffer, and the kernel
+  # drops datagrams that the interface does not count (#65). Thus the
+  # interface logs a warning if the buffer that the OS reports is smaller
+  # than the request. Linux doubles the limited value for its overhead, and
+  # reports the doubled value. Thus the warning starts only when `rmem_max`
+  # is less than half of the request.
   #
   # The buffer of the backend must hold the largest datagram completely. A
   # transport message is up to the MTU plus 32 bytes, and the MTU can be up
@@ -1308,7 +1319,11 @@ defmodule Wagyu.Interface do
     # The backend option must come first.
     options = [{:inet_backend, inet_backend(address)}, :binary, ip: address, active: @active]
     options = options ++ [recbuf: @recbuf, buffer: @buffer] ++ family
-    open_socket(port, options, @bind_attempts)
+
+    with {:ok, socket, bound} <- open_socket(port, options, @bind_attempts) do
+      check_recbuf(socket, address, bound)
+      {:ok, socket, bound}
+    end
   end
 
   defp inet_backend(address) when tuple_size(address) == 4, do: :socket
@@ -1330,6 +1345,23 @@ defmodule Wagyu.Interface do
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  # The check only gives information. If the OS does not report the size,
+  # the interface continues without a warning.
+  defp check_recbuf(socket, address, port) do
+    case :inet.getopts(socket, [:recbuf]) do
+      {:ok, [recbuf: recbuf]} when recbuf < @recbuf ->
+        Logger.warning(
+          "Wagyu: the UDP socket on #{:inet.ntoa(address)} port #{port} has a receive buffer of " <>
+            "#{recbuf} bytes, but the interface requested #{@recbuf} bytes. " <>
+            "The kernel can drop inbound datagrams during a burst. " <>
+            "On Linux, raise net.core.rmem_max, for example to 4194304."
+        )
+
+      _other ->
+        :ok
     end
   end
 

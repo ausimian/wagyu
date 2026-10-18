@@ -280,6 +280,34 @@ defmodule Wagyu do
   the stack cannot send yet stays in its sockets. TCP keeps the data in the
   send buffer and slows down, as it does on a slow network. A UDP send
   waits until there is space.
+
+  ### Receive buffer of the UDP socket
+
+  The interface requests a receive buffer of 1 MiB for its UDP socket. The
+  OS can give a smaller buffer. If the buffer is full, the kernel drops
+  inbound datagrams. `info/1` does not count these drops. A sender sends
+  the lost data again, but TCP through the tunnel stalls until it does.
+
+  On Linux, `net.core.rmem_max` limits the buffer. The default is 212,992
+  bytes on many distributions, for example Debian. Thus the interface gets
+  less than it requests. To get the full buffer, raise the limit, for
+  example to 4 MiB:
+
+  ```sh
+  sysctl -w net.core.rmem_max=4194304
+  ```
+
+  This command does not keep the value after a restart. To keep it, add the
+  setting to a file in `/etc/sysctl.d`. The kernel counts the drops in
+  `UdpRcvbufErrors`, for example in the output of `nstat -az UdpRcvbufErrors`.
+
+  On macOS, `kern.ipc.maxsockbuf` limits the buffer. Its default of 8 MiB
+  allows the full buffer.
+
+  If the OS reports a buffer that is smaller than the request, the interface
+  logs a warning when it opens the socket. Linux doubles the limited value
+  for its overhead, and reports the doubled value. Thus Linux gives no
+  warning if `net.core.rmem_max` is at least 512 KiB.
   """
 
   alias Wagyu.Config

@@ -16,4 +16,12 @@ interop? =
 # derivation. On a slow CI runner, that can take more than the default of
 # 100 ms. A test that passes returns as soon as its message arrives, so only
 # a test that fails waits longer.
-ExUnit.start(exclude: if(interop?, do: [], else: [:interop]), assert_receive_timeout: 1_000)
+#
+# On a host with a small UDP receive buffer, for example Linux with the
+# default net.core.rmem_max, each interface logs a warning when it starts.
+# ExUnit shows the log of a test only if the test fails.
+ExUnit.start(
+  exclude: if(interop?, do: [], else: [:interop]),
+  assert_receive_timeout: 1_000,
+  capture_log: true
+)
