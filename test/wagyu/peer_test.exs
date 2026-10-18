@@ -80,8 +80,10 @@ defmodule Wagyu.PeerTest do
   end
 
   # The fake clock starts at the time that the peer last sent a handshake
-  # message, after the peer completes its current work. Thus REKEY_TIMEOUT
-  # starts from that time.
+  # message. Thus REKEY_TIMEOUT starts from that time. Receive the first
+  # initiation before you call this function. If you do not, the sealer's
+  # report can start the handshake after the clock starts, and the peer
+  # then records the real time as the time of the initiation.
   defp fake_peer_clock(pid) do
     %{handshake_sent_at: sent_at} = :sys.get_state(pid)
     fake_clock(pid, sent_at || System.monotonic_time(:millisecond))
@@ -91,12 +93,10 @@ defmodule Wagyu.PeerTest do
     do: :ok = :gen_udp.send(from || context.remote_socket, {127, 0, 0, 1}, context.port, frame)
 
   # Returns the next datagram that the remote party receives. The datagram
-  # must come from the socket of the interface.
-  defp receive_datagram(context) do
-    port = context.port
-    assert {:ok, {{127, 0, 0, 1}, ^port, frame}} = :gen_udp.recv(context.remote_socket, 0, 1_000)
-    frame
-  end
+  # must come from the socket of the interface. The timeout is long because
+  # a loaded CI runner can delay the datagram. A test that passes does not
+  # wait for the timeout.
+  defp receive_datagram(context), do: receive_datagram_within(context, 5_000)
 
   defp receive_datagram_within(context, timeout) do
     port = context.port
@@ -450,21 +450,22 @@ defmodule Wagyu.PeerTest do
 
     test "a rekey reuses the peer process and rotates the key slots", context do
       demand(context)
+      initiation = receive_datagram(context)
       {peer, clock} = started_peer(context)
 
-      handshake = fn remote_index ->
-        {response, session, _sent} = respond_to(receive_datagram(context), context.remote, remote_index)
+      handshake = fn initiation, remote_index ->
+        {response, session, _sent} = respond_to(initiation, context.remote, remote_index)
         to_wagyu(context, response)
         assert {:ok, _confirmation} = open_transport(session, receive_datagram(context))
         session
       end
 
-      first = handshake.(1)
+      first = handshake.(initiation, 1)
       %{current: %{local_index: first_index, session: first_session}} = :sys.get_state(peer)
 
       advance(clock, 5_000)
       send(peer, :wg_initiate)
-      _second = handshake.(2)
+      _second = handshake.(receive_datagram(context), 2)
 
       assert %{current: %{remote_index: 2}, previous: %{local_index: ^first_index}, next: nil} =
                :sys.get_state(peer)
@@ -478,7 +479,7 @@ defmodule Wagyu.PeerTest do
       # A third handshake retires the first key pair and closes its session.
       advance(clock, 5_000)
       send(peer, :wg_initiate)
-      _third = handshake.(3)
+      _third = handshake.(receive_datagram(context), 3)
 
       assert %{current: %{remote_index: 3}, previous: %{remote_index: 2}, next: nil} = :sys.get_state(peer)
       assert lookup(context, first_index) == :retired
