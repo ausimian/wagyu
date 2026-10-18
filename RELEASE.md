@@ -12,3 +12,11 @@
   not hold. During a bulk download, the interface refused up to 1.5% of the
   packets, and TCP stalled until it retransmitted them. The outbound queue and
   the queue of packets that wait for a key stay at 128 packets or 256 KiB.
+
+### Fixed
+
+- Downloads through a tunnel are much faster on a path that reorders
+  packets. SmolNet 0.8.0 now uses TCP timestamps and sends a D-SACK for a
+  duplicate segment. Thus a Linux sender can undo a window reduction for a
+  segment that it sent again needlessly. On a path with 20 ms ± 5 ms of
+  delay and no loss, downloads went from about 0.5 MiB/s to 13 MiB/s.
