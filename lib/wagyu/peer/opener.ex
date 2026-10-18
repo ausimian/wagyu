@@ -73,7 +73,8 @@ defmodule Wagyu.Peer.Opener do
   # receives, and the endpoint of the peer follows the source of its
   # traffic. When the opener sends packets to the link, or when it took a
   # frame and no packet waits, it sends the peer one `{:wg_opened, events,
-  # source, confirmed, configured}` if it has something to report:
+  # source, confirmed, configured, authenticated_at}` if it has something
+  # to report:
   #
   #   * `events` holds `:authenticated` if a message authenticated, and
   #     `:data` if a message carried a plaintext that was not empty.
@@ -87,6 +88,21 @@ defmodule Wagyu.Peer.Opener do
   #     number. The peer does not learn `source` from a report with a lower
   #     number than its own: the interface admitted those frames before a
   #     change to the configuration.
+  #   * `authenticated_at` is the time on `state.clock` at which the last
+  #     message of the report authenticated.
+  #
+  # A report can reach the peer after a report of the sealer about a later
+  # send. The peer arms its new-handshake timer when it learns of a send,
+  # and cancels it when it learns that a message authenticated after that.
+  # Thus it cancels the timer only for a report whose `authenticated_at` is
+  # not before the time at which it armed the timer. The sealer does not
+  # compare the time of a send with the time of the last frame, because
+  # during a download most reports would look old (see
+  # `Wagyu.Peer.Sealer`). This comparison is different: during a download,
+  # a message authenticates within milliseconds after the peer arms the
+  # timer, so the peer still cancels it. A late send report costs at most
+  # one extra handshake, as in wireguard-go. A late receive report must not
+  # cancel the timer, because then the peer can lose its retry.
   #
   # The opener, the sealer, the sender and the peer are the children of one
   # `Wagyu.Peer.Group`, and they stop together. The group starts the peer
@@ -125,7 +141,9 @@ defmodule Wagyu.Peer.Opener do
   # after the first packet started to wait.
   @no_plaintext %{packets: [], count: 0, frame_bytes: 0, frames: 0}
   # The events that the opener has not reported to the peer yet.
-  @no_events %{authenticated: false, data: false, source: nil, confirmed: []}
+  # `authenticated` is the time at which the last message authenticated, or
+  # nil.
+  @no_events %{authenticated: nil, data: false, source: nil, confirmed: []}
 
   @spec start_link(map()) :: GenServer.on_start()
   def start_link(args), do: GenServer.start_link(__MODULE__, args)
@@ -244,7 +262,7 @@ defmodule Wagyu.Peer.Opener do
          {:replay, :ok} <- {:replay, ReplayWindow.check(key.replay, counter)},
          {:ok, plaintext} <- Noise.open(key.session, transport) do
       state = put_in(state.keys[index], %{key | replay: ReplayWindow.commit(key.replay, counter), pending: false})
-      state = %{state | events: %{state.events | authenticated: true}}
+      state = %{state | events: %{state.events | authenticated: state.clock.()}}
       state = if key.pending, do: update_in(state.events.confirmed, &[index | &1]), else: state
       receive_plaintext(state, plaintext, source)
     else
@@ -310,16 +328,21 @@ defmodule Wagyu.Peer.Opener do
 
   # Sends the events of the frames since the last report to the peer, as one
   # message.
-  defp report(%{events: %{authenticated: false}} = state), do: state
+  defp report(%{events: %{authenticated: nil}} = state), do: state
 
   defp report(%{events: events} = state) do
     confirmed = Enum.reverse(events.confirmed)
-    send(state.owner, {:wg_opened, events_list(events), events.source, confirmed, state.configured})
+
+    send(
+      state.owner,
+      {:wg_opened, events_list(events), events.source, confirmed, state.configured, events.authenticated}
+    )
+
     %{state | events: @no_events}
   end
 
-  defp events_list(%{authenticated: true, data: true}), do: [:authenticated, :data]
-  defp events_list(%{authenticated: true, data: false}), do: [:authenticated]
+  defp events_list(%{data: true}), do: [:authenticated, :data]
+  defp events_list(%{data: false}), do: [:authenticated]
 
   # REJECT_AFTER_TIME: a key that is this old does not receive.
   defp fresh?(state, key), do: state.clock.() - key.created_at < @reject_after_time

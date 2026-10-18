@@ -370,6 +370,23 @@ defmodule Wagyu.PeerTest do
       assert Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
     end
 
+    test "a receive report about a message before the send does not cancel the new-handshake timer", context do
+      # The staged packet that confirms the key arms the timer.
+      {peer, _clock, _session, _index} = initiated(context)
+      _sealer = :sys.get_state(sealer(peer))
+      %{new_handshake_armed_at: armed_at, configured: configured} = state = :sys.get_state(peer)
+      assert Map.has_key?(state.timers, :new_handshake)
+
+      # The opener reports a message that authenticated before the send. Its
+      # report arrives after the report of the sealer.
+      send(peer, {:wg_opened, [:authenticated], nil, [], configured, armed_at - 1})
+      assert Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
+
+      # A message that authenticated after the send answers it.
+      send(peer, {:wg_opened, [:authenticated], nil, [], configured, armed_at})
+      refute Map.has_key?(:sys.get_state(peer).timers, :new_handshake)
+    end
+
     test "a response with the wrong index, MAC1 or authentication changes nothing", context do
       demand(context)
       initiation = receive_datagram(context)

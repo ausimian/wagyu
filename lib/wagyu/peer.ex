@@ -168,11 +168,11 @@ defmodule Wagyu.Peer do
   #
   # Receiving data. The opener checks, opens and delivers the transport
   # messages (`Wagyu.Peer.Opener`). It reports what it received to the peer
-  # (`{:wg_opened, events, source, confirmed, configured}`). The source of
-  # a keepalive, or of a data packet that passes the checks of the opener,
-  # becomes the endpoint, unless the interface admitted it before the
-  # latest configure message. The source of an authenticated handshake
-  # message also becomes the endpoint.
+  # (`{:wg_opened, events, source, confirmed, configured, authenticated_at}`).
+  # The source of a keepalive, or of a data packet that passes the checks of
+  # the opener, becomes the endpoint, unless the interface admitted it
+  # before the latest configure message. The source of an authenticated
+  # handshake message also becomes the endpoint.
   #
   # Batching. The interface sends a peer's sealer its part of each egress
   # batch as one message. The sealer sends the batch under one key at one
@@ -201,7 +201,9 @@ defmodule Wagyu.Peer do
   #   * New handshake. The peer initiates KEEPALIVE_TIMEOUT plus
   #     REKEY_TIMEOUT (15 seconds), plus jitter, after it sends data, if it
   #     received no authenticated packet after that. The cause is that its
-  #     key can be stale on the other side.
+  #     key can be stale on the other side. A report of the opener cancels
+  #     this timer only if its message authenticated at or after the time
+  #     at which the peer armed the timer (see `Wagyu.Peer.Opener`).
   #   * Persistent keepalive. If one is configured, the peer sends a
   #     keepalive when that number of seconds passes with no authenticated
   #     packet sent or received. It also sends one when it starts. If it has
@@ -345,6 +347,8 @@ defmodule Wagyu.Peer do
       staged_seen: 0,
       inbound_dropped: 0,
       persistent_keepalive: peer.persistent_keepalive * 1_000,
+      # The time at which the peer armed the new-handshake timer.
+      new_handshake_armed_at: nil,
       configured: 0,
       last_minute_rekey: false,
       timers: %{},
@@ -385,9 +389,9 @@ defmodule Wagyu.Peer do
   # source is older than the configuration, so the peer does not learn it.
   # The opener reports the source of each batch, so a source that is still
   # current comes again with the next one.
-  def handle_info({:wg_opened, events, source, confirmed, configured}, state) do
+  def handle_info({:wg_opened, events, source, confirmed, configured, authenticated_at}, state) do
     state = if source && configured >= state.configured, do: learn_endpoint(state, source), else: state
-    state = received_authenticated(state)
+    state = received_authenticated(state, authenticated_at)
     state = if :data in events, do: received_data(state), else: state
     state = Enum.reduce(confirmed, state, &promote(&2, &1))
     {:noreply, state |> last_minute_rekey() |> arm()}
@@ -810,12 +814,34 @@ defmodule Wagyu.Peer do
   defp sent_authenticated(state, event) do
     state = state |> cancel_timer(:keepalive) |> persistent_keepalive()
 
-    if event == :transport_sent,
-      do: set_timer_unless_pending(state, :new_handshake, @keepalive_timeout + @rekey_timeout + jitter()),
-      else: state
+    if event == :transport_sent, do: arm_new_handshake(state), else: state
   end
 
-  defp received_authenticated(state), do: state |> cancel_timer(:new_handshake) |> persistent_keepalive()
+  # The timer runs from the first send that has no answer. Thus a later send
+  # does not move it.
+  defp arm_new_handshake(state) do
+    if pending?(state, :new_handshake) do
+      state
+    else
+      now = state.clock.()
+      state = set_timer(state, :new_handshake, now + @keepalive_timeout + @rekey_timeout + jitter())
+      %{state | new_handshake_armed_at: now}
+    end
+  end
+
+  # `at` is the time at which the message authenticated. A message that
+  # authenticated before the peer armed the new-handshake timer does not
+  # answer the send that armed it.
+  defp received_authenticated(state, at \\ nil) do
+    at = at || state.clock.()
+
+    state =
+      if pending?(state, :new_handshake) and at < state.new_handshake_armed_at,
+        do: state,
+        else: cancel_timer(state, :new_handshake)
+
+    persistent_keepalive(state)
+  end
 
   defp received_data(state), do: set_timer_unless_pending(state, :keepalive, @keepalive_timeout)
 
