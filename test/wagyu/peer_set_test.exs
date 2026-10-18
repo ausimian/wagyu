@@ -388,8 +388,8 @@ defmodule Wagyu.PeerSetTest do
       %{config: %{allowed_ips: table}} = interface_state(context)
 
       for {remote, key} <- [{a, key_a}, {b, key_b}] do
-        assert %{allowed_ips: filter, configured: 1, current: %{local_index: index}} = :sys.get_state(key.peer)
-        assert filter == AllowedIPs.source_filter(table, remote.key)
+        assert %{configured: 1, current: %{local_index: index}, opener: opener} = :sys.get_state(key.peer)
+        assert :sys.get_state(opener).allowed_ips == AllowedIPs.source_filter(table, remote.key)
         assert index == key.index
         assert peer(context, remote) == key.peer
       end
@@ -856,9 +856,9 @@ defmodule Wagyu.PeerSetTest do
         %{peers: running, config: %{allowed_ips: table}} = :sys.get_state(interface)
         assert table == elem(Config.put_peers(config(context), List.last(sets)), 1).allowed_ips
 
-        for {key, %{pid: pid, filter: filter}} <- running do
+        for {key, %{opener: opener, filter: filter}} <- running do
           assert filter == AllowedIPs.source_filter(table, key)
-          assert :sys.get_state(pid).allowed_ips == filter
+          assert :sys.get_state(opener).allowed_ips == filter
         end
       end
     end
@@ -950,8 +950,8 @@ defmodule Wagyu.PeerSetTest do
       assert %{message: {:"$gen_call", _from, {:put, :redacted}}} =
                Wagyu.ConfigStore.format_status(%{message: {:"$gen_call", {self(), make_ref()}, {:put, config}}})
 
-      assert %{message: {:wg_configure, :redacted, %AllowedIPs{}}} =
-               Wagyu.Peer.format_status(%{message: {:wg_configure, config.peers[context.a.key], %AllowedIPs{}}})
+      assert %{message: {:wg_configure, :redacted}} =
+               Wagyu.Peer.format_status(%{message: {:wg_configure, config.peers[context.a.key]}})
     end
   end
 end

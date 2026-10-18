@@ -4,7 +4,8 @@ defmodule Wagyu.Peer.Sealer do
   # Each peer has one sealer. The sealer encrypts the outbound packets of its
   # peer, and gives the frames to the sender of the peer
   # (`Wagyu.Peer.Sender`). Thus sealing is not on the scheduler of the peer,
-  # which opens the inbound frames.
+  # or of the opener of the peer, which opens the inbound frames
+  # (`Wagyu.Peer.Opener`).
   #
   # The interface sends each egress batch of the peer to the sealer as
   # `{:wg_outbound, packets}`, admitted against the peer's `:outbound`
@@ -12,19 +13,30 @@ defmodule Wagyu.Peer.Sealer do
   # as when the peer sealed them.
   #
   # Keys. The sealer sends only under the `:current` key pair of its peer.
-  # When a key pair becomes `:current`, the peer moves the outbound half of
-  # its Decibel session to the sealer (`Decibel.split/3`), and sends
-  # `{:wg_key, ticket, key, confirm}`. The sealer accepts the ticket and
-  # closes the outbound half of the key that it had. Then it sends the
-  # packets that it staged. If it has none and `confirm` is true, it sends a
-  # keepalive, which confirms a key that the peer initiated. When the peer
-  # discards a key pair whose outbound half the sealer holds, it sends
-  # `{:wg_discard, local_index}`, and the sealer closes that half.
+  # When a handshake completes, the peer moves both directions of its
+  # Decibel session to other processes (`Decibel.split/2`). The sealer gets
+  # the outbound half with `{:wg_key, ticket, key, mode}`:
+  #
+  #   * `mode` is `:next` for a handshake that this peer responded to. The
+  #     sealer keeps that half as its next key, and does not send under it.
+  #     A responder does not send under a new key until the initiator sends
+  #     under it. When the peer promotes the key pair to `:current`, it
+  #     sends `{:wg_promote, local_index}`. The sealer then closes the key
+  #     that it had, and sends under the next key.
+  #   * Otherwise the key pair is `:current` immediately, and `mode` is true
+  #     or false. The sealer closes the key that it had.
+  #
+  # When a key becomes the key that the sealer sends under, the sealer sends
+  # the packets that it staged. If it has none and `mode` is true, it sends
+  # a keepalive, which confirms a key that the peer initiated. When the peer
+  # discards a key pair, it sends `{:wg_discard, local_index}`, and the
+  # sealer closes the outbound half of that key pair if it holds it.
   #
   # Decibel discards a ticket that is not accepted in 60 seconds, and then
   # the outbound half is gone. If the sealer cannot accept a ticket, it
-  # closes the key that it had, and sends `{:wg_key_lost, local_index}`. The
-  # peer then discards that key pair and starts a handshake.
+  # sends `{:wg_key_lost, local_index}`. The peer then discards that key
+  # pair and starts a handshake. For a key that was to be `:current`, the
+  # sealer also closes the key that it had.
   #
   # The sealer applies the same send rules as the peer did. It sends under a
   # key while the key is younger than REJECT_AFTER_TIME and its nonce is
@@ -68,7 +80,7 @@ defmodule Wagyu.Peer.Sealer do
   # the interface to forget it immediately after, with no staged packet
   # still admitted.
   #
-  # The sealer, the sender and the peer are the children of one
+  # The sealer, the opener, the sender and the peer are the children of one
   # `Wagyu.Peer.Group`, and they stop together. The group starts the peer
   # last. Thus the peer sends `{:wg_owner, peer}` from its `init/1`, and the
   # sealer takes no other message before this one. The sealer holds Decibel
@@ -114,6 +126,8 @@ defmodule Wagyu.Peer.Sealer do
       # The configure number of the endpoint (see `{:wg_endpoint, ...}`).
       endpoint_configured: 0,
       key: nil,
+      # The outbound half of a key pair in the `:next` slot of the peer.
+      next: nil,
       staged: :queue.new(),
       # The sequence number of the last packet that the sealer staged.
       staged_number: 0,
@@ -139,19 +153,21 @@ defmodule Wagyu.Peer.Sealer do
     {:noreply, report(state)}
   end
 
+  def handle_info({:wg_key, ticket, key, :next}, state) do
+    case accept(ticket) do
+      {:ok, session} ->
+        {:noreply, %{close_next(state) | next: Map.put(key, :session, session)}}
+
+      :error ->
+        send(state.owner, {:wg_key_lost, key.local_index})
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:wg_key, ticket, key, confirm}, state) do
     case accept(ticket) do
       {:ok, session} ->
-        state = %{close_key(state) | key: Map.put(key, :session, session)}
-
-        state =
-          cond do
-            not :queue.is_empty(state.staged) -> send_staged(state)
-            confirm -> send_keepalive(state)
-            true -> state
-          end
-
-        {:noreply, report(state)}
+        {:noreply, state |> use_key(Map.put(key, :session, session), confirm) |> report()}
 
       :error ->
         send(state.owner, {:wg_key_lost, key.local_index})
@@ -159,8 +175,16 @@ defmodule Wagyu.Peer.Sealer do
     end
   end
 
+  def handle_info({:wg_promote, local_index}, %{next: %{local_index: local_index} = next} = state),
+    do: {:noreply, %{state | next: nil} |> use_key(next, false) |> report()}
+
+  def handle_info({:wg_promote, _local_index}, state), do: {:noreply, state}
+
   def handle_info({:wg_discard, local_index}, %{key: %{local_index: local_index}} = state),
     do: {:noreply, close_key(state)}
+
+  def handle_info({:wg_discard, local_index}, %{next: %{local_index: local_index}} = state),
+    do: {:noreply, close_next(state)}
 
   def handle_info({:wg_discard, _local_index}, state), do: {:noreply, state}
 
@@ -196,7 +220,18 @@ defmodule Wagyu.Peer.Sealer do
   end
 
   @impl true
-  def format_status(status), do: Wagyu.Redact.format_status(status, [:key, :staged])
+  def format_status(status), do: Wagyu.Redact.format_status(status, [:key, :next, :staged])
+
+  # Closes the key that the sealer had, and sends under `key`.
+  defp use_key(state, key, confirm) do
+    state = %{close_key(state) | key: key}
+
+    cond do
+      not :queue.is_empty(state.staged) -> send_staged(state)
+      confirm -> send_keepalive(state)
+      true -> state
+    end
+  end
 
   # Sends the events of this message to the peer, as one message.
   defp report(%{events: [], trigger: nil} = state), do: state
@@ -373,6 +408,13 @@ defmodule Wagyu.Peer.Sealer do
   defp close_key(%{key: key} = state) do
     :ok = Decibel.close(key.session)
     %{state | key: nil}
+  end
+
+  defp close_next(%{next: nil} = state), do: state
+
+  defp close_next(%{next: next} = state) do
+    :ok = Decibel.close(next.session)
+    %{state | next: nil}
   end
 
   defp count(_state, _name, 0), do: :ok

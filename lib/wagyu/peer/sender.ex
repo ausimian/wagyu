@@ -7,7 +7,7 @@ defmodule Wagyu.Peer.Sender do
   # peer. There is one sender for each peer, so the datagrams of a peer stay
   # in the order that the peer sealed them.
   #
-  # The sender, the sealer and the peer are the children of one
+  # The sender, the sealer, the opener and the peer are the children of one
   # `Wagyu.Peer.Group`. When one of them exits, the group stops the others.
   #
   # The sealer and the peer send `{:wg_send, endpoint, frames, event,

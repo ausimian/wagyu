@@ -94,11 +94,13 @@ defmodule Wagyu.SecretsTest do
     catch_exit(GenServer.call(interface, :crash))
     children = eventually(fn -> if child(root, :interface) != interface, do: children(root) end)
 
-    # A peer raises in the same way. At that time, it holds the transport
-    # session of a handshake that it responded to. Its Noise state includes
-    # the private key and the session keys. This state is in its process
-    # dictionary. Crash reports include the dictionary of a process that is
-    # not sensitive.
+    # A peer raises in the same way, after it responded to a handshake. Then
+    # the opener of the next peer raises. At that time, it holds the inbound
+    # half of the transport session of a handshake. The Noise state of the
+    # peer includes the private key, and the Noise state of the opener
+    # includes a session key. This state is in the process dictionary of each
+    # process. Crash reports include the dictionary of a process that is not
+    # sensitive.
     {:ok, %{public_key: public_key, listen: %{port: port}}} = Wagyu.info(root)
     {:ok, client} = :gen_udp.open(0, [:binary, ip: {127, 0, 0, 1}])
 
@@ -107,11 +109,24 @@ defmodule Wagyu.SecretsTest do
     # of the peer.
     :ok = :sys.log(children.interface, true)
     :ok = :gen_udp.send(client, {127, 0, 0, 1}, port, noise_initiation(public_key, initiator, timestamp(1)))
-    peer = children.peer_supervisor |> only_child() |> group_peer()
+    group = only_child(children.peer_supervisor)
+    peer = group_peer(group)
     assert eventually(fn -> :sys.get_state(peer).next end)
     status = inspect(:sys.get_status(children.interface), limit: :infinity, printable_limit: :infinity)
     assert status =~ ~r/\{:ok, #PID<[0-9.]+>, #Wagyu.Config.Peer</
     catch_exit(GenServer.call(peer, :crash))
+
+    # The interface accepts the next initiation from the key 20 ms after the
+    # last one.
+    Process.sleep(25)
+    :ok = :gen_udp.send(client, {127, 0, 0, 1}, port, noise_initiation(public_key, initiator, timestamp(2)))
+
+    next =
+      eventually(fn -> if only_child(children.peer_supervisor) != group, do: only_child(children.peer_supervisor) end)
+
+    opener = opener(group_peer(next))
+    assert eventually(fn -> :sys.get_state(opener).keys != %{} end)
+    catch_exit(GenServer.call(opener, :crash))
 
     # A handshake worker fails in init, with its key pair in its arguments.
     assert {:error, _reason} =
@@ -133,6 +148,7 @@ defmodule Wagyu.SecretsTest do
     assert logs =~ "GenServer #{inspect(interface)} terminating"
     assert logs =~ "no function clause matching in Wagyu.Interface.handle_call/3"
     assert logs =~ "GenServer #{inspect(peer)} terminating"
+    assert logs =~ "GenServer #{inspect(opener)} terminating"
     assert logs =~ "Wagyu.HandshakeWorker.init"
     assert logs =~ "Start Call: Wagyu.start_link(#Wagyu.Config<"
     assert logs =~ "Start Call: Wagyu.HandshakeSupervisor.start_link("

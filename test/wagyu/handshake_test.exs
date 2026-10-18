@@ -156,11 +156,12 @@ defmodule Wagyu.HandshakeTest do
     assert {:ok, %Packet.Response{sender_index: ^index, receiver_index: 77}} = Packet.decode(response)
     assert Packet.valid_mac1?(response, Packet.mac1_key(context.peer_key))
 
-    # Messages for the index get to the peer, which drops this message
-    # because it does not authenticate. The interface drops the other messages.
+    # Messages for the index get to the opener of the peer, which drops this
+    # message because it does not authenticate. The interface drops the other
+    # messages.
     send_datagrams(context, [transport(index), transport(index + 1)])
     assert %{inbound_routed: 1, unknown_index: 1} = counters(context.interface, &(&1.datagrams == 3))
-    assert eventually(fn -> :sys.get_state(responded.peer).inbound_dropped == 1 end)
+    assert eventually(fn -> :sys.get_state(opener(responded.peer)).inbound_dropped == 1 end)
     assert %{transport_invalid: 1} = counters(context.interface)
   end
 
@@ -287,6 +288,7 @@ defmodule Wagyu.HandshakeTest do
     send_datagrams(context, [genuine(context, 1)])
     %{local_index: index, peer: peer} = responded(context, timestamp(1))
     %{handoffs: handoffs, inbound: inbound} = Map.fetch!(interface_state(context).peers, context.peer_key)
+    :ok = :sys.suspend(opener(peer))
     :ok = :sys.suspend(peer)
 
     # A full inbound queue does not stop handshakes.
@@ -364,7 +366,7 @@ defmodule Wagyu.HandshakeTest do
   test "messages for a live index are bounded by the peer's inbound queue", context do
     send_datagrams(context, [genuine(context, 1)])
     %{local_index: index, peer: peer} = responded(context, timestamp(1))
-    :ok = :sys.suspend(peer)
+    :ok = :sys.suspend(opener(peer))
 
     send_datagrams(context, List.duplicate(transport(index), 1_400))
 

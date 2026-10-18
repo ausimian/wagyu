@@ -266,7 +266,7 @@ defmodule Wagyu.TestHelpers do
   @doc """
   Replaces the clock of an interface or a peer with a fake clock. The fake
   clock starts at `start`, and only `advance/2` moves it. A peer's sealer
-  gets the same clock. Returns the clock.
+  and opener get the same clock. Returns the clock.
   """
   def fake_clock(process, start \\ 1_000_000) do
     clock = :atomics.new(1, signed: true)
@@ -274,6 +274,7 @@ defmodule Wagyu.TestHelpers do
     fake = fn -> :atomics.get(clock, 1) end
     state = :sys.replace_state(process, &%{&1 | clock: fake})
     if is_map_key(state, :sealer), do: :sys.replace_state(state.sealer, &%{&1 | clock: fake})
+    if is_map_key(state, :opener), do: :sys.replace_state(state.opener, &%{&1 | clock: fake})
     clock
   end
 
@@ -285,6 +286,9 @@ defmodule Wagyu.TestHelpers do
 
   @doc "Returns the sealer of a peer."
   def sealer(peer), do: :sys.get_state(peer).sealer
+
+  @doc "Returns the opener of a peer."
+  def opener(peer), do: :sys.get_state(peer).opener
 
   @doc "Returns the packets that wait for a key in the sealer of a peer, in order."
   def staged(peer) do

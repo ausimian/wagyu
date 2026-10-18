@@ -57,9 +57,11 @@ defmodule Wagyu.Interface do
   #
   # Other messages have a receiver index (`Wagyu.IndexTable`). Peers
   # allocate and retire their indices here. The interface forwards a message
-  # only to the live peer that holds its index. It drops a message with an
-  # unknown or retired index. When a peer exits, each index that it held
-  # becomes a tombstone.
+  # only to the live peer that holds its index. A response or a cookie reply
+  # goes to the peer, and a transport message goes to the opener of the
+  # peer (`Wagyu.Peer.Opener`). It drops a message with an unknown or
+  # retired index. When a peer exits, each index that it held becomes a
+  # tombstone.
   #
   # A peer that initiates a handshake gets its sender index and its
   # timestamp here together (`allocate_initiation/2`). The interface keeps
@@ -127,16 +129,17 @@ defmodule Wagyu.Interface do
   #     its process with `:shutdown`. It does not wait for the exit, and it
   #     ignores the exit when it arrives. It also discards the learned
   #     endpoint of the key.
-  #   * It sends `{:wg_configure, peer, filter}` to a running peer whose
-  #     endpoint, preshared key, persistent keepalive or source filter
-  #     changed. A change to the AllowedIPs of one peer can change the
-  #     filter of a different peer, because prefixes can nest. Thus the
-  #     interface computes the filter of each running peer again.
+  #   * It sends `{:wg_configure, peer}` to a running peer whose endpoint,
+  #     preshared key, persistent keepalive or source filter changed. It
+  #     sends a changed source filter to the opener of the peer as
+  #     `{:wg_filter, filter}`. A change to the AllowedIPs of one peer can
+  #     change the filter of a different peer, because prefixes can nest.
+  #     Thus the interface computes the filter of each running peer again.
   #   * It starts an added peer, or a peer whose persistent keepalive
   #     changes from 0, if that peer has a persistent keepalive.
   #
-  # Frames that the interface admitted to a peer before the change are in
-  # the mailbox of the peer before the configure message. Thus the peer
+  # Frames that the interface admitted to an opener before the change are
+  # in the mailbox of the opener before the filter message. Thus the opener
   # checks them against the filter that was in force when they were
   # admitted. Egress routes immediately with the new table.
   #
@@ -827,13 +830,13 @@ defmodule Wagyu.Interface do
         handshake(state, datagram, source, sender, &initiation/3)
 
       {:ok, %Response{sender_index: sender, receiver_index: index}} ->
-        handshake(state, datagram, source, sender, &indexed(&1, index, &2, &3))
+        handshake(state, datagram, source, sender, &indexed(&1, index, &2, &3, :pid))
 
       {:ok, %CookieReply{receiver_index: index}} ->
-        indexed(state, index, datagram, source)
+        indexed(state, index, datagram, source, :pid)
 
       {:ok, %Transport{receiver_index: index}} ->
-        indexed(state, index, datagram, source)
+        indexed(state, index, datagram, source, :opener)
 
       {:error, _reason} ->
         count(state, :invalid_datagrams, state)
@@ -889,12 +892,15 @@ defmodule Wagyu.Interface do
   # messages drop the same as for an unknown index. The interface retires an
   # index when it processes the exit of its peer. Thus the peer check covers
   # the time before that.
-  defp indexed(state, index, frame, source) do
+  #
+  # `target` selects the process of the peer: the peer itself for a
+  # handshake message, and the opener of the peer for a transport message.
+  defp indexed(state, index, frame, source, target) do
     with {:active, {key, pid}} <- IndexTable.lookup(state.indices, index),
          %{^key => %{pid: ^pid} = peer} <- state.peers do
       case Admission.admit(peer.inbound, 1, byte_size(frame)) do
         :ok ->
-          send(pid, {:wg_frame, index, frame, source})
+          send(Map.fetch!(peer, target), {:wg_frame, index, frame, source})
           count(state, :inbound_routed, state)
 
         :full ->
@@ -1090,13 +1096,14 @@ defmodule Wagyu.Interface do
     }
 
     case PeerSupervisor.start_peer(state.root, args) do
-      {:ok, _group, %{peer: pid, sender: sender, sealer: sealer}} ->
+      {:ok, _group, %{peer: pid, sender: sender, sealer: sealer, opener: opener}} ->
         monitor = Process.monitor(pid)
 
         peer = %{
           pid: pid,
           sender: sender,
           sealer: sealer,
+          opener: opener,
           monitor: monitor,
           inbound: inbound,
           outbound: outbound,
@@ -1148,9 +1155,9 @@ defmodule Wagyu.Interface do
   end
 
   # Forgets the running peer of `key`, and stops its processes. The
-  # interface sends the exit signal to the peer, its sealer and its sender
-  # at the same time, so the sealer and the sender do not wait for their
-  # group to see the exit of the peer. The group then stops. The interface
+  # interface sends the exit signal to the peer, its sealer, its opener and
+  # its sender at the same time, so the helper processes do not wait for
+  # their group to see the exit of the peer. The group then stops. The interface
   # does not wait for the exits, and does not see them. A worker that
   # claimed the old process can still hand it a session. Its indices are
   # already tombstones, so that session carries no traffic.
@@ -1163,7 +1170,7 @@ defmodule Wagyu.Interface do
     case state.peers do
       %{^key => peer} ->
         Process.demonitor(peer.monitor, [:flush])
-        for pid <- [peer.pid, peer.sealer, peer.sender], do: Process.exit(pid, :shutdown)
+        for pid <- [peer.pid, peer.sealer, peer.opener, peer.sender], do: Process.exit(pid, :shutdown)
         forget(%{state | monitors: Map.delete(state.monitors, peer.monitor)}, key, peer)
 
       _not_running ->
@@ -1279,7 +1286,8 @@ defmodule Wagyu.Interface do
     filter = if filters?, do: AllowedIPs.source_filter(state.config.allowed_ips, key), else: running.filter
 
     if changed? or filter != running.filter do
-      send(running.pid, {:wg_configure, Map.fetch!(state.config.peers, key), filter})
+      if filter != running.filter, do: send(running.opener, {:wg_filter, filter})
+      send(running.pid, {:wg_configure, Map.fetch!(state.config.peers, key)})
       running = %{running | filter: filter, configured: running.configured + 1}
       %{state | peers: Map.put(state.peers, key, running)}
     else

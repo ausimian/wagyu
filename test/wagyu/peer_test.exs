@@ -110,9 +110,13 @@ defmodule Wagyu.PeerTest do
 
   defp sender_index(<<_type, 0, 0, 0, index::little-32, _rest::binary>>), do: index
 
-  # Waits until the peer takes `count` more frames from its mailbox.
-  defp dropped_after(peer, before, count),
-    do: eventually(fn -> :sys.get_state(peer).inbound_dropped == before + count end)
+  # Waits until the peer or its opener drops `count` more frames.
+  defp dropped_after(process, before, count),
+    do: eventually(fn -> :sys.get_state(process).inbound_dropped == before + count end)
+
+  # Returns the inbound half of the session of a key pair, which the opener
+  # of the peer holds.
+  defp inbound_session(peer, index), do: :sys.get_state(opener(peer)).keys |> Map.fetch!(index) |> Map.fetch!(:session)
 
   defp kill(pid) do
     monitor = Process.monitor(pid)
@@ -211,7 +215,7 @@ defmodule Wagyu.PeerTest do
       assert eventually(fn -> Process.info(sealer, :message_queue_len) == {:message_queue_len, 1} end)
       {response, _session, _sent} = respond_to(initiation, context.remote, 99)
       to_wagyu(context, response)
-      assert eventually(fn -> match?(%{current: %{split: true}}, :sys.get_state(peer)) end)
+      assert eventually(fn -> match?(%{current: %{}}, :sys.get_state(peer)) end)
       :ok = :sys.resume(sealer)
 
       # The sealer stages the second packet and reports a demand for a key.
@@ -312,6 +316,24 @@ defmodule Wagyu.PeerTest do
       assert <<1, 0, 0, 0, _rest::binary>> = receive_datagram(context)
     end
 
+    test "a key that the opener cannot accept is discarded, and the peer starts a handshake", context do
+      {peer, clock, _session, index} = initiated(context)
+
+      # The ticket for the inbound half is not valid, as after it expires.
+      send(opener(peer), {:wg_key, :expired, %{local_index: index, created_at: 0, pending: false}})
+
+      # The peer discards the key pair. Thus the sealer also closes its half.
+      assert eventually(fn -> match?(%{current: nil}, :sys.get_state(peer)) end)
+      assert lookup(context, index) == :retired
+      assert :sys.get_state(opener(peer)).keys == %{}
+      assert %{key: nil} = :sys.get_state(sealer(peer))
+
+      # The handshake goes out when REKEY_TIMEOUT has passed.
+      advance(clock, 5_333)
+      run_timers(peer)
+      assert <<1, 0, 0, 0, _rest::binary>> = receive_datagram(context)
+    end
+
     test "a lost key that is no longer current changes nothing", context do
       {peer, _clock, _session, index} = initiated(context)
       before = :sys.get_state(peer)
@@ -355,6 +377,7 @@ defmodule Wagyu.PeerTest do
       {peer, _clock} = started_peer(context)
       {response, session, _sent} = respond_to(initiation, context.remote, 99)
       before = :sys.get_state(peer)
+      opener_before = :sys.get_state(opener(peer))
 
       mac1_key = Packet.mac1_key(context.public_key)
       {:ok, genuine} = Packet.decode(response)
@@ -384,7 +407,10 @@ defmodule Wagyu.PeerTest do
       assert %{unknown_index: 1, invalid_mac1: 1, responses_invalid: 2, transport_invalid: 1} =
                counters(context.interface, &(&1.responses_invalid == 2 and &1.transport_invalid == 1))
 
-      dropped_after(peer, before.inbound_dropped, 3)
+      # The peer drops the two responses, and the opener the transport
+      # message.
+      dropped_after(peer, before.inbound_dropped, 2)
+      dropped_after(opener(peer), opener_before.inbound_dropped, 1)
 
       assert Process.alive?(peer)
       assert peer(context) == peer
@@ -461,7 +487,8 @@ defmodule Wagyu.PeerTest do
       end
 
       first = handshake.(initiation, 1)
-      %{current: %{local_index: first_index, session: first_session}} = :sys.get_state(peer)
+      %{current: %{local_index: first_index}} = :sys.get_state(peer)
+      first_session = inbound_session(peer, first_index)
 
       advance(clock, 5_000)
       send(peer, :wg_initiate)
@@ -471,9 +498,9 @@ defmodule Wagyu.PeerTest do
                :sys.get_state(peer)
 
       # A delayed packet under the previous key still authenticates.
-      dropped = :sys.get_state(peer).inbound_dropped
+      dropped = :sys.get_state(opener(peer)).inbound_dropped
       to_wagyu(context, transport_frame(first, first_index, "delayed"))
-      dropped_after(peer, dropped, 1)
+      dropped_after(opener(peer), dropped, 1)
       assert %{transport_invalid: 0} = counters(context.interface)
 
       # A third handshake retires the first key pair and closes its session.
@@ -483,7 +510,7 @@ defmodule Wagyu.PeerTest do
 
       assert %{current: %{remote_index: 3}, previous: %{remote_index: 2}, next: nil} = :sys.get_state(peer)
       assert lookup(context, first_index) == :retired
-      assert in_process(peer, fn _state -> closed?(first_session) end)
+      assert in_process(opener(peer), fn _state -> closed?(first_session) end)
 
       assert peer(context) == peer
       assert [_one] = DynamicSupervisor.which_children(context.children.peer_supervisor)
@@ -599,9 +626,9 @@ defmodule Wagyu.PeerTest do
       assert eventually(fn -> slots(peer) == %{next: second_index, current: first_index, previous: nil} end)
 
       # A packet under the current key authenticates but does not confirm a key.
-      dropped = :sys.get_state(peer).inbound_dropped
+      dropped = :sys.get_state(opener(peer)).inbound_dropped
       to_wagyu(context, transport_frame(first, first_index, "still the current key"))
-      dropped_after(peer, dropped, 1)
+      dropped_after(opener(peer), dropped, 1)
       assert slots(peer) == %{next: second_index, current: first_index, previous: nil}
 
       # The first packet under the new key promotes that key. The old key
@@ -609,17 +636,17 @@ defmodule Wagyu.PeerTest do
       to_wagyu(context, transport_frame(second, second_index))
       assert eventually(fn -> slots(peer) == %{next: nil, current: second_index, previous: first_index} end)
       to_wagyu(context, transport_frame(first, first_index, "delayed"))
-      dropped_after(peer, dropped, 2)
+      dropped_after(opener(peer), dropped, 2)
       assert %{keys_confirmed: 2, transport_invalid: 0} = counters(context.interface)
 
       # A third handshake makes space for its key. The previous key pair is
       # closed, and its index is retired.
-      %{previous: %{session: first_session}} = :sys.get_state(peer)
+      first_session = inbound_session(peer, first_index)
       advance(context.clock, 20)
       {_third, third_index} = remote_handshake(context, 3, 3)
       assert eventually(fn -> slots(peer) == %{next: third_index, current: second_index, previous: nil} end)
       assert lookup(context, first_index) == :retired
-      assert in_process(peer, fn _state -> closed?(first_session) end)
+      assert in_process(opener(peer), fn _state -> closed?(first_session) end)
 
       assert peer(context) == peer
       assert [_one] = DynamicSupervisor.which_children(context.children.peer_supervisor)
@@ -1069,10 +1096,11 @@ defmodule Wagyu.PeerTest do
 
       # A delayed packet under the old key still authenticates until that key
       # is 180 seconds old. The quantity of traffic does not change this.
-      %{previous: %{created_at: created}, inbound_dropped: dropped} = :sys.get_state(peer)
+      %{previous: %{created_at: created}} = :sys.get_state(peer)
+      %{inbound_dropped: dropped} = :sys.get_state(opener(peer))
       advance_to(clock, created + 179_999)
       to_wagyu(context, transport_frame(first, first_index, "delayed"))
-      dropped_after(peer, dropped, 1)
+      dropped_after(opener(peer), dropped, 1)
       assert %{transport_invalid: 0, transport_expired: 0, transport_malformed: 1} = counters(context.interface)
 
       # Then the old key is retired, and the interface drops the next delayed

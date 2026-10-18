@@ -43,7 +43,7 @@ defmodule Wagyu.Bench.Profile do
     peers =
       Enum.flat_map(state.peers, fn {_key, peer} ->
         [{"Wagyu.Peer", peer.pid}] ++
-          for {field, name} <- [sealer: "Wagyu.Peer.Sealer", sender: "Wagyu.Peer.Sender"],
+          for {field, name} <- [sealer: "Wagyu.Peer.Sealer", opener: "Wagyu.Peer.Opener", sender: "Wagyu.Peer.Sender"],
               pid = Map.get(peer, field),
               do: {name, pid}
       end)

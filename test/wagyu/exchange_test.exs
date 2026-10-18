@@ -65,13 +65,19 @@ defmodule Wagyu.ExchangeTest do
   end
 
   # Returns the handshake hash and indices of each key pair that the peer of
-  # the side holds.
+  # the side holds. The opener of the peer holds the inbound half of each
+  # session, and the hash with it.
   defp key_pairs(side) do
-    in_process(peer(side), fn state ->
-      for slot <- [:next, :current, :previous], key_pair = Map.fetch!(state, slot), key_pair != nil, into: %{} do
-        {slot, {Decibel.handshake_hash(key_pair.session), key_pair.local_index, key_pair.remote_index}}
-      end
-    end)
+    state = :sys.get_state(peer(side))
+
+    hashes =
+      in_process(state.opener, fn %{keys: keys} ->
+        Map.new(keys, fn {index, key} -> {index, Decibel.handshake_hash(key.session)} end)
+      end)
+
+    for slot <- [:next, :current, :previous], key_pair = Map.fetch!(state, slot), key_pair != nil, into: %{} do
+      {slot, {Map.fetch!(hashes, key_pair.local_index), key_pair.local_index, key_pair.remote_index}}
+    end
   end
 
   defp established?(side), do: peer(side) != nil and Map.has_key?(key_pairs(side), :current)

@@ -14,3 +14,11 @@
   does not change, because Linux limited the 1 MiB request to the same size.
   The `Wagyu` module documentation tells how to raise this limit. On macOS,
   the buffer increases from 1 MiB to 8 MiB.
+- Each peer now runs as four processes. A new opener process decrypts inbound
+  packets and gives them to the stack, so the peer process runs only the
+  handshakes and the timers, and holds no transport keys. The sealer still
+  encrypts outbound packets, and the sender still writes the datagrams to the
+  UDP socket. The four processes run under one supervisor for each peer, and
+  they stop together.
+- Wagyu now requires Decibel 1.4, which can move both directions of a transport
+  session to other processes.

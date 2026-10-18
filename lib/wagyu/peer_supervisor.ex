@@ -2,7 +2,7 @@ defmodule Wagyu.PeerSupervisor do
   @moduledoc false
 
   # Supervises one temporary `Wagyu.Peer.Group` for each active configured
-  # peer. The group holds the peer and its sender. Only the interface starts
+  # peer. The group holds the peer and its helper processes. Only the interface starts
   # peers. It starts a peer on demand. It also starts each peer with a
   # persistent keepalive when this supervisor tells the interface that the
   # supervisor started. The local key pair goes to the peers as an extra

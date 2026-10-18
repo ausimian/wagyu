@@ -182,15 +182,16 @@ defmodule Wagyu.DataPathTest do
       a_key = context.a.key
       %{peers: %{^a_key => %{inbound: inbound}}} = :sys.get_state(context.children.interface)
 
-      # Ten frames wait for the peer, and the link also waits.
-      :ok = :sys.suspend(key.peer)
+      # Ten frames wait for the opener of the peer, and the link also waits.
+      opener = opener(key.peer)
+      :ok = :sys.suspend(opener)
       :ok = :sys.suspend(link)
       for n <- 1..10, do: send_data(context, context.a, key, inbound(@a_host, port, "packet #{n}"))
       assert eventually(fn -> match?({10, _bytes}, Admission.usage(inbound)) end)
 
-      # The peer takes all ten frames before its mailbox is empty. Then it
+      # The opener takes all ten frames before its mailbox is empty. Then it
       # sends their trimmed packets in one message.
-      :ok = :sys.resume(key.peer)
+      :ok = :sys.resume(opener)
       {:messages, messages} = eventually(fn -> message_queue_len(link) > 0 and Process.info(link, :messages) end)
       assert [packets] = for({:wg_plaintext, packets} <- messages, do: packets)
       assert packets == for(n <- 1..10, do: ipv4_udp(@a_host, @local, 4_000, port, "packet #{n}"))
@@ -207,19 +208,20 @@ defmodule Wagyu.DataPathTest do
       link = context.children.link
       a_key = context.a.key
       %{peers: %{^a_key => %{inbound: inbound}}} = :sys.get_state(context.children.interface)
-      :ok = :sys.suspend(key.peer)
+      opener = opener(key.peer)
+      :ok = :sys.suspend(opener)
       :ok = :sys.suspend(link)
 
-      # A packet, 40 replays of that packet, which the peer refuses, and one
+      # A packet, 40 replays of that packet, which the opener refuses, and one
       # more packet.
       first = transport_frame(key.session, key.index, inbound(@a_host, port, "first"))
       for _n <- 0..40, do: to_wagyu(context, first, context.a.socket)
       send_data(context, context.a, key, inbound(@a_host, port, "second"))
       assert eventually(fn -> match?({42, _bytes}, Admission.usage(inbound)) end)
 
-      # The first packet goes after the peer takes 32 frames. It does not wait
-      # until the mailbox of the peer is empty.
-      :ok = :sys.resume(key.peer)
+      # The first packet goes after the opener takes 32 frames. It does not
+      # wait until the mailbox of the opener is empty.
+      :ok = :sys.resume(opener)
 
       deliveries =
         eventually(fn ->
