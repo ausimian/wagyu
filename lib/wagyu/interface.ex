@@ -200,8 +200,12 @@ defmodule Wagyu.Interface do
   # sends in bursts that are larger than the outbound bound. With a bound of
   # 128 frames, the interface refused up to 1.5% of a bulk download, and TCP
   # stalled until it retransmitted. With 512 frames, it refused none, and
-  # the median round trip increased by about 1 ms (#55).
-  @peer_inbound_packets 512
+  # the median round trip increased by about 1 ms (#55). The sealer process
+  # lets the peer receive faster, and then 512 frames refused about 100
+  # frames for each 8-stream download. With 1024 frames, it refused almost
+  # none (#61). The byte bound applies first to frames of full size: about
+  # 720 frames at an MTU of 1420.
+  @peer_inbound_packets 1024
   @peer_inbound_bytes 1024 * 1024
   # The handoffs that can wait for a peer: one that the peer takes now, and
   # one more. A newer handshake replaces an older handshake. Thus a deeper
