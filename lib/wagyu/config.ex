@@ -27,6 +27,14 @@ defmodule Wagyu.Config do
       `%{address: {0, 0, 0, 0}, port: 0}`. Peer endpoints must use the same
       address family.
 
+    * `:receive_buffer` - the size in bytes of the receive buffer that the
+      interface requests for its UDP socket, from 65,536 to 2,147,483,647.
+      If you do not set this option, the interface requests the largest
+      buffer that the OS allows. If the OS gives a smaller buffer than the
+      option, the interface logs a warning. `Wagyu.info/1` gives the size
+      that the OS reports. The section "Receive buffer of the UDP socket"
+      in `Wagyu` gives the limits of Linux and macOS.
+
     * `:stack` - options for the SmolNet stack of the interface:
 
       * `:addresses` - up to 8 `{address, prefix_length}` pairs. The
@@ -110,8 +118,8 @@ defmodule Wagyu.Config do
     * `:invalid` - the wrong type or shape, or a value that is not allowed,
       for example a multicast address or an unusable peer public key
     * `:invalid_length` - a key that is not exactly 32 bytes
-    * `:out_of_range` - a port, MTU, socket limit or persistent keepalive
-      outside its range
+    * `:out_of_range` - a port, receive buffer, MTU, socket limit or
+      persistent keepalive outside its range
     * `:too_many` - more addresses, routes or peers than the limit
     * `:family_mismatch` - an endpoint or gateway in the wrong address family
     * `:duplicate` - a repeated option, public key, address, route or prefix
@@ -132,13 +140,16 @@ defmodule Wagyu.Config do
   alias Wagyu.Config.Peer
   alias Wagyu.IP
 
-  @options [:name, :private_key, :listen, :stack, :peers]
+  @options [:name, :private_key, :listen, :receive_buffer, :stack, :peers]
   @stack_options [:addresses, :routes, :mtu, :sockets]
   @reserved_stack_options [:egress, :egress_credit, :limits, :link_down]
   @peer_options [:public_key, :endpoint, :allowed_ips, :preshared_key, :persistent_keepalive]
   @endpoint_options [:address, :port]
 
   @default_listen %{address: {0, 0, 0, 0}, port: 0}
+  # The buffer must hold the largest datagram: 65,507 bytes. The maximum is
+  # the largest value that `setsockopt` accepts.
+  @receive_buffer_range 65_536..2_147_483_647
   @default_mtu 1420
   # 65,535 minus the IPv4 and UDP headers (28) and the transport header and
   # tag (32). Padding cannot make a packet larger than the MTU. Thus
@@ -158,6 +169,7 @@ defmodule Wagyu.Config do
     :private_key,
     :public_key,
     listen: @default_listen,
+    receive_buffer: nil,
     stack: [addresses: [], routes: [], mtu: @default_mtu, sockets: @default_sockets],
     peers: %{},
     allowed_ips: %AllowedIPs{}
@@ -172,6 +184,7 @@ defmodule Wagyu.Config do
           private_key: <<_::256>>,
           public_key: <<_::256>>,
           listen: %{address: :inet.ip_address(), port: :inet.port_number()},
+          receive_buffer: pos_integer() | nil,
           stack: [
             addresses: [{:inet.ip_address(), non_neg_integer()}],
             routes: [{:inet.ip_address(), non_neg_integer(), :inet.ip_address()}],
@@ -221,9 +234,17 @@ defmodule Wagyu.Config do
          public_key = public_key(private_key),
          {:ok, listen} <- listen(Keyword.get(options, :listen, @default_listen)),
          {:ok, listen_family} <- family(listen.address),
+         {:ok, receive_buffer} <- receive_buffer(Keyword.fetch(options, :receive_buffer)),
          {:ok, stack} <- stack(Keyword.get(options, :stack, [])) do
       put_peers(
-        %__MODULE__{name: name, private_key: private_key, public_key: public_key, listen: listen, stack: stack},
+        %__MODULE__{
+          name: name,
+          private_key: private_key,
+          public_key: public_key,
+          listen: listen,
+          receive_buffer: receive_buffer,
+          stack: stack
+        },
         Keyword.get(options, :peers, []),
         %{family: listen_family, keys: {public_key, private_key}}
       )
@@ -322,6 +343,11 @@ defmodule Wagyu.Config do
       {:ok, value}
     end
   end
+
+  defp receive_buffer(:error), do: {:ok, nil}
+  defp receive_buffer({:ok, size}) when is_integer(size) and size in @receive_buffer_range, do: {:ok, size}
+  defp receive_buffer({:ok, size}) when is_integer(size), do: invalid([:receive_buffer], :out_of_range)
+  defp receive_buffer({:ok, _size}), do: invalid([:receive_buffer], :invalid)
 
   # Stack
 

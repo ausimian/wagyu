@@ -1,6 +1,7 @@
 defmodule Wagyu.InterfaceTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
   import Wagyu.TestHelpers
 
   alias Wagyu.Admission
@@ -27,6 +28,26 @@ defmodule Wagyu.InterfaceTest do
   defp send_datagrams(%{client: client, port: port}, datagrams) do
     for datagram <- datagrams, do: :ok = :gen_udp.send(client, {127, 0, 0, 1}, port, datagram)
     :ok
+  end
+
+  # Starts a second interface, and returns it with the log of its start.
+  # Other tests run at the same time. Thus a test finds the messages of this
+  # interface by its port.
+  defp start_logged(options) do
+    with_log(fn -> start_supervised!(Supervisor.child_spec({Wagyu, options}, id: :logged)) end)
+  end
+
+  # The largest receive buffer that the OS gives, as the OS reports it.
+  # Linux reports double its limit.
+  defp max_receive_buffer do
+    case :os.type() do
+      {:unix, :linux} ->
+        2 * ("/proc/sys/net/core/rmem_max" |> File.read!() |> String.trim() |> String.to_integer())
+
+      {:unix, :darwin} ->
+        {limit, 0} = System.cmd("sysctl", ["-n", "kern.ipc.maxsockbuf"])
+        limit |> String.trim() |> String.to_integer()
+    end
   end
 
   defp running_peers(interface) do
@@ -177,6 +198,31 @@ defmodule Wagyu.InterfaceTest do
 
       assert options[:buffer] >= 65_507
       assert options[:recbuf] >= 65_536
+    end
+
+    test "by default, gets the largest receive buffer that the OS allows", context do
+      %{socket: socket} = :sys.get_state(child(context.interface, :interface))
+      {:ok, [recbuf: recbuf]} = :inet.getopts(socket, [:recbuf])
+
+      assert {:ok, %{receive_buffer: ^recbuf}} = Wagyu.info(context.interface)
+      assert recbuf == max_receive_buffer()
+    end
+
+    test "requests the configured receive buffer" do
+      {interface, log} = start_logged(options(receive_buffer: 65_536))
+      {:ok, %{listen: %{port: port}, receive_buffer: recbuf}} = Wagyu.info(interface)
+
+      # Linux reports double the size.
+      assert recbuf in [65_536, 131_072]
+      refute log =~ "port #{port} has a receive buffer"
+    end
+
+    test "warns if the OS gives less than the configured receive buffer" do
+      {interface, log} = start_logged(options(receive_buffer: 2_147_483_647))
+      {:ok, %{listen: %{port: port}, receive_buffer: recbuf}} = Wagyu.info(interface)
+
+      assert recbuf == max_receive_buffer()
+      assert log =~ "port #{port} has a receive buffer of #{recbuf} bytes"
     end
 
     test "stops when its socket closes", context do
