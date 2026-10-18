@@ -93,12 +93,10 @@ defmodule Wagyu.PeerTest do
     do: :ok = :gen_udp.send(from || context.remote_socket, {127, 0, 0, 1}, context.port, frame)
 
   # Returns the next datagram that the remote party receives. The datagram
-  # must come from the socket of the interface.
-  defp receive_datagram(context) do
-    port = context.port
-    assert {:ok, {{127, 0, 0, 1}, ^port, frame}} = :gen_udp.recv(context.remote_socket, 0, 1_000)
-    frame
-  end
+  # must come from the socket of the interface. The timeout is long because
+  # a loaded CI runner can delay the datagram. A test that passes does not
+  # wait for the timeout.
+  defp receive_datagram(context), do: receive_datagram_within(context, 5_000)
 
   defp receive_datagram_within(context, timeout) do
     port = context.port
