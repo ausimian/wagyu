@@ -168,10 +168,11 @@ defmodule Wagyu.Peer do
   #
   # Receiving data. The opener checks, opens and delivers the transport
   # messages (`Wagyu.Peer.Opener`). It reports what it received to the peer
-  # (`{:wg_opened, events, source, confirmed}`). The source of a keepalive,
-  # or of a data packet that passes the checks of the opener, becomes the
-  # endpoint. The source of an authenticated handshake message also becomes
-  # the endpoint.
+  # (`{:wg_opened, events, source, confirmed, configured}`). The source of
+  # a keepalive, or of a data packet that passes the checks of the opener,
+  # becomes the endpoint, unless the interface admitted it before the
+  # latest configure message. The source of an authenticated handshake
+  # message also becomes the endpoint.
   #
   # Batching. The interface sends a peer's sealer its part of each egress
   # batch as one message. The sealer sends the batch under one key at one
@@ -378,8 +379,14 @@ defmodule Wagyu.Peer do
   # can confirm a key. The endpoint goes to the sealer before the promotion.
   # Thus the staged packets go to the endpoint that the confirming message
   # can set.
-  def handle_info({:wg_opened, events, source, confirmed}, state) do
-    state = if source, do: learn_endpoint(state, source), else: state
+  #
+  # The interface admitted the frames of a report with a lower configure
+  # number than the peer's before the latest configure message. Their
+  # source is older than the configuration, so the peer does not learn it.
+  # The opener reports the source of each batch, so a source that is still
+  # current comes again with the next one.
+  def handle_info({:wg_opened, events, source, confirmed, configured}, state) do
+    state = if source && configured >= state.configured, do: learn_endpoint(state, source), else: state
     state = received_authenticated(state)
     state = if :data in events, do: received_data(state), else: state
     state = Enum.reduce(confirmed, state, &promote(&2, &1))

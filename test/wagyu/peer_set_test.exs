@@ -490,6 +490,39 @@ defmodule Wagyu.PeerSetTest do
       assert receive_payload(context, stale, key) == "learned"
     end
 
+    test "a frame that the interface admitted before a change does not replace the new endpoint", context do
+      %{a: a, b: b} = context
+      key = handshake(context, a)
+      opener = opener(key.peer)
+
+      # A keepalive from another address waits for the opener, and then the
+      # endpoint changes.
+      stale = udp_socket()
+      :ok = :sys.suspend(opener)
+      to_wagyu(context, transport_frame(key.session, key.index), stale)
+      %{inbound: inbound} = interface_state(context).peers[a.key]
+      assert eventually(fn -> match?({1, _bytes}, Admission.usage(inbound)) end)
+
+      moved = udp_socket()
+      {:ok, moved_port} = :inet.port(moved)
+      moved_config = %{a.config | endpoint: %{address: {127, 0, 0, 1}, port: moved_port}}
+      :ok = Wagyu.replace_peers(context.interface, [moved_config, b.config])
+      assert eventually(fn -> :sys.get_state(key.peer).endpoint == {{127, 0, 0, 1}, moved_port} end)
+
+      # The opener takes the keepalive after the change. The peer does not
+      # learn its source.
+      # The handshake sent the first keepalive.
+      :ok = :sys.resume(opener)
+      assert %{keepalives_received: 2} = counters(context.interface, &(&1.keepalives_received == 2))
+      _opener = :sys.get_state(opener)
+      assert :sys.get_state(key.peer).endpoint == {{127, 0, 0, 1}, moved_port}
+      assert eventually(fn -> interface_state(context).endpoints[a.key] == {{127, 0, 0, 1}, moved_port} end)
+
+      {socket, _port} = smolnet_udp(context)
+      to_host(socket, @a_host, "moved")
+      assert receive_payload(context, moved, key) == "moved"
+    end
+
     test "a change of the endpoint to nil keeps the configured endpoint for the next process", context do
       %{a: a, b: b} = context
       {socket, _port} = smolnet_udp(context)

@@ -46,10 +46,13 @@ defmodule Wagyu.Peer.Opener do
   # it to the link (`Wagyu.Link.deliver_to/2`). It counts and drops all
   # other plaintext.
   #
-  # Source filter. When the filter of the peer changes, the interface sends
-  # `{:wg_filter, filter}` to the opener itself. Frames that the interface
-  # admitted before the change are in the mailbox before the message, so
-  # the old filter applies to them.
+  # Configuration. When the interface sends the peer a configure message,
+  # it sends the opener `{:wg_configured, configured, filter}` itself. The
+  # message holds the source filter, and the number of configure messages
+  # that the peer has after it takes its message. Frames that the interface
+  # admitted before the change are in the mailbox before the message. Thus
+  # the old filter applies to them, and the opener reports their source
+  # with the old number.
   #
   # Batching. Decrypted packets wait in `state.plaintext` while more frames
   # are in the queue. They go to the link together when one of these
@@ -70,7 +73,7 @@ defmodule Wagyu.Peer.Opener do
   # receives, and the endpoint of the peer follows the source of its
   # traffic. When the opener sends packets to the link, or when it took a
   # frame and no packet waits, it sends the peer one `{:wg_opened, events,
-  # source, confirmed}` if it has something to report:
+  # source, confirmed, configured}` if it has something to report:
   #
   #   * `events` holds `:authenticated` if a message authenticated, and
   #     `:data` if a message carried a plaintext that was not empty.
@@ -79,6 +82,11 @@ defmodule Wagyu.Peer.Opener do
   #   * `confirmed` holds the local index of each pending key under which a
   #     message authenticated for the first time. The peer then promotes the
   #     key pair from `:next` to `:current`.
+  #   * `configured` is the configure number of the last configured message.
+  #     Any other message ends a batch, so all frames of a report have this
+  #     number. The peer does not learn `source` from a report with a lower
+  #     number than its own: the interface admitted those frames before a
+  #     change to the configuration.
   #
   # The opener, the sealer, the sender and the peer are the children of one
   # `Wagyu.Peer.Group`, and they stop together. The group starts the peer
@@ -132,6 +140,8 @@ defmodule Wagyu.Peer.Opener do
       counters: counters,
       inbound: inbound,
       allowed_ips: allowed_ips,
+      # The configure number of the last `{:wg_configured, ...}`.
+      configured: 0,
       owner: nil,
       keys: %{},
       plaintext: @no_plaintext,
@@ -203,7 +213,8 @@ defmodule Wagyu.Peer.Opener do
 
   defp handle({:wg_discard, index}, state), do: {:noreply, close_key(state, index)}
 
-  defp handle({:wg_filter, filter}, state), do: {:noreply, %{state | allowed_ips: filter}}
+  defp handle({:wg_configured, configured, filter}, state),
+    do: {:noreply, %{state | configured: configured, allowed_ips: filter}}
 
   # The mailbox became empty while packets waited for the link. `settle/1`
   # already sent them to the link.
@@ -302,7 +313,8 @@ defmodule Wagyu.Peer.Opener do
   defp report(%{events: %{authenticated: false}} = state), do: state
 
   defp report(%{events: events} = state) do
-    send(state.owner, {:wg_opened, events_list(events), events.source, Enum.reverse(events.confirmed)})
+    confirmed = Enum.reverse(events.confirmed)
+    send(state.owner, {:wg_opened, events_list(events), events.source, confirmed, state.configured})
     %{state | events: @no_events}
   end
 
